@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+
+# skill build outputs
+dist/*.skill
+
+# local vector store outputs (do not commit generated user data)
+**/metadata_vectors.json
+**/fulltext_vectors.json
+**/vector_store_metadata.json
+**/*.bak_*
+**/snapshots/
+**/zotero-vectors/

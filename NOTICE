@@ -1,0 +1,3 @@
+This repository contains an OpenClaw skill in `skill/zotero-vectorize/` and lightweight repository-level tooling in `tools/` for validation and packaging.
+
+The repository-level tooling was written to mirror the expected OpenClaw skill packaging workflow while keeping the actual skill directory clean and compliant with skill structure conventions.
