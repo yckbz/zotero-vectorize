@@ -16,19 +16,6 @@ It also supports **incremental updates** with a safety-first workflow:
 5. append the missing vectors
 6. retain only the latest and previous backup per file
 
-## Why this exists
-
-There are Zotero-related skills and there are generic embedding / RAG skills, but there is still a gap for a reusable OpenClaw skill that combines:
-
-- local Zotero SQLite + storage access
-- metadata embeddings
-- PDF full-text chunk embeddings
-- incremental update workflow
-- backup retention rules
-- cross-platform support for Windows, macOS, and Linux
-
-`zotero-vectorize` is designed to fill that gap.
-
 ## Repository layout
 
 ```text
