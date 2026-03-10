@@ -99,7 +99,7 @@ Typical Python dependencies:
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/yckbz/zotero-vectorize
 cd zotero-vectorize
 ```
 
