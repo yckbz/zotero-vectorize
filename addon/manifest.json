@@ -1,0 +1,21 @@
+{
+  "manifest_version": 2,
+  "name": "Zotero Vectorize",
+  "version": "1.0.2",
+  "description": "Local-first semantic search, cross-lingual recall, full-text passage navigation, and automatic background vectorization for Zotero.",
+  "author": "yckbz",
+  "homepage_url": "https://github.com/yckbz/zotero-vectorize",
+  "icons": {
+    "32": "chrome/skin/default/icon.svg",
+    "48": "chrome/skin/default/icon.svg",
+    "96": "chrome/skin/default/icon.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "zotero-vectorize@yckbz.org",
+      "update_url": "https://github.com/yckbz/zotero-vectorize/releases/latest/download/updates.json",
+      "strict_min_version": "7.0",
+      "strict_max_version": "*"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+zotero-vectorize-item-pane-header =
+    .label = 语义相似文献
+zotero-vectorize-item-pane-sidenav =
+    .tooltiptext = 相似文献
+zotero-vectorize-menu-palette =
+    .label = Zotero Vectorize 语义命令面板…
+zotero-vectorize-menu-index-all =
+    .label = Zotero Vectorize：后台增量索引文献
+zotero-vectorize-menu-settings =
+    .label = Zotero Vectorize 插件设置…
+zotero-vectorize-menu-index-selected =
+    .label = 立即向量化所选文献
