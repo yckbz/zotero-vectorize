@@ -213,6 +213,7 @@ export class VectorizeService {
       mode,
       topK,
       hybridAlpha: config.hybridSemanticWeight,
+      normalizeNotation: config.normalizeNotation,
       filterItemIDs: options?.filterItemIDs,
     }, signal);
 
@@ -223,7 +224,7 @@ export class VectorizeService {
   }
 
   findSimilarItems(itemID: number, topK = 5) {
-    return this.searchIndex.findSimilarItems(itemID, { topK });
+    return this.searchIndex.findSimilarItems(itemID, { topK, normalizeNotation: this.config.normalizeNotation });
   }
 
   getIndexProgress(): IndexProgress {
@@ -253,9 +254,9 @@ export class VectorizeService {
     this.notifyIndexUpdated();
   }
 
-  async getStats(): Promise<StoreStats> {
+  async getStats(activeModel?: Pick<EngineHealthStatus, 'modelFingerprint' | 'dimensions'>): Promise<StoreStats> {
     await this.init();
-    return this.store.getStats();
+    return this.store.getStats(activeModel);
   }
 
   async exportCompatJsonToFolder(folderPath: string): Promise<{ items: number; chunks: number; files: string[] }> {

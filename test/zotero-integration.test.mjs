@@ -80,6 +80,7 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
           attachment_id: params[0], attachment_key: params[1], parent_item_id: params[2],
           file_hash: params[3], mtime: params[4], status: params[5], chunk_count: params[6],
           model_fingerprint: params[7], error_message: params[8], updated_at: params[9],
+          chunking_key: params[10],
         });
         return [];
       }
@@ -311,7 +312,7 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
     const svc = new VectorizeService({ rootURI: 'file:///plugin/', dataDir: tmpDir });
     await svc.init();
 
-    // 1. Initial background scan (no ONNX installed -> extracts text & enables immediate cross-lingual lexical recall)
+    // 1. Initial background scan (no ONNX installed -> extracts text for keyword search)
     await svc.startIndexing(false);
     assert.equal(pdfExtractCalls, 1);
 
@@ -325,7 +326,7 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
       searchProviderCalls++;
       return getProvider.apply(svc.providerManager, args);
     };
-    const searchRes = await svc.search('注意力机制', { mode: 'hybrid' });
+    const searchRes = await svc.search('multi-head projections', { mode: 'hybrid' });
     assert.equal(searchProviderCalls, 0);
     svc.providerManager.getProvider = getProvider;
     assert.equal(searchRes.hits.length, 1);
@@ -571,6 +572,7 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
     svc.providerManager.getProvider = async () => ({
       engine: 'ollama',
       model: 'nomic-embed-text:latest',
+      getPassageBatchSize: () => 16,
       getModelFingerprint: () => 'ollama:nomic-embed-text:latest',
       getStatus: async () => ({ neuralAvailable: true, dimensions: 0 }),
       embedPassages: async (texts, onProgress) => {
@@ -649,6 +651,69 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
     delete globalThis.IOUtils;
     delete globalThis.PathUtils;
   }
+});
+
+test('Preferences refreshes persisted coverage during a scan and flushes the final count', async (t) => {
+  let onWrite;
+  let onProgress;
+  let vectorizedChunks = 0;
+  let reads = 0;
+  const coverage = { textContent: '' };
+  globalThis.document = {
+    getElementById: (id) => id === 'zv-stat-chunks' ? coverage : null,
+  };
+  globalThis.window = {
+    requestAnimationFrame: () => 1,
+    cancelAnimationFrame: () => {},
+  };
+  const service = {
+    store: { subscribeWrites: (listener) => {
+      onWrite = listener;
+      return () => { onWrite = undefined; };
+    } },
+    subscribeProgress: (listener) => {
+      onProgress = listener;
+      return () => { onProgress = undefined; };
+    },
+    getConfig: () => ({ uiLanguage: 'en-US' }),
+    getEngineStatus: async () => ({ modelFingerprint: 'test:model:2' }),
+    getStats: async () => {
+      reads++;
+      return { vectorizedChunks, indexedChunks: 43 };
+    },
+  };
+  globalThis.Zotero = { Vectorize: service };
+  t.after(() => {
+    globalThis.ZoteroVectorizePrefs?.onUnload();
+    delete globalThis.ZoteroVectorizePrefs;
+    delete globalThis.Zotero;
+    delete globalThis.document;
+    delete globalThis.window;
+  });
+  await importTs('src/zotero/ui/preferences.ts');
+  const controller = globalThis.ZoteroVectorizePrefs;
+  controller.container = {};
+  controller.subscribeToProgress(service);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+
+  vectorizedChunks = 20;
+  onWrite();
+  onWrite();
+  onProgress({ phase: 'indexing' });
+  t.mock.timers.tick(1000);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(coverage.textContent, '20 / 43');
+  assert.equal(reads, 1);
+
+  vectorizedChunks = 43;
+  onWrite();
+  onProgress({ phase: 'completed' });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(coverage.textContent, '43 / 43');
+  t.mock.timers.tick(1000);
+  assert.equal(reads, 2);
 });
 
 test('registerSimilarPapersSection renders .zv-item-pane-box and .zv-similar-card and uses valid FTL attributes', async () => {

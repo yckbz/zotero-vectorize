@@ -10,9 +10,9 @@ import { dotProduct, isFiniteVector, l2Normalize } from './math.ts';
 import {
   computeHighlightRanges,
   createLexicalScorer,
-  expandQueryCrossLingually,
   hasCjk,
   prepareLexicalText,
+  shouldFoldDigits,
 } from './lexical.ts';
 
 export interface SearchQueryOptions {
@@ -23,6 +23,7 @@ export interface SearchQueryOptions {
   mode: SearchMode;
   topK?: number;
   hybridAlpha?: number; // [0..1] weight for dense semantic vs lexical
+  normalizeNotation?: boolean;
   filterItemIDs?: Set<number> | null;
 }
 
@@ -32,7 +33,10 @@ export class VectorSearchIndex {
   private chunksById = new Map<string, IndexedChunkRecord>();
   private chunksList: IndexedChunkRecord[] = [];
   private chunksByItemId = new Map<number, IndexedChunkRecord[]>();
-  private lexicalText = new WeakMap<IndexedItemRecord | IndexedChunkRecord, ReturnType<typeof prepareLexicalText>>();
+  private lexicalText = new WeakMap<IndexedItemRecord | IndexedChunkRecord, {
+    foldDigits: boolean;
+    text: ReturnType<typeof prepareLexicalText>;
+  }>();
   private lexicalVocabulary = new Map<string, string>();
 
   clear(): void {
@@ -267,7 +271,8 @@ export class VectorSearchIndex {
       options.mode === 'fulltext' ? [] : items,
       options.mode === 'metadata' ? [] : chunks
     );
-    const scoreLexical = createLexicalScorer(query);
+    const foldDigits = shouldFoldDigits(query, options.normalizeNotation);
+    const scoreLexical = createLexicalScorer(query, foldDigits);
     const queryIsCjk = hasCjk(query);
     let processed = 0;
 
@@ -300,31 +305,29 @@ export class VectorSearchIndex {
           vectorSearchUsed = true;
         }
 
-        let lexicalText = this.lexicalText.get(item);
-        if (!lexicalText) {
-          lexicalText = prepareLexicalText({
+        let prepared = this.lexicalText.get(item);
+        if (!prepared || prepared.foldDigits !== foldDigits) {
+          prepared = { foldDigits, text: prepareLexicalText({
             title: item.title,
             meta: `${item.creators} ${item.year} ${item.publicationTitle} ${item.tags.join(' ')}`,
             body: item.abstractNote,
-          }, this.lexicalVocabulary);
-          this.lexicalText.set(item, lexicalText);
+          }, this.lexicalVocabulary, foldDigits) };
+          this.lexicalText.set(item, prepared);
         }
-        const lex = scoreLexical(lexicalText);
-
-        const titleHasCjk = hasCjk(lexicalText.titleLower);
-        const neuralCrossLingual = compatibleVector && sem >= 0.38 && queryIsCjk !== titleHasCjk;
+        const lex = scoreLexical(prepared.text);
+        const neuralCrossLingual = compatibleVector && sem >= 0.38 && queryIsCjk !== hasCjk(item.title);
 
         metaScores.set(item.itemID, {
           semantic: sem,
-          lexical: lex.score,
-          crossLingual: lex.crossLingualHit || neuralCrossLingual,
+          lexical: lex,
+          crossLingual: neuralCrossLingual,
           compatibleVector,
         });
       }
     }
 
     // 2. Score Fulltext Chunks (when mode is 'fulltext' or 'hybrid')
-    const chunksByParent = new Map<number, Array<ChunkHitInfo & { compatibleVector: boolean }>>();
+    const chunksByParent = new Map<number, ChunkHitInfo[]>();
     if (options.mode === 'fulltext' || options.mode === 'hybrid') {
       for (const chunk of chunks) {
         if (++processed % 32 === 0) yield;
@@ -345,23 +348,19 @@ export class VectorSearchIndex {
           vectorSearchUsed = true;
         }
 
-        let lexicalText = this.lexicalText.get(chunk);
-        if (!lexicalText) {
-          lexicalText = prepareLexicalText({ body: chunk.text }, this.lexicalVocabulary);
-          this.lexicalText.set(chunk, lexicalText);
+        let prepared = this.lexicalText.get(chunk);
+        if (!prepared || prepared.foldDigits !== foldDigits) {
+          prepared = { foldDigits, text: prepareLexicalText({ body: chunk.text }, this.lexicalVocabulary, foldDigits) };
+          this.lexicalText.set(chunk, prepared);
         }
-        const lex = scoreLexical(lexicalText);
+        const lex = scoreLexical(prepared.text);
 
-        const combinedChunkScore = compatibleVector
-          ? alpha * sem + (1 - alpha) * lex.score
-          : lex.score;
-
-        if (!compatibleVector && lex.score > 0) {
+        if (!compatibleVector && lex > 0) {
           lexicalFallbackUsed = true;
         }
 
         // Prune clearly irrelevant chunks early
-        if (combinedChunkScore < 0.04 && sem < 0.12 && lex.score <= 0) {
+        if (alpha * sem < 0.04 && sem < 0.12 && lex <= 0) {
           continue;
         }
 
@@ -375,10 +374,9 @@ export class VectorSearchIndex {
           pageLabel: chunk.pageLabel,
           snippet: chunk.snippet,
           text: chunk.text,
-          score: combinedChunkScore,
+          score: 0,
           semanticScore: sem,
-          lexicalScore: lex.score,
-          compatibleVector,
+          lexicalScore: lex,
           highlightRanges: [],
         });
         chunksByParent.set(chunk.itemID, list);
@@ -417,12 +415,13 @@ export class VectorSearchIndex {
       const rel = Math.max(0, Math.min(1, (raw - minSem) / semSpan));
       return 0.55 * raw + 0.45 * rel;
     };
+    const lexicalWeight = vectorSearchUsed ? 1 - alpha : 1;
+    const blendScore = (semantic: number, lexical: number): number =>
+      alpha * stretchSemantic(semantic) + lexicalWeight * lexical;
     for (const list of chunksByParent.values()) {
       if (++processed % 32 === 0) yield;
       for (const chunk of list) {
-        if (chunk.compatibleVector) {
-          chunk.score = alpha * stretchSemantic(chunk.semanticScore) + (1 - alpha) * chunk.lexicalScore;
-        }
+        chunk.score = blendScore(chunk.semanticScore, chunk.lexicalScore);
       }
       list.sort((a, b) => b.score - a.score);
     }
@@ -452,24 +451,20 @@ export class VectorSearchIndex {
         if (!meta) continue;
         semanticScore = meta.semantic;
         lexicalScore = meta.lexical;
-        finalScore = meta.compatibleVector
-          ? alpha * stretchSemantic(meta.semantic) + (1 - alpha) * meta.lexical
-          : meta.lexical;
+        finalScore = blendScore(meta.semantic, meta.lexical);
       } else if (options.mode === 'fulltext') {
         if (!bestChunk) continue;
         semanticScore = bestChunk.semanticScore;
         lexicalScore = bestChunk.lexicalScore;
         finalScore = bestChunk.score;
-        if (queryIsCjk !== hasCjk(bestChunk.text) && (bestChunk.semanticScore >= 0.38 || bestChunk.lexicalScore > 0)) {
+        if (queryIsCjk !== hasCjk(bestChunk.text) && bestChunk.semanticScore >= 0.38) {
           crossLingualMatched = true;
         }
       } else {
         // Hybrid: combine metadata signal + fulltext best chunk signal
         const metaSem = meta?.semantic ?? 0;
         const metaLex = meta?.lexical ?? 0;
-        const metaTotal = meta?.compatibleVector
-          ? alpha * stretchSemantic(metaSem) + (1 - alpha) * metaLex
-          : metaLex;
+        const metaTotal = blendScore(metaSem, metaLex);
 
         const chunkSem = bestChunk?.semanticScore ?? 0;
         const chunkLex = bestChunk?.lexicalScore ?? 0;
@@ -485,7 +480,7 @@ export class VectorSearchIndex {
         if (
           bestChunk &&
           queryIsCjk !== hasCjk(bestChunk.text) &&
-          (bestChunk.semanticScore >= 0.38 || bestChunk.lexicalScore > 0)
+          bestChunk.semanticScore >= 0.38
         ) {
           crossLingualMatched = true;
         }
@@ -493,6 +488,9 @@ export class VectorSearchIndex {
 
       // If running in lexical-only fallback mode (or pure lexical weight alpha === 0), drop zero-score records
       if ((!vectorSearchUsed || alpha === 0) && lexicalScore <= 0) {
+        continue;
+      }
+      if (vectorSearchUsed && alpha === 1 && finalScore <= 0) {
         continue;
       }
       // Even in vector mode, filter obviously irrelevant tail if lexical is 0 and cosine is noise
@@ -527,10 +525,10 @@ export class VectorSearchIndex {
     const topHits = hits.slice(0, topK);
     for (const h of topHits) {
       if (h.bestChunk) {
-        h.bestChunk.highlightRanges = computeHighlightRanges(h.bestChunk.snippet, query);
+        h.bestChunk.highlightRanges = computeHighlightRanges(h.bestChunk.snippet, query, options.normalizeNotation);
       }
       for (const extra of h.extraHits) {
-        extra.highlightRanges = computeHighlightRanges(extra.snippet, query);
+        extra.highlightRanges = computeHighlightRanges(extra.snippet, query, options.normalizeNotation);
       }
     }
 
@@ -552,7 +550,7 @@ export class VectorSearchIndex {
 
   findSimilarItems(
     itemID: number,
-    options?: { topK?: number; filterItemIDs?: Set<number> | null }
+    options?: { topK?: number; filterItemIDs?: Set<number> | null; normalizeNotation?: boolean }
   ): Array<{ item: IndexedItemRecord; score: number }> {
     const source = this.itemsById.get(itemID);
     if (!source) return [];
@@ -573,8 +571,9 @@ export class VectorSearchIndex {
         }
       }
     } else if (source.title) {
-      const exp = expandQueryCrossLingually(`${source.title} ${source.tags.join(' ')}`);
-      const scoreLexical = createLexicalScorer(source.title, exp);
+      const tags = source.tags.join(' ');
+      const foldDigits = shouldFoldDigits(`${source.title} ${tags}`, options?.normalizeNotation);
+      const scoreLexical = createLexicalScorer(source.title, foldDigits, tags);
       for (const candidate of this.itemsList) {
         if (candidate.itemID === itemID) continue;
         if (options?.filterItemIDs && !options.filterItemIDs.has(candidate.itemID)) continue;
@@ -582,9 +581,9 @@ export class VectorSearchIndex {
           title: candidate.title,
           meta: `${candidate.creators} ${candidate.tags.join(' ')}`,
           body: candidate.abstractNote,
-        }));
-        if (lex.score > 0.12) {
-          scored.push({ item: candidate, score: lex.score });
+        }, undefined, foldDigits));
+        if (lex > 0.12) {
+          scored.push({ item: candidate, score: lex });
         }
       }
     }

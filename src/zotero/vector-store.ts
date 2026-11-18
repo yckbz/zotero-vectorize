@@ -1,5 +1,6 @@
 import type {
   AttachmentStateRecord,
+  EngineHealthStatus,
   IndexedChunkRecord,
   IndexedItemRecord,
   StoreStats,
@@ -9,7 +10,7 @@ import { bytesToFloat32, float32ToBytes, isFiniteVector } from '../core/math.ts'
 import { parseVectorStoreJson, serializeVectorStoreJson } from '../core/compat-json.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
 
-const SCHEMA_VERSION = '1';
+const SCHEMA_VERSION = '2';
 
 export class VectorStore {
   private readonly storeDir: string;
@@ -17,6 +18,7 @@ export class VectorStore {
   private db: ZoteroDBConnectionInstance | null = null;
   private openPromise: Promise<void> | null = null;
   private writeChain: Promise<void> = Promise.resolve();
+  private readonly writeListeners = new Set<() => void>();
   private closed = false;
 
   constructor(dataDir: string) {
@@ -33,12 +35,26 @@ export class VectorStore {
   }
 
   private enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.writeChain.then(fn, fn);
+    const run = this.writeChain.then(fn, fn).then((result) => {
+      for (const listener of this.writeListeners) {
+        try {
+          listener();
+        } catch {
+          // A UI observer cannot fail a committed write.
+        }
+      }
+      return result;
+    });
     this.writeChain = run.then(
       () => undefined,
       () => undefined
     );
     return run;
+  }
+
+  subscribeWrites(listener: () => void): () => void {
+    this.writeListeners.add(listener);
+    return () => { this.writeListeners.delete(listener); };
   }
 
   async open(): Promise<void> {
@@ -124,11 +140,16 @@ export class VectorStore {
             chunk_count INTEGER NOT NULL DEFAULT 0,
             model_fingerprint TEXT NOT NULL DEFAULT '',
             error_message TEXT NOT NULL DEFAULT '',
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            chunking_key TEXT NOT NULL DEFAULT ''
           )
         `);
+        const attachmentColumns = await conn.queryAsync<{ name: string }>('PRAGMA table_info(attachment_state)');
+        if (!attachmentColumns.some((column) => column.name === 'chunking_key')) {
+          await conn.queryAsync("ALTER TABLE attachment_state ADD COLUMN chunking_key TEXT NOT NULL DEFAULT ''");
+        }
         await conn.queryAsync(
-          `INSERT OR IGNORE INTO store_meta (key, value) VALUES (?, ?)`,
+          `INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)`,
           ['schema_version', SCHEMA_VERSION]
         );
         await conn.queryAsync(
@@ -304,7 +325,7 @@ export class VectorStore {
     const conn = await this.ensureConn();
     const row = await conn.rowQueryAsync<Record<string, any>>(
       `SELECT attachment_id, attachment_key, parent_item_id, file_hash, mtime, status,
-              chunk_count, model_fingerprint, error_message, updated_at
+              chunk_count, model_fingerprint, error_message, updated_at, chunking_key
        FROM attachment_state WHERE attachment_id = ?`,
       [attachmentID]
     );
@@ -315,6 +336,7 @@ export class VectorStore {
       parentItemID: Number(row.parent_item_id),
       fileHash: String(row.file_hash || ''),
       mtime: Number(row.mtime) || 0,
+      chunkingKey: String(row.chunking_key || ''),
       status: (row.status || 'indexed') as AttachmentStateRecord['status'],
       chunkCount: Number(row.chunk_count) || 0,
       modelFingerprint: String(row.model_fingerprint || ''),
@@ -363,28 +385,38 @@ export class VectorStore {
     });
   }
 
-  async replaceAttachmentChunksAndState(
-    attachmentID: number,
-    parentItemID: number,
+  async saveAttachmentChunksAndState(
     chunks: IndexedChunkRecord[],
-    state: AttachmentStateRecord
-  ): Promise<number[]> {
+    state: AttachmentStateRecord,
+    mode: 'replace' | 'checkpoint'
+  ): Promise<number[] | null> {
     return this.enqueueWrite(async () => {
       const conn = await this.ensureConn();
-      let previousParents: number[] = [];
+      const { attachmentID, parentItemID } = state;
+      let previousParents: number[] | null = [];
       await conn.executeTransaction(async () => {
-        const rows = await conn.queryAsync<{ item_id: number }>(
-          'SELECT DISTINCT item_id FROM fulltext_chunks WHERE attachment_id = ? AND item_id != ?',
-          [attachmentID, parentItemID]
-        );
-        previousParents = rows.map((row) => Number(row.item_id));
-        await conn.queryAsync('DELETE FROM fulltext_chunks WHERE attachment_id = ?', [attachmentID]);
-        // Also purge legacy imported chunks under attachment_id = 0 for same attachmentKey if re-indexed natively
-        if (state.attachmentKey) {
-          await conn.queryAsync(
-            'DELETE FROM fulltext_chunks WHERE item_id = ? AND attachment_key = ?',
-            [parentItemID, state.attachmentKey]
+        if (mode === 'checkpoint') {
+          const current = await this.getAttachmentState(attachmentID);
+          if (!current || current.parentItemID !== parentItemID || current.attachmentKey !== state.attachmentKey ||
+              current.fileHash !== state.fileHash || current.mtime !== state.mtime ||
+              current.chunkingKey !== state.chunkingKey) {
+            previousParents = null;
+            return;
+          }
+        } else {
+          const rows = await conn.queryAsync<{ item_id: number }>(
+            'SELECT DISTINCT item_id FROM fulltext_chunks WHERE attachment_id = ? AND item_id != ?',
+            [attachmentID, parentItemID]
           );
+          previousParents = rows.map((row) => Number(row.item_id));
+          await conn.queryAsync('DELETE FROM fulltext_chunks WHERE attachment_id = ?', [attachmentID]);
+          // Also remove imported chunks for the same attachment key.
+          if (state.attachmentKey) {
+            await conn.queryAsync(
+              'DELETE FROM fulltext_chunks WHERE item_id = ? AND attachment_key = ?',
+              [parentItemID, state.attachmentKey]
+            );
+          }
         }
         for (const chunk of chunks) {
           const { blob, dim } = this.encodeVectorBlob(chunk.vector);
@@ -419,8 +451,8 @@ export class VectorStore {
         await conn.queryAsync(
           `INSERT OR REPLACE INTO attachment_state (
             attachment_id, attachment_key, parent_item_id, file_hash, mtime, status,
-            chunk_count, model_fingerprint, error_message, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            chunk_count, model_fingerprint, error_message, updated_at, chunking_key
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             state.attachmentID,
             state.attachmentKey,
@@ -432,6 +464,7 @@ export class VectorStore {
             state.modelFingerprint,
             state.errorMessage || '',
             state.updatedAt || Date.now(),
+            state.chunkingKey,
           ]
         );
         await conn.queryAsync(
@@ -449,7 +482,8 @@ export class VectorStore {
       `SELECT chunk_id, item_id, item_key, attachment_id, attachment_key, attachment_title,
               chunk_index, page_index, page_label, char_start, char_end, text, snippet,
               vector, dim, model_fingerprint, updated_at
-       FROM fulltext_chunks WHERE item_id = ?`,
+       FROM fulltext_chunks WHERE item_id = ?
+       ORDER BY attachment_id, chunk_index`,
       [itemID]
     );
     return rows.map((row) => {
@@ -525,21 +559,34 @@ export class VectorStore {
     });
   }
 
-  async getStats(): Promise<StoreStats> {
+  async getStats(activeModel?: Pick<EngineHealthStatus, 'modelFingerprint' | 'dimensions'>): Promise<StoreStats> {
     const conn = await this.ensureConn();
+    const fingerprint = activeModel?.modelFingerprint;
+    const modelCondition = !fingerprint ? '' : activeModel.dimensions > 0
+      ? ' AND model_fingerprint = ?'
+      : " AND model_fingerprint = ? || ':' || dim";
+    const modelParams = fingerprint ? [fingerprint] : [];
+    const vectorCount = `SUM(CASE WHEN vector IS NOT NULL AND dim > 0${modelCondition} THEN 1 ELSE 0 END)`;
     const itemSummary = await conn.rowQueryAsync<Record<string, any>>(
       `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN dim > 0 THEN 1 ELSE 0 END) AS vec_count,
+              ${vectorCount} AS vec_count,
               MAX(dim) AS max_dim
-       FROM item_vectors`
+       FROM item_vectors`, modelParams
     );
     const chunkSummary = await conn.rowQueryAsync<Record<string, any>>(
       `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN dim > 0 THEN 1 ELSE 0 END) AS vec_count,
+              ${vectorCount} AS vec_count,
               MAX(dim) AS max_dim
-       FROM fulltext_chunks`
+       FROM fulltext_chunks`, modelParams
     );
-    const attCount = await conn.valueQueryAsync<number>('SELECT COUNT(*) FROM attachment_state');
+    const attachmentSummary = await conn.rowQueryAsync<Record<string, any>>(
+      `SELECT COUNT(*) AS total,
+              SUM(status = 'error') AS failed,
+              SUM(status = 'pending') AS pending,
+              SUM(status = 'missing') AS missing,
+              SUM(status = 'no_text') AS no_text
+       FROM attachment_state`
+    );
     const fpRow = await conn.rowQueryAsync<Record<string, any>>(
       `SELECT model_fingerprint FROM item_vectors WHERE dim > 0 AND model_fingerprint != ''
        ORDER BY updated_at DESC LIMIT 1`
@@ -576,7 +623,11 @@ export class VectorStore {
       vectorizedItems: Number(itemSummary ? itemSummary.vec_count : 0) || 0,
       indexedChunks: Number(chunkSummary ? chunkSummary.total : 0) || 0,
       vectorizedChunks: Number(chunkSummary ? chunkSummary.vec_count : 0) || 0,
-      indexedAttachments: Number(attCount) || 0,
+      indexedAttachments: Number(attachmentSummary && attachmentSummary.total) || 0,
+      failedAttachments: Number(attachmentSummary && attachmentSummary.failed) || 0,
+      pendingAttachments: Number(attachmentSummary && attachmentSummary.pending) || 0,
+      missingAttachments: Number(attachmentSummary && attachmentSummary.missing) || 0,
+      noTextAttachments: Number(attachmentSummary && attachmentSummary.no_text) || 0,
       modelFingerprint: String(fpItem || fpChunk || ''),
       dimensions: itemDim || chunkDim || 0,
       dbSizeBytes,
@@ -658,6 +709,7 @@ export class VectorStore {
         }
         for (const [parentID, list] of grouped.entries()) {
           await conn.queryAsync('DELETE FROM fulltext_chunks WHERE item_id = ?', [parentID]);
+          await conn.queryAsync('DELETE FROM attachment_state WHERE parent_item_id = ?', [parentID]);
           for (const chunk of list) {
             const { blob, dim } = this.encodeVectorBlob(chunk.vector);
             await conn.queryAsync(

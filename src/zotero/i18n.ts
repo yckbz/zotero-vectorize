@@ -33,10 +33,11 @@ export type LocaleStrings = {
   indexCheckingFile: string;
   indexReadingPdf: string;
   indexEmbeddingPdf: (completed: number, total: number) => string;
-  indexSavingPdf: string;
   indexReadTimeout: (stage: string, title: string, seconds: number) => string;
   indexTextDone: (items: number, chunks: number) => string;
   indexVectorDone: (items: number, chunks: number) => string;
+  indexIncomplete: (items: number, failures: number, error: string) => string;
+  indexAttachmentIssues: (unfinished: number, missing: number, noText: number) => string;
   palettePlaceholder: string;
   paletteTitle: string;
   paletteEmptyHint: string;
@@ -76,6 +77,7 @@ export type LocaleStrings = {
   prefOpenaiApiKey: string;
   prefOpenaiModel: string;
   prefOpenaiDimensions: string;
+  prefOpenaiBatchSize: string;
   prefChunkSize: string;
   prefChunkOverlap: string;
   prefMaxPdfPages: string;
@@ -84,6 +86,7 @@ export type LocaleStrings = {
   prefDefaultMode: string;
   prefEnablePopover: string;
   prefSemanticWeight: string;
+  prefNormalizeNotation: string;
   prefClearOnJump: string;
   prefLanguage: string;
   prefExportJson: string;
@@ -121,7 +124,7 @@ const ZH_CN: LocaleStrings = {
   emptyIndexTitle: '尚未建立文献向量索引',
   emptyIndexDesc: '点击下方按钮在后台静默索引您的文献库与 PDF 全文，不修改 Zotero 原库。',
   setupBannerCta: '下载本地语义模型',
-  setupBannerHint: '本地 ONNX 模型尚未安装，当前使用跨语言词法桥接检索。',
+  setupBannerHint: '当前使用关键词检索。安装本地 ONNX 模型可启用跨语言语义检索。',
   openSettings: '插件设置',
   openPalette: '命令面板',
   buildIndexNow: '立即增量索引',
@@ -130,9 +133,10 @@ const ZH_CN: LocaleStrings = {
   indexCheckingFile: '正在检查附件',
   indexReadingPdf: '正在抽取 PDF 正文',
   indexEmbeddingPdf: (completed, total) => `正在向量化 PDF 分块 ${completed}/${total}`,
-  indexSavingPdf: '正在保存 PDF 索引',
   indexTextDone: (items, chunks) => `文本索引完成。本轮处理 ${items} 篇文献、保存 ${chunks} 个分块，未生成向量。`,
   indexVectorDone: (items, chunks) => `向量索引扫描完成。本轮处理 ${items} 篇文献、生成 ${chunks} 个正文向量。`,
+  indexIncomplete: (items, failures, error) => `索引未完成。本轮检查 ${items} 篇文献，${failures} 项失败。首个错误：${error}`,
+  indexAttachmentIssues: (unfinished, missing, noText) => `待完成附件 ${unfinished} · 缺失 PDF ${missing} · 无可提取文本 ${noText}`,
   indexReadTimeout: (stage, title, seconds) => `${stage}，${title} 在 ${seconds} 秒内未响应，本轮索引已停止。`,
   rebuildIndex: '全量重建索引',
   clearIndex: '清空向量库',
@@ -174,6 +178,7 @@ const ZH_CN: LocaleStrings = {
   prefOpenaiApiKey: 'API Key',
   prefOpenaiModel: '模型名称',
   prefOpenaiDimensions: '输出维度（0 表示模型默认）',
+  prefOpenaiBatchSize: '每批输入条数（0 表示自动测试）',
   prefChunkSize: '段落切片长度（字符）',
   prefChunkOverlap: '切片重叠长度（字符）',
   prefMaxPdfPages: '单篇最大解析页数（0 为不限）',
@@ -182,6 +187,7 @@ const ZH_CN: LocaleStrings = {
   prefDefaultMode: '默认检索范围',
   prefEnablePopover: '在顶部检索框输入时自动弹出语义候选浮层',
   prefSemanticWeight: '语义向量权重（0 = 纯词法，1 = 纯向量）',
+  prefNormalizeNotation: '允许普通数字匹配上下标数字',
   prefClearOnJump: '点击候选跳转到 PDF 后自动清空顶部检索框',
   prefLanguage: '界面语言',
   prefExportJson: '导出三文件向量 JSON…',
@@ -219,7 +225,7 @@ const EN_US: LocaleStrings = {
   emptyIndexTitle: 'Vector index is empty',
   emptyIndexDesc: 'Start silent background indexing to vectorize metadata and PDF passages without touching zotero.sqlite.',
   setupBannerCta: 'Download Local ONNX Model',
-  setupBannerHint: 'Local ONNX model not installed yet — using cross-lingual lexical bridge.',
+  setupBannerHint: 'Keyword search is available. Install a local ONNX model for cross-language semantic search.',
   openSettings: 'Settings',
   openPalette: 'Command Palette',
   buildIndexNow: 'Index Missing / Changed',
@@ -228,9 +234,10 @@ const EN_US: LocaleStrings = {
   indexCheckingFile: 'Checking attachment',
   indexReadingPdf: 'Extracting PDF text',
   indexEmbeddingPdf: (completed, total) => `Embedding PDF passages ${completed}/${total}`,
-  indexSavingPdf: 'Saving PDF index',
   indexTextDone: (items, chunks) => `Text indexing completed. Processed ${items} items, saved ${chunks} passages, and generated no vectors in this scan.`,
   indexVectorDone: (items, chunks) => `Vector indexing scan completed. Processed ${items} items and generated ${chunks} passage vectors.`,
+  indexIncomplete: (items, failures, error) => `Indexing incomplete. Checked ${items} items with ${failures} failures. First error: ${error}`,
+  indexAttachmentIssues: (unfinished, missing, noText) => `${unfinished} unfinished attachments · ${missing} missing PDFs · ${noText} without extractable text`,
   indexReadTimeout: (stage, title, seconds) => `${stage}. ${title} did not respond within ${seconds} seconds. Indexing stopped.`,
   rebuildIndex: 'Rebuild All',
   clearIndex: 'Clear Index',
@@ -272,6 +279,7 @@ const EN_US: LocaleStrings = {
   prefOpenaiApiKey: 'API Key',
   prefOpenaiModel: 'Model Name',
   prefOpenaiDimensions: 'Dimensions (0 = model default)',
+  prefOpenaiBatchSize: 'Inputs per batch (0 = auto-test)',
   prefChunkSize: 'Chunk Size (chars)',
   prefChunkOverlap: 'Chunk Overlap (chars)',
   prefMaxPdfPages: 'Max PDF Pages per File (0 = unlimited)',
@@ -280,6 +288,7 @@ const EN_US: LocaleStrings = {
   prefDefaultMode: 'Default Search Mode',
   prefEnablePopover: 'Auto-open semantic popover under top search bar',
   prefSemanticWeight: 'Semantic Weight (0 = lexical, 1 = dense vector)',
+  prefNormalizeNotation: 'Match plain digits to superscript and subscript digits',
   prefClearOnJump: 'Clear top search bar after jumping to a PDF page',
   prefLanguage: 'UI Language',
   prefExportJson: 'Export 3-File Vector JSON…',

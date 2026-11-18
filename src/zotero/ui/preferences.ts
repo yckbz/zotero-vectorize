@@ -48,6 +48,8 @@ class VectorizePreferencesController {
   private container: HTMLElement | null = null;
   private initialized = false;
   private unsubProgress: (() => void) | null = null;
+  private unsubWrites: (() => void) | null = null;
+  private statsTimer: ReturnType<typeof setTimeout> | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private statsSeq = 0;
   private progressFrame: number | null = null;
@@ -93,6 +95,9 @@ class VectorizePreferencesController {
       this.unsubProgress();
       this.unsubProgress = null;
     }
+    this.unsubWrites?.();
+    this.unsubWrites = null;
+    this.cancelScheduledStats();
     if (this.progressFrame !== null) {
       window.cancelAnimationFrame(this.progressFrame);
       this.progressFrame = null;
@@ -147,6 +152,13 @@ class VectorizePreferencesController {
   }
 
   private subscribeToProgress(svc: VectorizeService): void {
+    this.unsubWrites = svc.store.subscribeWrites(() => {
+      if (this.statsTimer !== null) return;
+      this.statsTimer = setTimeout(() => {
+        this.statsTimer = null;
+        void this.refreshStatsAndStatus();
+      }, 1000);
+    });
     this.unsubProgress = svc.subscribeProgress((progress) => {
       if (this.progressFrame === null) {
         this.progressFrame = window.requestAnimationFrame(() => {
@@ -154,8 +166,18 @@ class VectorizePreferencesController {
           this.updateProgressDom(svc.getIndexProgress());
         });
       }
-      if (progress.phase === 'completed' || progress.phase === 'error') void this.refreshStatsAndStatus();
+      if (progress.phase === 'completed' || progress.phase === 'incomplete' || progress.phase === 'error') {
+        this.cancelScheduledStats();
+        void this.refreshStatsAndStatus();
+      }
     });
+  }
+
+  private cancelScheduledStats(): void {
+    if (this.statsTimer !== null) {
+      clearTimeout(this.statsTimer);
+      this.statsTimer = null;
+    }
   }
 
   private async refreshStatsAndStatus(): Promise<void> {
@@ -164,7 +186,8 @@ class VectorizePreferencesController {
     const seq = ++this.statsSeq;
     let stats, status;
     try {
-      [stats, status] = await Promise.all([svc.getStats(), svc.getEngineStatus()]);
+      status = await svc.getEngineStatus();
+      stats = await svc.getStats(status);
     } catch (error) {
       if (seq === this.statsSeq) this.setFeedback(String(error), 'err');
       return;
@@ -177,7 +200,12 @@ class VectorizePreferencesController {
     setTxt('zv-stat-items', `${stats.vectorizedItems} / ${stats.indexedItems}`);
     setTxt('zv-stat-chunks', `${stats.vectorizedChunks} / ${stats.indexedChunks}`);
     setTxt('zv-stat-db', formatBytes(stats.dbSizeBytes));
-    setTxt('zv-stat-fp', stats.modelFingerprint || status.modelFingerprint || '—');
+    setTxt('zv-stat-fp', status.modelFingerprint || '—');
+    const s = getStrings(svc.getConfig());
+    const unfinished = stats.pendingAttachments + stats.failedAttachments;
+    setTxt('zv-stat-attachment-issues', unfinished || stats.missingAttachments || stats.noTextAttachments
+      ? s.indexAttachmentIssues(unfinished, stats.missingAttachments, stats.noTextAttachments)
+      : '');
     const pill = document.getElementById('zv-pref-engine-pill');
     if (pill) {
       pill.textContent = status.statusMessage;
@@ -288,6 +316,7 @@ class VectorizePreferencesController {
           statCard(s.prefDbSize, 'zv-stat-db', '—'),
           statCard(s.prefActiveModel, 'zv-stat-fp', '—'),
         ]),
+        el(doc, 'div', { id: 'zv-stat-attachment-issues', className: 'zv-progress-text' }),
         el(doc, 'div', { className: 'zv-progress-track' }, [
           el(doc, 'div', { id: 'zv-pref-progress-fill', className: 'zv-progress-fill' }),
         ]),
@@ -477,6 +506,7 @@ class VectorizePreferencesController {
       }) as HTMLInputElement;
       baseInput.addEventListener('change', () => {
         svc.updateConfig({ openaiBaseUrl: baseInput.value.trim() });
+        void this.refreshStatsAndStatus();
       });
 
       const keyInput = el(doc, 'input', {
@@ -519,14 +549,19 @@ class VectorizePreferencesController {
       }) as HTMLInputElement;
       dimInput.addEventListener('change', () => {
         svc.updateConfig({ openaiDimensions: Math.max(0, Number(dimInput.value) || 0) });
+        void this.refreshStatsAndStatus();
       });
 
+      const batchInput = this.numberInput(doc, cfg.openaiBatchSize, 0, 256, (value) =>
+        svc.updateConfig({ openaiBatchSize: value })
+      );
       const testBtn = this.buildTestConnBtn(doc, svc, s);
 
       engineBody.appendChild(this.fieldRow(doc, s.prefOpenaiBaseUrl, baseInput));
       engineBody.appendChild(this.fieldRow(doc, s.prefOpenaiApiKey, keyInput));
       engineBody.appendChild(this.fieldRow(doc, s.prefOpenaiModel, el(doc, 'div', {}, [modelInput, datalist])));
       engineBody.appendChild(this.fieldRow(doc, s.prefOpenaiDimensions, dimInput));
+      engineBody.appendChild(this.fieldRow(doc, s.prefOpenaiBatchSize, batchInput));
       engineBody.appendChild(el(doc, 'div', { className: 'zv-btn-row' }, [testBtn]));
     }
 
@@ -625,6 +660,9 @@ class VectorizePreferencesController {
           doc,
           s.prefSemanticWeight,
           el(doc, 'div', { className: 'zv-inline-row' }, [weightInput, weightVal])
+        ),
+        this.checkboxRow(doc, s.prefNormalizeNotation, cfg.normalizeNotation, (value) =>
+          svc.updateConfig({ normalizeNotation: value })
         ),
         popoverChk,
         clearJumpChk,

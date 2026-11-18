@@ -9,6 +9,7 @@ import type { ZoteroItem } from '../types/zotero.d.ts';
 import type { EmbeddingProvider } from '../engines/provider.ts';
 import { chunkDocumentPages } from '../core/chunker.ts';
 import { buildModelFingerprint } from '../core/hash.ts';
+import { isFiniteVector } from '../core/math.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
 import { extractItemMetadata, extractPdfPages, getAttachmentSignature, isIndexableRegularItem } from './extractor.ts';
 import { getStrings } from './i18n.ts';
@@ -177,7 +178,7 @@ export class BackgroundIndexer {
     const pendingModelBackfill = this.pendingModelBackfill;
     this.pendingModelBackfill = null;
     if (this.disposed || this.cancelled) return;
-    if (pendingModelBackfill && this.progress.phase === 'completed') {
+    if (pendingModelBackfill && (this.progress.phase === 'completed' || this.progress.phase === 'incomplete')) {
       void this.startLibraryScan(false);
       return;
     }
@@ -404,10 +405,8 @@ export class BackgroundIndexer {
 
   private async saveAttachmentChunks(chunks: IndexedChunkRecord[], state: AttachmentStateRecord): Promise<void> {
     const { searchIndex, store } = this.deps;
-    const previousParents = await store.replaceAttachmentChunksAndState(
-      state.attachmentID, state.parentItemID, chunks, state
-    );
-    for (const id of [...previousParents, state.parentItemID]) {
+    const previousParents = await store.saveAttachmentChunksAndState(chunks, state, 'replace');
+    for (const id of [...(previousParents ?? []), state.parentItemID]) {
       searchIndex.replaceItemChunks(id, await store.getChunksForItem(id));
     }
   }
@@ -424,6 +423,7 @@ export class BackgroundIndexer {
     }
     const initialFp = provider.getModelFingerprint();
     const targetHasDim = status.dimensions > 0;
+    const chunkingKey = `1:${cfg.chunkSize}:${cfg.chunkOverlap}:${cfg.maxPdfPages}`;
 
     const indexingMessage = canEmbedNeural
       ? `Indexing with ${provider.model}…`
@@ -448,6 +448,11 @@ export class BackgroundIndexer {
     let savedChunks = 0;
     let skippedUnchanged = 0;
     let failedCount = 0;
+    let passageBatchSize: Promise<number> | undefined;
+    const recordFailure = (message: string): void => {
+      failedCount++;
+      this.emit({ failedCount, lastError: this.progress.lastError ?? message });
+    };
 
     for (const itemID of itemIds) {
       if (!(await this.waitIfPaused())) break;
@@ -489,8 +494,7 @@ export class BackgroundIndexer {
               fp = vector ? buildModelFingerprint(provider.engine, provider.model, vector.length) : '';
             } catch (err: any) {
               embedFailed = true;
-              failedCount++;
-              this.emit({ failedCount, lastError: err?.message || String(err) });
+              recordFailure(err?.message || String(err));
             }
           }
 
@@ -534,9 +538,8 @@ export class BackgroundIndexer {
           }
         }
       } catch (err: any) {
-        failedCount++;
         Zotero.logError(err);
-        this.emit({ failedCount, lastError: err?.message || String(err) });
+        recordFailure(err?.message || String(err));
       }
 
       // 2. PDF Attachments incremental check
@@ -564,160 +567,187 @@ export class BackgroundIndexer {
             getAttachmentSignature(att),
             strings.indexReadTimeout(strings.indexCheckingFile, attachmentTitle, ATTACHMENT_READ_TIMEOUT_MS / 1000)
           );
-          const prevState = await this.deps.store.getAttachmentState(att.id);
-          const previousParent = prevState?.parentItemID;
-          const sameParent = previousParent === item.id;
-
-          const sameFile =
-            prevState !== null &&
+          const { store, searchIndex } = this.deps;
+          const prevState = await store.getAttachmentState(att.id);
+          const sameSource = prevState !== null &&
+            prevState.parentItemID === item.id &&
+            prevState.attachmentKey === att.key &&
             prevState.fileHash === sig.fileHash &&
             prevState.mtime === sig.mtime;
+          const sameLayout = !forceRebuild && sameSource && prevState.chunkingKey === chunkingKey;
+          const modelFp = provider.getModelFingerprint();
+          const modelHasDim = targetHasDim || modelFp !== initialFp;
+          const isCurrent = () => !item.deleted && !att.deleted && att.parentItemID === item.id;
 
-          const attUpToDate =
-            !forceRebuild && sameParent && sameFile &&
-            (prevState.status === 'no_text' ||
-              prevState.status === 'missing' ||
+          if (sameLayout && (prevState.status === 'no_text' || prevState.status === 'missing' ||
               (prevState.status === 'indexed' &&
-                (!canEmbedNeural || fingerprintMatches(prevState.modelFingerprint, initialFp, targetHasDim))));
-
-          if (attUpToDate) {
+                (!canEmbedNeural || fingerprintMatches(prevState.modelFingerprint, modelFp, modelHasDim))))) {
             skippedUnchanged++;
             processedAttachments++;
             this.emit({ skippedUnchanged, processedAttachments });
             continue;
           }
 
-          if (!forceRebuild && !canEmbedNeural && (prevState === null || (sameParent && sameFile))) {
-            const existingChunks = await this.deps.store.getChunksForItem(item.id);
-            if (existingChunks.some((c) => c.attachmentID === att.id && c.vector !== null && c.dim > 0)) {
-              skippedUnchanged++;
-              processedAttachments++;
-              this.emit({ skippedUnchanged, processedAttachments });
-              continue;
-            }
-          }
-
-          this.emit({ message: strings.indexReadingPdf });
-          const extracted = await waitForAttachmentRead(
-            extractPdfPages(att, cfg.maxPdfPages, sig),
-            strings.indexReadTimeout(strings.indexReadingPdf, attachmentTitle, ATTACHMENT_READ_TIMEOUT_MS / 1000)
-          );
-          if (extracted.status !== 'indexed') {
-            const state: AttachmentStateRecord = {
-              attachmentID: att.id,
-              attachmentKey: att.key,
-              parentItemID: item.id,
-              fileHash: extracted.fileHash,
-              mtime: extracted.mtime,
-              status: extracted.status,
-              chunkCount: 0,
-              modelFingerprint: canEmbedNeural ? initialFp : '',
-              errorMessage: extracted.errorMessage,
-              updatedAt: Date.now(),
-            };
-            await this.saveAttachmentChunks([], state);
-            if (extracted.status === 'error') {
-              failedCount++;
-              this.emit({ failedCount, lastError: extracted.errorMessage });
-            }
+          const existing = !forceRebuild && (sameSource || (prevState === null && !canEmbedNeural))
+            ? (await store.getChunksForItem(item.id)).filter((chunk) => chunk.attachmentID === att.id)
+            : [];
+          if (!canEmbedNeural && prevState === null && existing.some((chunk) => chunk.vector)) {
+            skippedUnchanged++;
             processedAttachments++;
-            this.emit({ processedAttachments });
+            this.emit({ skippedUnchanged, processedAttachments });
             continue;
           }
 
-          const docChunks = chunkDocumentPages(extracted.pages, {
-            itemID: item.id,
-            itemKey: item.key,
-            attachmentID: att.id,
-            attachmentKey: att.key,
-            attachmentTitle,
-            chunkSize: cfg.chunkSize,
-            chunkOverlap: cfg.chunkOverlap,
-          });
-
-          let vectors: Float32Array[] = [];
-          let chunkFp = '';
-          let chunkEmbedErr = '';
-          if (canEmbedNeural && docChunks.length > 0) {
-            try {
-              this.emit({ message: strings.indexEmbeddingPdf(0, docChunks.length) });
-              vectors = await provider.embedPassages(docChunks.map((c) => c.text), (completed) => {
-                if (!this.paused && !this.cancelled) {
-                  this.emit({ message: strings.indexEmbeddingPdf(completed, docChunks.length) });
-                }
-              });
-              if (vectors[0]) {
-                chunkFp = buildModelFingerprint(provider.engine, provider.model, vectors[0].length);
-              }
-            } catch (err: any) {
-              chunkEmbedErr = err?.message || String(err);
-              failedCount++;
-              vectors = [];
-              chunkFp = '';
-              this.emit({ failedCount, lastError: chunkEmbedErr });
-            }
-          }
-
-          const preservePrevChunks =
-            !forceRebuild &&
-            Boolean(chunkEmbedErr) &&
-            ((prevState !== null &&
-              sameParent && sameFile &&
-              prevState.status === 'indexed' &&
-              Boolean(prevState.modelFingerprint)) ||
-              ((prevState === null || (sameParent && sameFile)) &&
-                (await this.deps.store.getChunksForItem(item.id)).some(
-                  (c) => c.attachmentID === att.id && c.vector !== null && c.dim > 0
-                )));
-
-          if (preservePrevChunks || item.deleted || att.deleted) {
-            processedAttachments++;
-            this.emit({ processedAttachments });
-            continue;
-          }
-
-          const now = Date.now();
-          const indexedChunks: IndexedChunkRecord[] = docChunks.map((c, idx) => {
-            const v = vectors[idx] ?? null;
-            return {
-              ...c,
-              vector: v,
-              dim: v ? v.length : 0,
-              modelFingerprint: v ? chunkFp : '',
-              updatedAt: now,
-            };
-          });
-
+          const reuseLayout = sameLayout && existing.length > 0 && existing.length === prevState.chunkCount;
           const state: AttachmentStateRecord = {
             attachmentID: att.id,
             attachmentKey: att.key,
             parentItemID: item.id,
-            fileHash: extracted.fileHash,
-            mtime: extracted.mtime,
-            status: chunkEmbedErr ? 'error' : 'indexed',
-            chunkCount: indexedChunks.length,
-            modelFingerprint: chunkFp,
-            errorMessage: chunkEmbedErr || undefined,
-            updatedAt: now,
+            fileHash: sig.fileHash,
+            mtime: sig.mtime,
+            chunkingKey,
+            status: 'indexed',
+            chunkCount: 0,
+            modelFingerprint: '',
+            updatedAt: Date.now(),
           };
+          let chunks = existing;
+          if (!reuseLayout) {
+            this.emit({ message: strings.indexReadingPdf });
+            const extracted = await waitForAttachmentRead(
+              extractPdfPages(att, cfg.maxPdfPages, sig),
+              strings.indexReadTimeout(strings.indexReadingPdf, attachmentTitle, ATTACHMENT_READ_TIMEOUT_MS / 1000)
+            );
+            if (!isCurrent() || this.cancelled || this.disposed) break;
+            state.status = extracted.status;
+            state.errorMessage = extracted.errorMessage;
+            if (extracted.status === 'indexed') {
+              const byId = new Map(existing.map((chunk) => [chunk.chunkId, chunk]));
+              chunks = chunkDocumentPages(extracted.pages, {
+                itemID: item.id,
+                itemKey: item.key,
+                attachmentID: att.id,
+                attachmentKey: att.key,
+                attachmentTitle,
+                chunkSize: cfg.chunkSize,
+                chunkOverlap: cfg.chunkOverlap,
+              }).map((chunk) => {
+                // After a layout change, reuse only vectors verified against the new chunk text.
+                const stored = byId.get(chunk.chunkId);
+                const match = stored?.text === chunk.text ? stored : undefined;
+                return {
+                  ...chunk,
+                  vector: match?.vector ?? null,
+                  dim: match?.dim ?? 0,
+                  modelFingerprint: match?.modelFingerprint ?? '',
+                  updatedAt: match?.updatedAt ?? state.updatedAt,
+                };
+              });
+              if (!chunks.length) state.status = 'no_text';
+            } else {
+              if (extracted.status === 'error' && existing.length) {
+                recordFailure(extracted.errorMessage || strings.indexReadingPdf);
+                processedAttachments++;
+                this.emit({ processedAttachments });
+                continue;
+              }
+              chunks = [];
+            }
+          }
 
-          if (!this.paused) this.emit({ message: strings.indexSavingPdf });
-          await this.saveAttachmentChunks(indexedChunks, state);
+          state.chunkCount = chunks.length;
+          if (!isCurrent()) continue;
+          if (state.status !== 'indexed' || !canEmbedNeural) {
+            if (!reuseLayout) {
+              await this.saveAttachmentChunks(chunks, state);
+              savedChunks += chunks.length;
+            }
+            if (state.status === 'error') recordFailure(state.errorMessage || strings.indexReadingPdf);
+            processedAttachments++;
+            this.emit({ processedAttachments });
+            continue;
+          }
 
-          savedChunks += indexedChunks.length;
-          embeddedChunks += indexedChunks.filter((chunk) => chunk.vector !== null).length;
+          const matchingFingerprint = chunks.find((chunk) =>
+            chunk.vector && fingerprintMatches(chunk.modelFingerprint, modelFp, modelHasDim)
+          )?.modelFingerprint;
+          state.modelFingerprint = matchingFingerprint || (modelHasDim ? modelFp : '');
+          const needed = chunks.filter((chunk) =>
+            !chunk.vector || chunk.modelFingerprint !== state.modelFingerprint
+          );
+          state.status = needed.length ? 'pending' : 'indexed';
+          if (!reuseLayout) {
+            await this.saveAttachmentChunks(chunks, state);
+          } else {
+            const written = await store.saveAttachmentChunksAndState([], state, 'checkpoint');
+            if (written === null) continue;
+          }
+          savedChunks += chunks.length;
+
+          try {
+            let completed = chunks.length - needed.length;
+            this.emit({ message: strings.indexEmbeddingPdf(completed, chunks.length) });
+            for (let start = 0; start < needed.length;) {
+              if (!(await this.waitIfPaused()) || !isCurrent()) break;
+              let batch: IndexedChunkRecord[];
+              let vectors: Float32Array[];
+              try {
+                const batchSize = await (passageBatchSize ??= Promise.resolve(provider.getPassageBatchSize()));
+                if (!(await this.waitIfPaused()) || !isCurrent()) break;
+                batch = needed.slice(start, start + batchSize);
+                vectors = await provider.embedPassages(batch.map((chunk) => chunk.text));
+                const dim = vectors[0]?.length;
+                const fp = buildModelFingerprint(provider.engine, provider.model, dim);
+                if (!dim || vectors.length !== batch.length ||
+                    vectors.some((vector) => vector.length !== dim || !isFiniteVector(vector)) ||
+                    (state.modelFingerprint && state.modelFingerprint !== fp)) {
+                  throw new Error('Embedding provider returned invalid or incompatible PDF vectors');
+                }
+                state.modelFingerprint = fp;
+              } catch (err: any) {
+                if (isCurrent() && !this.cancelled && !this.disposed) {
+                  state.status = 'error';
+                  const message = err?.message || String(err);
+                  state.errorMessage = message;
+                  state.updatedAt = Date.now();
+                  const written = await store.saveAttachmentChunksAndState([], state, 'checkpoint');
+                  if (written !== null) recordFailure(message);
+                }
+                break;
+              }
+              if (!isCurrent()) break;
+              state.status = start + batch.length === needed.length ? 'indexed' : 'pending';
+              state.updatedAt = Date.now();
+              const checkpoint = batch.map((chunk, index) => ({
+                ...chunk,
+                vector: vectors[index],
+                dim: vectors[index].length,
+                modelFingerprint: state.modelFingerprint,
+                updatedAt: state.updatedAt,
+              }));
+              const written = await store.saveAttachmentChunksAndState(checkpoint, state, 'checkpoint');
+              if (written === null) break;
+              start += batch.length;
+              completed += batch.length;
+              embeddedChunks += batch.length;
+              if (!this.paused && !this.cancelled) {
+                this.emit({ embeddedChunks, message: strings.indexEmbeddingPdf(completed, chunks.length) });
+              }
+            }
+          } finally {
+            searchIndex.replaceItemChunks(item.id, await store.getChunksForItem(item.id));
+          }
           processedAttachments++;
           this.emit({ embeddedChunks, processedAttachments });
         } catch (err: any) {
-          failedCount++;
+          recordFailure(err?.message || String(err));
           if (err instanceof AttachmentReadTimeout) {
-            // A non-responsive Zotero PDF worker may block its shared queue. Stop queueing reads in this scan.
-            this.emit({ failedCount });
+            // A stalled Zotero PDF worker may block the shared queue.
             throw err;
           }
           processedAttachments++;
           Zotero.logError(err);
-          this.emit({ failedCount, processedAttachments, lastError: err?.message || String(err) });
+          this.emit({ processedAttachments });
         }
         await yieldToEventLoop(10);
       }
@@ -732,11 +762,13 @@ export class BackgroundIndexer {
       this.emit({ phase: 'idle', currentTitle: '', message: 'Cancelled' });
     } else {
       this.emit({
-        phase: 'completed',
+        phase: failedCount ? 'incomplete' : 'completed',
         currentTitle: '',
-        message: canEmbedNeural
-          ? strings.indexVectorDone(processedItems, embeddedChunks)
-          : strings.indexTextDone(processedItems, savedChunks),
+        message: failedCount
+          ? strings.indexIncomplete(processedItems, failedCount, this.progress.lastError || '')
+          : canEmbedNeural
+            ? strings.indexVectorDone(processedItems, embeddedChunks)
+            : strings.indexTextDone(processedItems, savedChunks),
       });
     }
   }

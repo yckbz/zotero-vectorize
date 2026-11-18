@@ -1,88 +1,28 @@
-/**
- * Lexical + CJK Bigram + Fuzzy + Bilingual EN<->ZH Academic Concept Bridge.
- * Used both as zero-wait fallback before ONNX download and as hybrid reranker signal alongside dense vectors.
- */
+const SCRIPT_DIGITS = '⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉';
+const SCRIPT_DIGIT = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/;
+const WORD_PART = /[\p{Script=Latin}0-9⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]+/gu;
+const LATIN_TOKEN = /[\p{Script=Latin}0-9⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]+(?:[._-][\p{Script=Latin}0-9⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]+)*/gu;
+const LATIN_OR_DIGIT = /[\p{Script=Latin}0-9⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉_]/u;
 
-const CONCEPT_PAIRS: Array<[string[], string[]]> = [
-  // AI / ML / NLP
-  [['attention', 'self-attention', 'multi-head attention'], ['注意力', '注意力机制', '自注意力', '多头注意力']],
-  [['transformer', 'transformers'], ['变压器', '变换器', 'transformer']],
-  [['sparse', 'sparsity', 'sparse attention'], ['稀疏', '稀疏化', '稀疏注意力']],
-  [['long context', 'context window', 'long-context'], ['长上下文', '长文本', '上下文窗口', '长序列']],
-  [['large language model', 'llm', 'llms', 'language model'], ['大语言模型', '大模型', '语言模型']],
-  [['reinforcement learning', 'rl', 'rlhf', 'policy gradient'], ['强化学习', '人类反馈强化学习', '策略梯度', '对齐']],
-  [['fine-tuning', 'finetuning', 'fine tuning', 'lora', 'adapter'], ['微调', '参数高效微调', '低秩自适应']],
-  [['retrieval', 'rag', 'retrieval-augmented'], ['检索', '检索增强', '检索增强生成', '召回']],
-  [['embedding', 'embeddings', 'representation', 'vector'], ['嵌入', '向量', '表征', '向量化', '语义表示']],
-  [['contrastive learning', 'self-supervised'], ['对比学习', '自监督', '自监督学习']],
-  [['knowledge distillation', 'distillation'], ['知识蒸馏', '蒸馏']],
-  [['quantization', 'pruning', 'compression'], ['量化', '剪枝', '模型压缩']],
-  [['diffusion model', 'diffusion models', 'denoising diffusion'], ['扩散模型', '去噪扩散']],
-  [['graph neural network', 'gnn', 'knowledge graph'], ['图神经网络', '知识图谱']],
-  [['multimodal', 'vision-language', 'vlm'], ['多模态', '视觉语言']],
-  [['reasoning', 'chain-of-thought', 'cot'], ['推理', '思维链']],
-  [['hallucination', 'factuality', 'grounding'], ['幻觉', '事实性', '真实性']],
-  [['agent', 'agents', 'multi-agent', 'tool use'], ['智能体', '多智能体', '工具调用']],
-  [['benchmark', 'evaluation', 'dataset'], ['基准', '评测', '评估', '数据集']],
-  [['neural network', 'deep learning', 'backpropagation'], ['神经网络', '深度学习', '反向传播']],
-  [['gradient descent', 'optimization', 'optimizer'], ['梯度下降', '优化', '优化器']],
-  [['overfitting', 'generalization', 'regularization'], ['过拟合', '泛化', '正则化']],
-  [['segmentation', 'object detection', 'classification'], ['分割', '目标检测', '分类']],
-  [['clustering', 'dimensionality reduction', 'pca'], ['聚类', '降维']],
-  [['anomaly detection', 'outlier'], ['异常检测', '离群点']],
-  // Science / Math / Stats / Bio / Econ
-  [['hydrogen bond network connectivity', 'hydrogen-bond network connectivity'], ['氢键连通性', '氢键网络连通性']],
-  [['density functional theory', 'dft'], ['密度泛函理论']],
-  [['causal inference', 'causality', 'counterfactual'], ['因果推断', '因果关系', '反事实']],
-  [['bayesian', 'posterior', 'variational inference'], ['贝叶斯', '后验', '变分推断']],
-  [['randomized controlled trial', 'rct', 'clinical trial'], ['随机对照试验', '临床试验']],
-  [['meta-analysis', 'systematic review'], ['元分析', '荟萃分析', '系统综述']],
-  [['gene expression', 'transcriptomics', 'single-cell', 'rna-seq'], ['基因表达', '转录组', '单细胞']],
-  [['protein folding', 'protein structure', 'alphafold'], ['蛋白质折叠', '蛋白质结构']],
-  [['crispr', 'gene editing'], ['基因编辑']],
-  [['quantum', 'entanglement', 'qubit'], ['量子', '量子纠缠', '量子比特']],
-  [['differential equation', 'pde', 'ode'], ['微分方程', '偏微分方程']],
-  [['climate change', 'carbon emission', 'sustainability'], ['气候变化', '碳排放', '可持续']],
-  [['monetary policy', 'inflation', 'macroeconomic'], ['货币政策', '通货膨胀', '宏观经济']],
-  [['mechanism', 'architecture', 'framework', 'survey'], ['机制', '架构', '框架', '综述']],
-  [['memory', 'kv cache', 'caching'], ['记忆', '缓存', '显存']],
-  [['privacy', 'federated learning', 'differential privacy'], ['隐私', '联邦学习', '差分隐私']],
-  [['latency', 'throughput', 'efficiency', 'inference'], ['延迟', '吞吐量', '高效', '推理']],
-];
-
-const EN_TO_ZH = new Map<string, string[]>();
-const ZH_TO_EN = new Map<string, string[]>();
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export function shouldFoldDigits(query: string, enabled = false): boolean {
+  // An explicitly typed superscript or subscript keeps its exact meaning.
+  return enabled && /[0-9]/.test(query) && !SCRIPT_DIGIT.test(query);
 }
 
-for (const [enTerms, zhTerms] of CONCEPT_PAIRS) {
-  for (const en of enTerms) {
-    const key = en.toLowerCase();
-    const list = EN_TO_ZH.get(key) ?? [];
-    for (const zh of zhTerms) {
-      if (!list.includes(zh)) list.push(zh);
+function lexicalText(text: string, foldDigits: boolean): string {
+  const input = foldDigits
+    ? text.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (digit) => String(SCRIPT_DIGITS.indexOf(digit) % 10))
+    : text;
+  return input.replace(WORD_PART, (token) => {
+    // Short acronyms and letter/number identifiers retain their spelling.
+    if (/^[A-Z]{2,4}$/.test(token) || (/\p{Script=Latin}/u.test(token) && /[0-9⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/.test(token))) {
+      return token;
     }
-    EN_TO_ZH.set(key, list);
-  }
-  for (const zh of zhTerms) {
-    const list = ZH_TO_EN.get(zh) ?? [];
-    for (const en of enTerms) {
-      const low = en.toLowerCase();
-      if (!list.includes(low)) list.push(low);
-    }
-    ZH_TO_EN.set(zh, list);
-  }
+    const lower = token.toLowerCase();
+    // Keep every search offset valid in the original snippet.
+    return lower.length === token.length ? lower : token;
+  });
 }
-
-const EN_CONCEPT_MATCHERS: Array<{ term: string; regex: RegExp; targets: string[] }> = Array.from(
-  EN_TO_ZH.entries()
-).map(([term, targets]) => ({
-  term,
-  regex: new RegExp(`(?:^|[^a-z0-9])${escapeRegExp(term)}(?:$|[^a-z0-9])`),
-  targets,
-}));
 
 const EN_STOPWORDS = new Set([
   'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'is', 'are',
@@ -119,17 +59,17 @@ export function hasCjk(text: string): boolean {
 }
 
 export function tokenizeForLexical(text: string): string[] {
-  return tokenizeLowerCase(text.toLowerCase());
+  return tokenize(lexicalText(text, false));
 }
 
-function tokenizeLowerCase(lower: string): string[] {
+function tokenize(text: string): string[] {
   const tokens: string[] = [];
 
   // Latin & alphanumeric tokens
-  const latinMatches = lower.match(/[a-z0-9][a-z0-9._-]{1,}/g) || [];
-  for (const w of latinMatches) {
-    if (EN_STOPWORDS.has(w)) continue;
+  for (const w of text.match(LATIN_TOKEN) || []) {
+    if ((w.length === 1 && !/[0-9⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/.test(w)) || EN_STOPWORDS.has(w)) continue;
     tokens.push(w);
+    if (!/^[a-z]+$/.test(w)) continue;
     const stemmed = lightStemEn(w);
     if (stemmed !== w && stemmed.length >= 3) {
       tokens.push(stemmed);
@@ -137,7 +77,7 @@ function tokenizeLowerCase(lower: string): string[] {
   }
 
   // CJK tokens: standalone single chars (excluding grammatical particles) or 2-3 char grams without filler noise
-  const cjkRuns = lower.match(/[\u4e00-\u9fff]+/g) || [];
+  const cjkRuns = text.match(/[\u4e00-\u9fff]+/g) || [];
   for (const run of cjkRuns) {
     const chars = Array.from(run);
     if (chars.length === 1) {
@@ -178,54 +118,6 @@ function tokenizeLowerCase(lower: string): string[] {
   return tokens;
 }
 
-export interface ExpandedQueryTerms {
-  directTokens: string[];
-  bridgedTokens: string[];
-  bridgedPhrases: string[];
-  hasCrossLingualExpansion: boolean;
-}
-
-export function expandQueryCrossLingually(query: string): ExpandedQueryTerms {
-  const lower = query.toLowerCase().trim();
-  const directTokens = Array.from(new Set(tokenizeForLexical(lower)));
-  const bridgedPhrases: string[] = [];
-  const bridgedSet = new Set<string>();
-
-  // Match Chinese concept terms -> expand to English terms
-  for (const [zhTerm, enTargets] of ZH_TO_EN.entries()) {
-    if (lower.includes(zhTerm)) {
-      for (const en of enTargets) {
-        bridgedPhrases.push(en);
-        for (const t of tokenizeForLexical(en)) {
-          bridgedSet.add(t);
-        }
-      }
-    }
-  }
-
-  // Match English concept terms -> expand to Chinese terms (word-boundary safe so "world" != "rl", "model" != "ode")
-  for (const matcher of EN_CONCEPT_MATCHERS) {
-    if (matcher.regex.test(lower)) {
-      for (const zh of matcher.targets) {
-        bridgedPhrases.push(zh);
-        for (const t of tokenizeForLexical(zh)) {
-          bridgedSet.add(t);
-        }
-      }
-    }
-  }
-
-  const directSet = new Set(directTokens);
-  const bridgedTokens = Array.from(bridgedSet).filter((t) => !directSet.has(t));
-
-  return {
-    directTokens,
-    bridgedTokens,
-    bridgedPhrases: Array.from(new Set(bridgedPhrases)),
-    hasCrossLingualExpansion: bridgedTokens.length > 0,
-  };
-}
-
 /**
  * Bounded Levenshtein edit distance (for typo/fuzzy impression recall on Latin terms).
  */
@@ -253,14 +145,15 @@ export function editDistance(a: string, b: string): number {
 
 export function prepareLexicalText(
   fields: { title?: string; meta?: string; body?: string },
-  vocabulary?: Map<string, string>
+  vocabulary?: Map<string, string>,
+  foldDigits = false
 ) {
-  const titleLower = (fields.title || '').toLowerCase();
-  const metaLower = (fields.meta || '').toLowerCase();
-  const bodyLower = (fields.body || '').toLowerCase();
-  const combined = `${titleLower} ${metaLower} ${bodyLower}`;
+  const title = lexicalText(fields.title || '', foldDigits);
+  const meta = lexicalText(fields.meta || '', foldDigits);
+  const body = lexicalText(fields.body || '', foldDigits);
+  const combined = `${title} ${meta} ${body}`;
   const collectTokens = (text: string) => {
-    const tokens = Array.from(new Set(tokenizeLowerCase(text))).sort();
+    const tokens = Array.from(new Set(tokenize(text))).sort();
     if (vocabulary) {
       for (let i = 0; i < tokens.length; i++) {
         const token = tokens[i];
@@ -272,11 +165,10 @@ export function prepareLexicalText(
     return tokens;
   };
   return {
-    titleLower,
+    title,
     combined,
     docTokens: collectTokens(combined),
-    titleTokens: collectTokens(titleLower),
-    isCjk: hasCjk(combined),
+    titleTokens: collectTokens(title),
   };
 }
 
@@ -297,7 +189,7 @@ function hasFuzzyMatch(tokens: string[], target: string, matches: Map<string, bo
     if (token.length < 5 || Math.abs(target.length - token.length) > limit) continue;
     let match = matches.get(token);
     if (match === undefined) {
-      match = /^[a-z0-9]+$/.test(token) && editDistance(target, token) <= limit;
+      match = /^[a-z]+$/.test(token) && editDistance(target, token) <= limit;
       matches.set(token, match);
     }
     if (match) return true;
@@ -305,133 +197,83 @@ function hasFuzzyMatch(tokens: string[], target: string, matches: Map<string, bo
   return false;
 }
 
-export function createLexicalScorer(query: string, exp = expandQueryCrossLingually(query)) {
-  const qLower = query.toLowerCase().trim();
-  const queryIsCjk = hasCjk(qLower);
-  const fuzzyMatches = new Map(exp.directTokens
-    .filter((token) => token.length >= 5 && /^[a-z0-9]+$/.test(token))
+function* literalMatches(text: string, term: string): Generator<number> {
+  if (!term) return;
+  const checkLeft = LATIN_OR_DIGIT.test(term[0]);
+  const checkRight = LATIN_OR_DIGIT.test(term[term.length - 1]);
+  let start = text.indexOf(term);
+  while (start >= 0) {
+    const end = start + term.length;
+    if ((!checkLeft || start === 0 || !LATIN_OR_DIGIT.test(text[start - 1])) &&
+        (!checkRight || end === text.length || !LATIN_OR_DIGIT.test(text[end]))) {
+      yield start;
+    }
+    start = text.indexOf(term, end);
+  }
+}
+
+export function createLexicalScorer(query: string, foldDigits = false, extraTerms = '') {
+  const phrase = lexicalText(query.trim(), foldDigits);
+  const tokens = [...new Set(tokenize(`${phrase} ${lexicalText(extraTerms, foldDigits)}`))];
+  const fuzzyMatches = new Map(tokens
+    .filter((token) => token.length >= 5 && /^[a-z]+$/.test(token))
     .map((token) => [token, new Map<string, boolean>()]));
-  const maxDenominator = Math.max(2.5, exp.directTokens.length * 1.15 + (exp.bridgedTokens.length > 0 ? 1.5 : 0));
+  const maxDenominator = Math.max(2.5, tokens.length * 1.15);
 
-  return (doc: ReturnType<typeof prepareLexicalText>): { score: number; crossLingualHit: boolean } => {
-    if (exp.directTokens.length === 0 && exp.bridgedTokens.length === 0) {
-      return { score: 0, crossLingualHit: false };
-    }
-    const { titleLower, combined, titleTokens, docTokens, isCjk } = doc;
-
-    let rawScore = 0;
-    let directHits = 0;
-    let bridgedHits = 0;
-
-    if (qLower.length >= 2 && titleLower.includes(qLower)) {
-      rawScore += 3.2;
-    } else if (qLower.length >= 2 && combined.includes(qLower)) {
-      rawScore += 1.8;
+  return ({ title, combined, titleTokens, docTokens }: ReturnType<typeof prepareLexicalText>): number => {
+    if (tokens.length === 0) return 0;
+    let score = 0;
+    if (phrase.length >= 2) {
+      if (!literalMatches(title, phrase).next().done) score += 3.2;
+      else if (!literalMatches(combined, phrase).next().done) score += 1.8;
     }
 
-    for (const tok of exp.directTokens) {
-      if (tok.length === 1) {
-        if (titleLower.includes(tok)) {
-          rawScore += 0.45;
-          directHits++;
-        } else if (combined.includes(tok)) {
-          rawScore += 0.25;
-          directHits++;
-        }
-        continue;
-      }
-      if (containsToken(titleTokens, tok)) {
-        rawScore += 1.6;
-        directHits++;
-      } else if (containsToken(docTokens, tok)) {
-        rawScore += 0.95;
-        directHits++;
+    for (const token of tokens) {
+      if (token.length === 1 && hasCjk(token)) {
+        if (title.includes(token)) score += 0.45;
+        else if (combined.includes(token)) score += 0.25;
+      } else if (containsToken(titleTokens, token)) {
+        score += 1.6;
+      } else if (containsToken(docTokens, token)) {
+        score += 0.95;
       } else {
-        const matches = fuzzyMatches.get(tok);
+        const matches = fuzzyMatches.get(token);
         if (!matches) continue;
-        if (hasFuzzyMatch(titleTokens, tok, matches)) {
-          rawScore += 0.9;
-          directHits++;
-        } else if (hasFuzzyMatch(docTokens, tok, matches)) {
-          rawScore += 0.5;
-          directHits++;
-        }
+        if (hasFuzzyMatch(titleTokens, token, matches)) score += 0.9;
+        else if (hasFuzzyMatch(docTokens, token, matches)) score += 0.5;
       }
     }
 
-    for (const phrase of exp.bridgedPhrases) {
-      if (titleLower.includes(phrase)) {
-        rawScore += 2.2;
-        bridgedHits++;
-      } else if (combined.includes(phrase)) {
-        rawScore += 1.35;
-        bridgedHits++;
-      }
-    }
-
-    for (const tok of exp.bridgedTokens) {
-      if (containsToken(titleTokens, tok)) {
-        rawScore += tok.length >= 2 ? 1.0 : 0.3;
-        bridgedHits++;
-      } else if (containsToken(docTokens, tok)) {
-        rawScore += tok.length >= 2 ? 0.55 : 0.15;
-        bridgedHits++;
-      }
-    }
-
-    const normalized = Math.min(1, rawScore / maxDenominator);
-    const crossLingualHit =
-      bridgedHits > 0 && (queryIsCjk !== isCjk || directHits === 0);
-
-    return { score: normalized, crossLingualHit };
+    return Math.min(1, score / maxDenominator);
   };
 }
 
 export function scoreLexicalText(
   query: string,
   fields: { title?: string; meta?: string; body?: string },
-  expanded?: ExpandedQueryTerms
-): { score: number; crossLingualHit: boolean } {
-  return createLexicalScorer(query, expanded)(prepareLexicalText(fields));
+  normalizeNotation = false
+): number {
+  const foldDigits = shouldFoldDigits(query, normalizeNotation);
+  return createLexicalScorer(query, foldDigits)(prepareLexicalText(fields, undefined, foldDigits));
 }
 
 /**
- * Compute highlight character ranges [start, end] inside a snippet for safe DOM rendering.
+ * Compute highlight ranges in the original snippet.
  */
-export function computeHighlightRanges(text: string, query: string): Array<[number, number]> {
+export function computeHighlightRanges(text: string, query: string, normalizeNotation = false): Array<[number, number]> {
   if (!text || !query) return [];
-  const lowerText = text.toLowerCase();
-  const exp = expandQueryCrossLingually(query);
-  const candidates = new Set<string>();
-
-  const qClean = query.trim().toLowerCase();
-  if (qClean.length >= 2) candidates.add(qClean);
-  for (const t of exp.directTokens) {
-    if (t.length >= 2) candidates.add(t);
-  }
-  for (const p of exp.bridgedPhrases) {
-    if (p.length >= 2) candidates.add(p);
-  }
-  for (const t of exp.bridgedTokens) {
-    if (t.length >= 3) candidates.add(t);
-  }
+  const foldDigits = shouldFoldDigits(query, normalizeNotation);
+  const source = lexicalText(text, foldDigits);
+  const phrase = lexicalText(query.trim(), foldDigits);
+  const terms = new Set([phrase, ...tokenize(phrase)]);
 
   const ranges: Array<[number, number]> = [];
-  for (const term of candidates) {
-    const isAscii = /^[a-z0-9 ._+-]+$/.test(term);
-    let idx = lowerText.indexOf(term);
+  for (const term of terms) {
+    if (term.length < 2) continue;
     let count = 0;
-    while (idx !== -1 && count < 4) {
-      const end = idx + term.length;
-      const boundaryOk =
-        !isAscii ||
-        ((idx === 0 || !/[a-z0-9]/.test(lowerText[idx - 1])) &&
-          (end === lowerText.length || !/[a-z0-9]/.test(lowerText[end])));
-      if (boundaryOk || term.length >= 5) {
-        ranges.push([idx, end]);
-        count++;
-      }
-      idx = lowerText.indexOf(term, end);
+    for (const start of literalMatches(source, term)) {
+      ranges.push([start, start + term.length]);
+      if (++count === 4) break;
     }
   }
 

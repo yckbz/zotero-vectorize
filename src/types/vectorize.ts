@@ -18,6 +18,7 @@ export interface PluginConfig {
   openaiApiKey: string;
   openaiModel: string;
   openaiDimensions: number;
+  openaiBatchSize: number;
   // Indexing & chunking
   chunkSize: number;
   chunkOverlap: number;
@@ -27,6 +28,7 @@ export interface PluginConfig {
   // Search & UI
   defaultSearchMode: SearchMode;
   hybridSemanticWeight: number;
+  normalizeNotation: boolean;
   maxResults: number;
   enableTopSearchPopover: boolean;
   popoverMinChars: number;
@@ -137,7 +139,8 @@ export interface AttachmentStateRecord {
   parentItemID: number;
   fileHash: string;
   mtime: number;
-  status: 'indexed' | 'no_text' | 'missing' | 'error';
+  chunkingKey: string;
+  status: 'indexed' | 'no_text' | 'missing' | 'pending' | 'error';
   chunkCount: number;
   modelFingerprint: string;
   errorMessage?: string;
@@ -210,7 +213,7 @@ export interface EngineHealthStatus {
 }
 
 export interface IndexProgress {
-  phase: 'idle' | 'scanning' | 'indexing' | 'paused' | 'completed' | 'error';
+  phase: 'idle' | 'scanning' | 'indexing' | 'paused' | 'completed' | 'incomplete' | 'error';
   totalItems: number;
   processedItems: number;
   totalAttachments: number;
@@ -229,6 +232,10 @@ export interface StoreStats {
   indexedChunks: number;
   vectorizedChunks: number;
   indexedAttachments: number;
+  failedAttachments: number;
+  pendingAttachments: number;
+  missingAttachments: number;
+  noTextAttachments: number;
   modelFingerprint: string;
   dimensions: number;
   dbSizeBytes: number;

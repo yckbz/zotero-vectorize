@@ -93,6 +93,8 @@ export class LocalOnnxProvider implements EmbeddingProvider {
   private readonly fetchFn: typeof fetch;
 
   private readonly workers = [createWorkerSlot(), createWorkerSlot()] as const;
+  private readonly workerBatchSize = 8;
+  getPassageBatchSize(): number { return this.workerBatchSize * this.workers.length; }
   private generation = 0;
   private disposed = false;
   private detectedDim: number;
@@ -609,7 +611,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
 
   async embedPassages(texts: string[], onProgress?: (completed: number) => void): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
-    const batchSize = 8;
+    const batchSize = this.workerBatchSize;
     const slots = texts.length > batchSize ? this.workers : [this.workers[0]];
     const generation = this.generation;
     const out = new Array<Float32Array>(texts.length);

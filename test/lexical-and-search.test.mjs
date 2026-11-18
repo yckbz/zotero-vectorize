@@ -6,7 +6,7 @@ const lexical = await importTs('src/core/lexical.ts');
 const searchEngine = await importTs('src/core/search-engine.ts');
 const math = await importTs('src/core/math.ts');
 
-test('cross-lingual concept bridge matches Chinese query to English paper and highlights terms', () => {
+test('Cross-language search requires vectors and lexical highlights use the original query', () => {
   const index = new searchEngine.VectorSearchIndex();
   index.loadAll(
     [
@@ -83,35 +83,39 @@ test('cross-lingual concept bridge matches Chinese query to English paper and hi
         charEnd: 190,
         text: 'Section 4: Our sparse attention kernel reduces KV cache latency for long context inference.',
         snippet: 'Section 4: Our sparse attention kernel reduces KV cache latency for long context inference.',
-        vector: null,
-        dim: 0,
-        modelFingerprint: '',
+        vector: new Float32Array([1, 0]),
+        dim: 2,
+        modelFingerprint: 'test:model:2',
         updatedAt: 1000,
       },
     ]
   );
 
-  const res = index.search({
-    query: '注意力机制稀疏化',
-    queryVector: null,
-    activeModelFingerprint: '',
-    engineLabel: 'Lexical',
-    mode: 'hybrid',
-  });
+  const query = '注意力机制稀疏化';
+  const options = {
+    query, queryVector: null, activeModelFingerprint: 'test:model:2',
+    engineLabel: 'Test', mode: 'hybrid',
+  };
+  assert.deepEqual(index.search(options).hits, []);
 
-  assert.equal(res.hits.length, 1);
-  assert.equal(res.hits[0].itemID, 1);
-  assert.equal(res.hits[0].crossLingualMatched, true);
-  assert.equal(res.hits[0].bestChunk?.pageIndex, 6);
-  assert.ok(res.hits[0].bestChunk.highlightRanges.length > 0);
-  assert.equal(res.diagnostics.lexicalFallbackUsed, true);
+  const semantic = index.search({ ...options, queryVector: new Float32Array([1, 0]) });
+  assert.equal(semantic.hits.length, 1);
+  assert.equal(semantic.hits[0].itemID, 1);
+  assert.equal(semantic.hits[0].crossLingualMatched, true);
+  assert.equal(semantic.hits[0].bestChunk?.pageIndex, 6);
+  assert.deepEqual(semantic.hits[0].bestChunk.highlightRanges, []);
+
+  const lexical = index.search({ ...options, query: 'sparse attention' });
+  assert.equal(lexical.hits[0].bestChunk?.pageIndex, 6);
+  assert.ok(lexical.hits[0].bestChunk.highlightRanges.length > 0);
+  assert.equal(lexical.diagnostics.lexicalFallbackUsed, true);
 });
 
 test('fuzzy edit-distance tolerates misspelled Latin terms', () => {
   const res = lexical.scoreLexicalText('attenion mechanims', {
     title: 'Attention Mechanisms in Neural Networks',
   });
-  assert.ok(res.score > 0.2, `Expected typo-tolerant score > 0.2, got ${res.score}`);
+  assert.ok(res > 0.2, `Expected typo-tolerant score > 0.2, got ${res}`);
 });
 
 test('VectorSearchIndex hybrid, metadata, fulltext, collection filtering, and mismatch detection', () => {
@@ -254,21 +258,38 @@ test('computeHighlightRanges merges overlapping ranges', () => {
   }
 });
 
-test('expandQueryCrossLingually uses ASCII word boundaries and avoids false substring expansion', () => {
-  const safe = lexical.expandQueryCrossLingually('world model storage protocol');
-  assert.deepEqual(safe.bridgedPhrases, []);
-  assert.equal(safe.hasCrossLingualExpansion, false);
-
-  const real = lexical.expandQueryCrossLingually('RL with RAG and ODE solver');
-  assert.ok(real.bridgedPhrases.includes('强化学习'));
-  assert.ok(real.bridgedPhrases.includes('检索增强生成'));
-  assert.ok(real.bridgedPhrases.includes('偏微分方程'));
+test('Lexical scoring never introduces translated terms or their partial matches', () => {
+  assert.equal(lexical.scoreLexicalText('机制', { title: 'A survey of climate policy' }), 0);
+  assert.equal(lexical.scoreLexicalText('密度泛函理论', { title: 'Density of liquid nitrogen' }), 0);
+  assert.equal(lexical.scoreLexicalText('denoising diffusion models', { title: '去噪扩散模型用于图像生成' }), 0);
 });
 
-test('The bilingual glossary distinguishes physical diffusion from diffusion models', () => {
-  const imagePaper = { title: '去噪扩散模型用于图像生成' };
-  assert.equal(lexical.scoreLexicalText('alkane diffusion in carbon nanotubes', imagePaper).score, 0);
-  assert.ok(lexical.scoreLexicalText('denoising diffusion models', imagePaper).crossLingualHit);
+test('Optional digit matching preserves explicit scripts, token boundaries, and original highlight positions', () => {
+  const title = 'İntro: report v₂ and v²';
+  const normalized = lexical.scoreLexicalText('v2', { title }, true);
+  assert.equal(lexical.scoreLexicalText('v2', { title }), 0);
+  assert.ok(normalized > 0);
+  assert.deepEqual(lexical.computeHighlightRanges(title, 'v2', true).map(([a, b]) => title.slice(a, b)), ['v₂', 'v²']);
+  assert.deepEqual(lexical.computeHighlightRanges(title, 'v₂', true).map(([a, b]) => title.slice(a, b)), ['v₂']);
+  assert.equal(lexical.scoreLexicalText('v²', { title: 'report v₂' }, true), 0);
+  assert.equal(lexical.scoreLexicalText('CO', { title: 'Co catalysts' }), 0);
+  assert.equal(lexical.scoreLexicalText('Co', { title: 'CO catalysts' }), 0);
+  assert.equal(lexical.scoreLexicalText('NO', { title: 'NO₂ results' }, true), 0);
+  assert.equal(lexical.scoreLexicalText('NH3-SCR', { title: 'NH₃-SCR report' }), 0);
+  assert.ok(lexical.scoreLexicalText('NH3-SCR', { title: 'NH₃-SCR report' }, true) > 0);
+});
+
+test('Switching digit matching searches existing chunks and highlights the original text', () => {
+  const index = new searchEngine.VectorSearchIndex();
+  index.loadAll([{ itemID: 1, title: 'Paper', tags: [], vector: null }], [{
+    itemID: 1, chunkId: '1', text: 'Value x²', snippet: 'Value x²', vector: null,
+  }]);
+  const options = { query: 'x2', mode: 'fulltext', queryVector: null, activeModelFingerprint: '', engineLabel: 'Lexical' };
+  assert.equal(index.search(options).hits.length, 0);
+  const enabled = index.search({ ...options, normalizeNotation: true });
+  assert.deepEqual(enabled.hits[0].bestChunk.highlightRanges, [[6, 8]]);
+  assert.equal(index.search({ ...options, query: 'x₂', normalizeNotation: true }).hits.length, 0);
+  assert.equal(index.search(options).hits.length, 0);
 });
 
 test('VectorSearchIndex handles >70k items without spread stack overflow and supports alpha=0 pure lexical', () => {
@@ -361,6 +382,31 @@ test('A compatible zero-similarity fulltext vector keeps the configured lexical 
   assert.ok(Math.abs(result.hits[0].score - result.hits[0].lexicalScore * 0.15) < 1e-9);
 });
 
+test('Partially indexed results use the same lexical weight in each search mode', () => {
+  const text = 'constant potential';
+  const modelFingerprint = 'test:model:2';
+  const source = [
+    { itemID: 1, vector: null },
+    { itemID: 2, vector: new Float32Array([0.8, 0.6]), modelFingerprint },
+  ];
+  const index = new searchEngine.VectorSearchIndex();
+  index.loadAll(
+    source.map((record) => ({ ...record, title: text, tags: [] })),
+    source.map((record) => ({ ...record, chunkId: String(record.itemID), text, snippet: text }))
+  );
+  const options = {
+    query: text, activeModelFingerprint: modelFingerprint, engineLabel: 'Test',
+    queryVector: new Float32Array([1, 0]), hybridAlpha: 0.85,
+  };
+  for (const mode of ['metadata', 'fulltext', 'hybrid']) {
+    const result = index.search({ ...options, mode });
+    assert.deepEqual(result.hits.map((hit) => hit.itemID), [2, 1]);
+    assert.equal(result.hits[0].lexicalScore, result.hits[1].lexicalScore);
+    assert.deepEqual(index.search({ ...options, mode, hybridAlpha: 1 }).hits.map((hit) => hit.itemID), [2]);
+    assert.equal(index.search({ ...options, mode, queryVector: null }).hits.length, 2);
+  }
+});
+
 test('Hybrid search retains strong fulltext evidence when metadata is weak', () => {
   const index = new searchEngine.VectorSearchIndex();
   const query = 'interfacial hydrogen bond stability';
@@ -422,11 +468,11 @@ test('tokenizeForLexical filters Chinese grammatical/filler noise without clippi
 
   // Single-character CJK queries still match substrings directly, while filler-only ZH docs score 0 against unrelated topic
   const hit1 = lexical.scoreLexicalText('癌', { title: '早期肺癌免疫治疗进展' });
-  assert.ok(hit1.score > 0);
+  assert.ok(hit1 > 0);
 
   const unrelatedDecoy = lexical.scoreLexicalText('如何通过稀疏注意力降低长上下文的计算复杂度', {
     title: '基于深度学习的中国古典诗词情感分析与生成方法研究',
     body: '本文探讨在古典诗词中如何通过模型分析情感特征。',
   });
-  assert.equal(unrelatedDecoy.score, 0);
+  assert.equal(unrelatedDecoy, 0);
 });

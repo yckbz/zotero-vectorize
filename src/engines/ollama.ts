@@ -11,6 +11,7 @@ import {
 
 export class OllamaEmbeddingProvider implements EmbeddingProvider {
   readonly engine = 'ollama' as const;
+  getPassageBatchSize(): number { return 16; }
   readonly model: string;
   private readonly baseUrl: string;
   private readonly http: HttpRequestFn;
@@ -117,7 +118,7 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
 
   private async embedPassagesRaw(inputs: string[], onProgress?: (completed: number) => void): Promise<Float32Array[]> {
     if (inputs.length === 0) return [];
-    const batchSize = 16;
+    const batchSize = this.getPassageBatchSize();
     const out: Float32Array[] = [];
     for (let i = 0; i < inputs.length; i += batchSize) {
       const slice = inputs.slice(i, i + batchSize);
