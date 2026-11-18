@@ -70,6 +70,16 @@ export function getModelSlug(modelId: string): string {
   return modelId.replace(/[\\/:*?"<>|]+/g, '--');
 }
 
+interface WorkerSlot {
+  worker: WorkerLike | null;
+  initPromise: Promise<boolean> | null;
+  initialized: boolean;
+}
+
+function createWorkerSlot(): WorkerSlot {
+  return { worker: null, initPromise: null, initialized: false };
+}
+
 export class LocalOnnxProvider implements EmbeddingProvider {
   readonly engine = 'local-onnx' as const;
   readonly model: string;
@@ -82,9 +92,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
   private readonly workerFactory: WorkerFactoryFn;
   private readonly fetchFn: typeof fetch;
 
-  private worker: WorkerLike | null = null;
-  private initPromise: Promise<boolean> | null = null;
-  private initialized = false;
+  private readonly workers = [createWorkerSlot(), createWorkerSlot()] as const;
   private generation = 0;
   private disposed = false;
   private detectedDim: number;
@@ -255,13 +263,13 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     return (await this.resolveExistingAssets()) !== null;
   }
 
-  private async ensureInitialized(): Promise<boolean> {
+  private async ensureInitialized(slot = this.workers[0]): Promise<boolean> {
     if (this.disposed) return false;
-    if (this.initialized && this.worker) return true;
-    if (this.initPromise) return this.initPromise;
+    if (slot.initialized) return true;
+    if (slot.initPromise) return slot.initPromise;
     const generation = this.generation;
 
-    this.initPromise = (async () => {
+    slot.initPromise = (async () => {
       try {
         const assets = await this.resolveExistingAssets();
         if (!assets || generation !== this.generation) return false;
@@ -282,10 +290,10 @@ export class LocalOnnxProvider implements EmbeddingProvider {
         ) {
           poolingMode = 'cls';
         }
-        if (assets.configPath) {
+        if (assets.configPath && slot === this.workers[0]) {
           try {
             const cfg = JSON.parse(await this.fs.readUTF8(assets.configPath));
-            if (typeof cfg.hidden_size === 'number' && cfg.hidden_size > 0) {
+            if (generation === this.generation && typeof cfg.hidden_size === 'number' && cfg.hidden_size > 0) {
               this.detectedDim = cfg.hidden_size;
             }
           } catch {
@@ -300,7 +308,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
           return false;
         }
         worker.addEventListener('message', (ev: any) => {
-          if (this.worker !== worker) return;
+          if (slot.worker !== worker) return;
           const data = ev.data ?? ev;
           const entry = this.pending.get(data.id);
           if (!entry) return;
@@ -312,15 +320,16 @@ export class LocalOnnxProvider implements EmbeddingProvider {
           }
         });
         worker.addEventListener('error', (ev: any) => {
-          if (this.worker === worker) this.resetWorker(new Error(ev?.message || 'ONNX worker crashed'));
+          if (slot.worker === worker) this.resetWorkers(new Error(ev?.message || 'ONNX worker crashed'));
         });
 
-        this.worker = worker;
+        slot.worker = worker;
 
         const wasmCopy = wasmBytes.slice().buffer;
         const modelCopy = modelBytes.slice().buffer;
 
         const res = await this.sendToWorker(
+          slot,
           'init',
           {
             ortModuleCode,
@@ -334,34 +343,34 @@ export class LocalOnnxProvider implements EmbeddingProvider {
         );
 
         if (generation !== this.generation) return false;
-        if (typeof res?.dimensions === 'number' && res.dimensions > 0) {
+        if (slot === this.workers[0] && typeof res?.dimensions === 'number' && res.dimensions > 0) {
           this.detectedDim = res.dimensions;
         }
-        this.initialized = true;
+        slot.initialized = true;
         this.lastError = '';
         return true;
       } catch (error) {
         if (generation === this.generation) {
-          this.resetWorker(error instanceof Error ? error : new Error(String(error)));
+          this.resetWorkers(error instanceof Error ? error : new Error(String(error)));
         }
         return false;
       } finally {
-        if (generation === this.generation) this.initPromise = null;
+        if (generation === this.generation) slot.initPromise = null;
       }
     })();
 
-    return this.initPromise;
+    return slot.initPromise;
   }
 
-  private sendToWorker(type: 'init' | 'embed', payload?: any, transfer?: Transferable[]): Promise<any> {
-    const worker = this.worker;
+  private sendToWorker(slot: WorkerSlot, type: 'init' | 'embed', payload?: any, transfer?: Transferable[]): Promise<any> {
+    const worker = slot.worker;
     if (!worker) {
       return Promise.reject(new Error('ONNX worker not started'));
     }
     const id = this.nextReqId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (this.worker === worker) this.resetWorker(new Error(`ONNX worker request '${type}' timed out`));
+        if (slot.worker === worker) this.resetWorkers(new Error(`ONNX worker request '${type}' timed out`));
       }, 120000);
 
       this.pending.set(id, {
@@ -377,7 +386,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
       try {
         worker.postMessage({ id, type, payload }, transfer);
       } catch (error) {
-        this.resetWorker(error instanceof Error ? error : new Error(String(error)));
+        this.resetWorkers(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
@@ -576,7 +585,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     }
 
     if (tasks.length > 0 && !this.disposed) {
-      this.resetWorker(new Error('ONNX model is being reinitialized'));
+      this.resetWorkers(new Error('ONNX model is being reinitialized'));
     }
     const ok = await this.ensureInitialized();
     if (!ok) {
@@ -585,12 +594,13 @@ export class LocalOnnxProvider implements EmbeddingProvider {
   }
 
   async embedQuery(text: string): Promise<Float32Array> {
+    const generation = this.generation;
     const ready = await this.ensureInitialized();
-    if (!ready) {
+    if (!ready || generation !== this.generation) {
       throw new Error(this.lastError || 'Local ONNX model is not installed yet');
     }
     const formatted = formatTextForModel(text, 'query', this.model);
-    const res = await this.sendToWorker('embed', {
+    const res = await this.sendToWorker(this.workers[0], 'embed', {
       texts: [formatted],
       maxSeqLength: this.maxSeqLength,
     });
@@ -599,24 +609,52 @@ export class LocalOnnxProvider implements EmbeddingProvider {
 
   async embedPassages(texts: string[], onProgress?: (completed: number) => void): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
-    const ready = await this.ensureInitialized();
-    if (!ready) {
-      throw new Error(this.lastError || 'Local ONNX model is not installed yet');
-    }
-    const formatted = texts.map((t) => formatTextForModel(t, 'passage', this.model));
     const batchSize = 8;
-    const out: Float32Array[] = [];
-    for (let i = 0; i < formatted.length; i += batchSize) {
-      const slice = formatted.slice(i, i + batchSize);
-      const res = await this.sendToWorker('embed', {
-        texts: slice,
-        maxSeqLength: this.maxSeqLength,
-      });
-      for (const v of res.vectors) {
-        out.push(new Float32Array(v));
+    const slots = texts.length > batchSize ? this.workers : [this.workers[0]];
+    const generation = this.generation;
+    const out = new Array<Float32Array>(texts.length);
+    let nextOffset = 0;
+    let completed = 0;
+    let failed = false;
+
+    const run = async (slot: WorkerSlot): Promise<void> => {
+      try {
+        const ready = await this.ensureInitialized(slot);
+        if (!ready || generation !== this.generation) {
+          throw new Error(this.lastError || 'Local ONNX model is not installed yet');
+        }
+        while (!failed && nextOffset < texts.length) {
+          const offset = nextOffset;
+          nextOffset += batchSize;
+          const batch = texts.slice(offset, offset + batchSize).map((text) => formatTextForModel(text, 'passage', this.model));
+          const res = await this.sendToWorker(slot, 'embed', {
+            texts: batch,
+            maxSeqLength: this.maxSeqLength,
+          });
+          if (generation !== this.generation) {
+            throw new Error(this.lastError || 'ONNX workers were reset');
+          }
+          if (failed) return;
+          if (res.vectors.length !== batch.length) {
+            throw new Error('ONNX worker returned an unexpected number of vectors');
+          }
+          for (const [index, vector] of res.vectors.entries()) {
+            out[offset + index] = new Float32Array(vector);
+          }
+          completed += batch.length;
+          onProgress?.(completed);
+          if (generation !== this.generation) {
+            throw new Error(this.lastError || 'ONNX workers were reset');
+          }
+        }
+      } catch (error) {
+        failed = true;
+        throw error;
       }
-      onProgress?.(out.length);
-    }
+    };
+    const results = await Promise.allSettled(slots.map(run));
+    const failure = results.find((result) => result.status === 'rejected');
+    if (failure) throw failure.reason;
     return out;
   }
 
@@ -680,24 +718,26 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     };
   }
 
-  private resetWorker(error: Error): void {
+  private resetWorkers(error: Error): void {
     this.generation++;
-    const worker = this.worker;
-    this.worker = null;
-    this.initialized = false;
-    this.initPromise = null;
     this.lastError = error.message;
     for (const entry of this.pending.values()) entry.reject(error);
     this.pending.clear();
-    try {
-      worker?.terminate();
-    } catch (terminationError) {
-      if (typeof Zotero !== 'undefined') Zotero.logError(terminationError);
+    for (const slot of this.workers) {
+      const worker = slot.worker;
+      slot.worker = null;
+      slot.initialized = false;
+      slot.initPromise = null;
+      try {
+        worker?.terminate();
+      } catch (terminationError) {
+        if (typeof Zotero !== 'undefined') Zotero.logError(terminationError);
+      }
     }
   }
 
   async dispose(): Promise<void> {
     this.disposed = true;
-    this.resetWorker(new Error('ONNX provider was closed'));
+    this.resetWorkers(new Error('ONNX provider was closed'));
   }
 }

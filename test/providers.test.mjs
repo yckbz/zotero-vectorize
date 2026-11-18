@@ -186,6 +186,91 @@ test('LocalOnnxProvider downloads assets with mirror fallback and drives worker 
   await provider.dispose();
 });
 
+test('Local ONNX passage workers keep input order and report completed batches', { timeout: 5000 }, async () => {
+  const requests = [];
+  const workers = [];
+  const provider = new LocalOnnxProvider({
+    modelId: 'Xenova/multilingual-e5-small',
+    dataDir: '/tmp/zdata',
+    workerScriptUrl: 'file:///workers/onnx-worker.js',
+    fs: {
+      join: (...parts) => parts.join('/'),
+      exists: async () => true,
+      readBytes: async () => new Uint8Array([1]),
+      readUTF8: async () => '{}',
+    },
+    workerFactory: () => {
+      const listeners = new Map();
+      const worker = {
+        addEventListener: (type, fn) => listeners.set(type, fn),
+        terminated: false,
+        terminate() { this.terminated = true; },
+        crash: () => listeners.get('error')({ message: 'Test worker crashed' }),
+        postMessage(msg) {
+          const reply = (result) => listeners.get('message')({ data: { id: msg.id, ok: true, result } });
+          if (msg.type === 'init') {
+            reply({ dimensions: 1 });
+            return;
+          }
+          requests.push({
+            worker,
+            texts: msg.payload.texts,
+            finish: () => reply({ vectors: msg.payload.texts.map((text) => [Number(text.split(' ').at(-1))]) }),
+          });
+        },
+      };
+      workers.push(worker);
+      return worker;
+    },
+  });
+  const flush = () => new Promise(setImmediate);
+  try {
+    const query = provider.embedQuery('42');
+    await flush();
+    assert.equal(workers.length, 1);
+    assert.deepEqual(requests[0].texts, ['query: 42']);
+    requests.shift().finish();
+    assert.equal((await query)[0], 42);
+
+    const progress = [];
+    const texts = Array.from({ length: 17 }, (_, i) => String(i));
+    const embed = provider.embedPassages(texts, (count) => progress.push(count));
+    await flush();
+    assert.equal(workers.length, 2);
+    assert.equal(requests.length, 2);
+    const [first, second] = requests.splice(0);
+    assert.notEqual(first.worker, second.worker);
+    assert.deepEqual(first.texts, texts.slice(0, 8).map((text) => `passage: ${text}`));
+    assert.deepEqual(second.texts, texts.slice(8, 16).map((text) => `passage: ${text}`));
+    second.finish();
+    await flush();
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].worker, second.worker);
+    requests.shift().finish();
+    first.finish();
+    assert.deepEqual((await embed).map((v) => v[0]), texts.map(Number));
+    assert.deepEqual(progress, [8, 9, 17]);
+
+    const interrupted = provider.embedPassages(texts);
+    const interruptedCheck = assert.rejects(interrupted, /Test worker crashed/);
+    await flush();
+    assert.equal(requests.length, 2);
+    workers[1].crash();
+    await interruptedCheck;
+    assert.ok(workers.every((worker) => worker.terminated));
+    requests.length = 0;
+
+    const resumed = provider.embedPassages(['1']);
+    await flush();
+    assert.equal(workers.length, 3);
+    requests.shift().finish();
+    assert.equal((await resumed)[0][0], 1);
+  } finally {
+    await provider.dispose();
+  }
+  assert.ok(workers.every((worker) => worker.terminated));
+});
+
 test('LocalOnnxProvider skips model download when customModelDir already has onnx/model_quantized.onnx', async () => {
   const memFiles = new Map([
     ['/custom-model/tokenizer.json', new TextEncoder().encode('{}')],
