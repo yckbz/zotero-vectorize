@@ -86,6 +86,15 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
       if (s.startsWith('SELECT') && s.includes('FROM item_vectors') && !s.includes('COUNT(*)')) {
         return Array.from(tables.item_vectors.values());
       }
+      if (s === 'SELECT attachment_id FROM attachment_state') {
+        return Array.from(tables.attachment_state.values());
+      }
+      if (s === 'SELECT DISTINCT item_id FROM fulltext_chunks WHERE attachment_id = ? AND item_id != ?') {
+        const ids = new Set(Array.from(tables.fulltext_chunks.values())
+          .filter((row) => row.attachment_id === params[0] && row.item_id !== params[1])
+          .map((row) => row.item_id));
+        return Array.from(ids, (item_id) => ({ item_id }));
+      }
       if (s.startsWith('SELECT') && s.includes('FROM fulltext_chunks') && s.includes('WHERE item_id = ?')) {
         return Array.from(tables.fulltext_chunks.values()).filter((r) => r.item_id === params[0]);
       }
@@ -580,6 +589,45 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
     await svc.startIndexing(false);
     assert.equal(embeddingCalls, 2);
     assert.equal(svc.searchIndex.getItemById(10)?.modelFingerprint, 'ollama:nomic-embed-text:latest:2');
+
+    // A foreign item key must never resolve through a colliding numeric ID.
+    const collisionDir = path.join(tmpDir, 'compat-collision');
+    await fs.mkdir(collisionDir);
+    await fs.writeFile(path.join(collisionDir, 'metadata_vectors.json'), JSON.stringify([
+      { itemID: 10, key: 'PAPER10', title: paperTitle, vector: [1, 0] },
+      { itemID: 10, key: 'FOREIGN10', title: 'Foreign record', vector: [1, 0] },
+    ]));
+    await fs.writeFile(path.join(collisionDir, 'fulltext_vectors.json'), JSON.stringify([
+      { itemID: 10, item_key: 'FOREIGN10', text: 'Foreign passage', vector: [1, 0] },
+    ]));
+    const collision = await svc.importCompatJsonFromFolder(collisionDir);
+    assert.equal(collision.importedItems, 1);
+    assert.equal(collision.importedChunks, 0);
+    assert.equal(svc.searchIndex.getItemById(10)?.title, paperTitle);
+    assert.equal(svc.searchIndex.getChunkCount(), 2);
+
+    // Unchanged file signature and model must not hide an attachment move.
+    const formerParent = itemsMap.get(10);
+    itemsMap.set(30, { ...formerParent, id: 30, key: 'PAPER30' });
+    formerParent.getAttachments = () => [];
+    itemsMap.get(20).parentItemID = 30;
+    await svc.indexItems([20], false);
+    assert.equal((await svc.store.getAttachmentState(20))?.parentItemID, 30);
+    assert.equal((await svc.store.getChunksForItem(10)).length, 0);
+    assert.equal((await svc.store.getChunksForItem(30)).length, 2);
+    assert.deepEqual(svc.searchIndex.getAllChunks().map((c) => c.itemID), [30, 30]);
+
+    // A library scan reconciles both tables and memory when deletion events were missed.
+    itemsMap.get(20).deleted = true;
+    itemsMap.get(30).getAttachments = () => [];
+    await svc.startIndexing(false);
+    assert.equal(await svc.store.getAttachmentState(20), null);
+    assert.equal(svc.searchIndex.getChunkCount(), 0);
+    assert.equal((await svc.store.getChunksForItem(30)).length, 0);
+    itemsMap.delete(30);
+    await svc.startIndexing(false);
+    assert.equal(svc.searchIndex.getItemById(30), undefined);
+    assert.equal(tables.item_vectors.has(30), false);
 
     svc.updateConfig({ hybridSemanticWeight: 0 });
     svc.providerManager.getProvider = async () => { throw new Error('Lexical search called the embedding provider'); };

@@ -458,8 +458,7 @@ export function parseVectorStoreJson(
     }
 
     const parentResolved =
-      (rawItemKey ? itemByKey.get(rawItemKey) : undefined) ??
-      (rawItemID ? itemById.get(rawItemID) : undefined) ??
+      (rawItemKey ? itemByKey.get(rawItemKey) : rawItemID ? itemById.get(rawItemID) : undefined) ??
       resolveItemIDByKey(rawItemKey, rawItemID);
     if (!parentResolved) {
       skippedChunks++;

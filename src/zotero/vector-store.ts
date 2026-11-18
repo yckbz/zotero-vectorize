@@ -368,10 +368,16 @@ export class VectorStore {
     parentItemID: number,
     chunks: IndexedChunkRecord[],
     state: AttachmentStateRecord
-  ): Promise<void> {
+  ): Promise<number[]> {
     return this.enqueueWrite(async () => {
       const conn = await this.ensureConn();
+      let previousParents: number[] = [];
       await conn.executeTransaction(async () => {
+        const rows = await conn.queryAsync<{ item_id: number }>(
+          'SELECT DISTINCT item_id FROM fulltext_chunks WHERE attachment_id = ? AND item_id != ?',
+          [attachmentID, parentItemID]
+        );
+        previousParents = rows.map((row) => Number(row.item_id));
         await conn.queryAsync('DELETE FROM fulltext_chunks WHERE attachment_id = ?', [attachmentID]);
         // Also purge legacy imported chunks under attachment_id = 0 for same attachmentKey if re-indexed natively
         if (state.attachmentKey) {
@@ -433,6 +439,7 @@ export class VectorStore {
           ['last_indexed_at', String(Date.now())]
         );
       });
+      return previousParents;
     });
   }
 
@@ -479,6 +486,12 @@ export class VectorStore {
         await conn.queryAsync('DELETE FROM attachment_state WHERE parent_item_id = ?', [itemID]);
       });
     });
+  }
+
+  async getStoredAttachmentIDs(): Promise<number[]> {
+    const conn = await this.ensureConn();
+    const rows = await conn.queryAsync<{ attachment_id: number }>('SELECT attachment_id FROM attachment_state');
+    return rows.map((row) => Number(row.attachment_id));
   }
 
   async removeAttachment(attachmentID: number): Promise<number | null> {

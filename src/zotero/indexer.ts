@@ -219,6 +219,39 @@ export class BackgroundIndexer {
     }
   }
 
+  private async reconcileLibrary(regularIDs: Set<number>, pdfIDs: Set<number>): Promise<void> {
+    const { searchIndex, store } = this.deps;
+    const staleItems = new Set<number>();
+    const staleAttachments = new Set<number>();
+    const parentsToRefresh = new Set<number>();
+    for (const item of searchIndex.getAllItems()) {
+      if (!regularIDs.has(item.itemID)) staleItems.add(item.itemID);
+    }
+    for (const chunk of searchIndex.getAllChunks()) {
+      if (!regularIDs.has(chunk.itemID)) {
+        staleItems.add(chunk.itemID);
+      } else if (chunk.attachmentID > 0 && !pdfIDs.has(chunk.attachmentID)) {
+        staleAttachments.add(chunk.attachmentID);
+        parentsToRefresh.add(chunk.itemID);
+      }
+    }
+    for (const id of await store.getStoredAttachmentIDs()) {
+      if (!pdfIDs.has(id)) staleAttachments.add(id);
+    }
+    for (const id of staleItems) {
+      await store.removeItem(id);
+      searchIndex.removeItem(id);
+    }
+    for (const id of staleAttachments) {
+      const parentID = await store.removeAttachment(id);
+      if (parentID !== null && regularIDs.has(parentID)) parentsToRefresh.add(parentID);
+    }
+    for (const id of parentsToRefresh) {
+      searchIndex.replaceItemChunks(id, await store.getChunksForItem(id));
+    }
+    if (staleItems.size || staleAttachments.size) this.deps.onItemIndexed?.();
+  }
+
   pause(): void {
     this.paused = true;
     if (this.progress.phase === 'indexing' || this.progress.phase === 'scanning') {
@@ -284,19 +317,29 @@ export class BackgroundIndexer {
         });
 
         const libs = Zotero.Libraries.getAll();
-        const regularIds: number[] = [];
+        const regularIds = new Set<number>();
+        const pdfParents = new Map<number, number>();
         for (const lib of libs) {
           if (lib.libraryType === 'feed') continue;
-          const items = await Zotero.Items.getAll(lib.libraryID, true, false);
+          const items = await Zotero.Items.getAll(lib.libraryID, false, false);
           for (const item of items) {
-            if (isIndexableRegularItem(item)) {
-              regularIds.push(item.id);
+            if (!item.deleted && item.isPDFAttachment?.() && item.parentItemID) {
+              pdfParents.set(item.id, item.parentItemID);
+            } else if (isIndexableRegularItem(item)) {
+              regularIds.add(item.id);
             }
           }
           await yieldToEventLoop(5);
         }
 
-        await this.processItemIds(regularIds, forceRebuild, true);
+        if (!this.cancelled && !this.disposed) {
+          const pdfIDs = new Set<number>();
+          for (const [id, parentID] of pdfParents) {
+            if (regularIds.has(parentID)) pdfIDs.add(id);
+          }
+          await this.reconcileLibrary(regularIds, pdfIDs);
+        }
+        await this.processItemIds(Array.from(regularIds), forceRebuild, true);
       } catch (err: any) {
         Zotero.logError(err);
         this.emit({
@@ -357,6 +400,16 @@ export class BackgroundIndexer {
     })();
     this.activeRun = run;
     return run;
+  }
+
+  private async saveAttachmentChunks(chunks: IndexedChunkRecord[], state: AttachmentStateRecord): Promise<void> {
+    const { searchIndex, store } = this.deps;
+    const previousParents = await store.replaceAttachmentChunksAndState(
+      state.attachmentID, state.parentItemID, chunks, state
+    );
+    for (const id of [...previousParents, state.parentItemID]) {
+      searchIndex.replaceItemChunks(id, await store.getChunksForItem(id));
+    }
   }
 
   private async processItemIds(itemIds: number[], forceRebuild: boolean, libraryScan = false): Promise<void> {
@@ -511,7 +564,9 @@ export class BackgroundIndexer {
             getAttachmentSignature(att),
             strings.indexReadTimeout(strings.indexCheckingFile, attachmentTitle, ATTACHMENT_READ_TIMEOUT_MS / 1000)
           );
-          const prevState = forceRebuild ? null : await this.deps.store.getAttachmentState(att.id);
+          const prevState = await this.deps.store.getAttachmentState(att.id);
+          const previousParent = prevState?.parentItemID;
+          const sameParent = previousParent === item.id;
 
           const sameFile =
             prevState !== null &&
@@ -519,7 +574,7 @@ export class BackgroundIndexer {
             prevState.mtime === sig.mtime;
 
           const attUpToDate =
-            sameFile &&
+            !forceRebuild && sameParent && sameFile &&
             (prevState.status === 'no_text' ||
               prevState.status === 'missing' ||
               (prevState.status === 'indexed' &&
@@ -532,7 +587,7 @@ export class BackgroundIndexer {
             continue;
           }
 
-          if (!forceRebuild && !canEmbedNeural && (prevState === null || sameFile)) {
+          if (!forceRebuild && !canEmbedNeural && (prevState === null || (sameParent && sameFile))) {
             const existingChunks = await this.deps.store.getChunksForItem(item.id);
             if (existingChunks.some((c) => c.attachmentID === att.id && c.vector !== null && c.dim > 0)) {
               skippedUnchanged++;
@@ -560,9 +615,7 @@ export class BackgroundIndexer {
               errorMessage: extracted.errorMessage,
               updatedAt: Date.now(),
             };
-            await this.deps.store.replaceAttachmentChunksAndState(att.id, item.id, [], state);
-            const updatedParentChunks = await this.deps.store.getChunksForItem(item.id);
-            this.deps.searchIndex.replaceItemChunks(item.id, updatedParentChunks);
+            await this.saveAttachmentChunks([], state);
             if (extracted.status === 'error') {
               failedCount++;
               this.emit({ failedCount, lastError: extracted.errorMessage });
@@ -609,10 +662,10 @@ export class BackgroundIndexer {
             !forceRebuild &&
             Boolean(chunkEmbedErr) &&
             ((prevState !== null &&
-              sameFile &&
+              sameParent && sameFile &&
               prevState.status === 'indexed' &&
               Boolean(prevState.modelFingerprint)) ||
-              ((prevState === null || sameFile) &&
+              ((prevState === null || (sameParent && sameFile)) &&
                 (await this.deps.store.getChunksForItem(item.id)).some(
                   (c) => c.attachmentID === att.id && c.vector !== null && c.dim > 0
                 )));
@@ -649,9 +702,7 @@ export class BackgroundIndexer {
           };
 
           if (!this.paused) this.emit({ message: strings.indexSavingPdf });
-          await this.deps.store.replaceAttachmentChunksAndState(att.id, item.id, indexedChunks, state);
-          const allItemChunks = await this.deps.store.getChunksForItem(item.id);
-          this.deps.searchIndex.replaceItemChunks(item.id, allItemChunks);
+          await this.saveAttachmentChunks(indexedChunks, state);
 
           savedChunks += indexedChunks.length;
           embeddedChunks += indexedChunks.filter((chunk) => chunk.vector !== null).length;

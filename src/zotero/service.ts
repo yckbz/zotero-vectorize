@@ -373,8 +373,7 @@ export class VectorizeService {
     const parsed = await this.store.importCompatBundle(
       { metadataJson, fulltextJson, storeMetaJson },
       (itemKey, fallbackID) => {
-        const hit =
-          (itemKey ? byKey.get(itemKey) : undefined) ?? (fallbackID ? byItemId.get(fallbackID) : undefined);
+        const hit = itemKey ? byKey.get(itemKey) : fallbackID ? byItemId.get(fallbackID) : undefined;
         return hit ? { itemID: hit.itemID, libraryID: hit.libraryID, itemKey: hit.itemKey } : null;
       },
       (attKey, parentID, fallbackAttID) => {
