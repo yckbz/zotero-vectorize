@@ -13,6 +13,8 @@ Search your Zotero library by meaning, find the relevant passage in a PDF, and o
 
 Open **Semantically Similar Papers** in the item pane to browse related papers from your library.
 
+Cross-language semantic search uses the selected embedding model. In Search Settings, you can enable plain-digit matching to find formatted digits such as `x₂` or `x²` with `x2`.
+
 The package declares Zotero 7.0 as its minimum version. Desktop integration has been tested on Zotero 10.0.9 on macOS. Windows and Linux desktop validation is pending.
 
 ## Indexing
@@ -44,7 +46,7 @@ The skill uses the same JSON index format for command-line and agent workflows. 
 
 ## Build from source
 
-Install Node.js 20 or later and make Python 3 available as `python3`. From the repository root, run:
+Install Node.js 22 or later and make Python 3 available as `python3`. From the repository root, run:
 
 ```sh
 npm ci

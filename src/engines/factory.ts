@@ -28,6 +28,7 @@ export class ProviderManager {
       config.openaiApiKey,
       config.openaiModel,
       config.openaiDimensions,
+      config.openaiBatchSize,
     ]);
   }
 
@@ -50,6 +51,7 @@ export class ProviderManager {
         apiKey: config.openaiApiKey,
         model: config.openaiModel,
         dimensions: config.openaiDimensions,
+        batchSize: config.openaiBatchSize,
       });
     } else {
       provider = new LocalOnnxProvider({

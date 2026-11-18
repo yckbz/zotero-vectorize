@@ -246,6 +246,7 @@ export async function defaultHttpRequest(
 export interface EmbeddingProvider {
   readonly engine: EngineType;
   readonly model: string;
+  getPassageBatchSize(): number | Promise<number>;
   getModelFingerprint(dim?: number): string;
   getStatus(): Promise<EngineHealthStatus>;
   embedQuery(text: string): Promise<Float32Array>;

@@ -71,6 +71,7 @@ test('OpenAICompatProvider sorts out-of-order index responses and retries on HTT
     apiKey: 'sk-test',
     model: 'text-embedding-3-small',
     dimensions: 2,
+    batchSize: 2,
     http: async (_method, _url, opts) => {
       attempts++;
       const payload = JSON.parse(opts.body);
@@ -102,6 +103,116 @@ test('OpenAICompatProvider fails cleanly when API key is missing', async () => {
   const status = await provider.getStatus();
   assert.equal(status.needsSetup, true);
   await assert.rejects(() => provider.embedQuery('hello'), /API key/i);
+});
+
+test('OpenAI-compatible Qwen and Flash connection checks and embeddings use the model batch limit', async () => {
+  for (const model of ['qwen3.7-text-embedding', 'qwen3.7-text-embedding-flash']) {
+    for (const batchSize of [0, 24]) {
+      const batches = [];
+      const provider = new OpenAICompatProvider({
+        model,
+        apiKey: 'test-key',
+        batchSize,
+        http: async (_method, _url, opts) => {
+          const input = JSON.parse(opts.body).input;
+          const batch = Array.isArray(input) ? input : [input];
+          batches.push(batch.length);
+          assert.ok(batch.length <= 20);
+          return {
+            status: 200,
+            json: { data: batch.map((_, index) => ({ index, embedding: [1, 0] })) },
+            text: '',
+          };
+        },
+      });
+      const connection = await provider.testConnection();
+      assert.equal(connection.ok, true);
+      assert.match(connection.message, /20 inputs per batch/);
+      assert.equal((await provider.embedPassages(Array(41).fill('passage'))).length, 41);
+      assert.deepEqual(batches, [20, 20, 20, 1], `${model} with configured batch size ${batchSize}`);
+    }
+  }
+});
+
+test('OpenAI-compatible responses reject duplicate input indices and mixed dimensions', async () => {
+  let data;
+  const provider = new OpenAICompatProvider({
+    apiKey: 'test-key',
+    batchSize: 2,
+    http: async () => ({ status: 200, json: { data }, text: '' }),
+  });
+  data = [{ index: 0, embedding: [1, 0] }, { index: 0, embedding: [0, 1] }];
+  await assert.rejects(provider.embedPassages(['first', 'second']), /invalid embedding indices/);
+  data = [{ index: 0, embedding: [1, 0] }, { index: 1, embedding: [0, 1, 0] }];
+  await assert.rejects(provider.embedPassages(['first', 'second']), /inconsistent embedding dimensions/);
+});
+
+test('Automatic batch probing verifies a gateway hint and shares the tested size', async () => {
+  const batches = [];
+  const provider = new OpenAICompatProvider({
+    model: 'unlisted-model',
+    apiKey: 'test-key',
+    http: async (_method, _url, opts) => {
+      const input = JSON.parse(opts.body).input;
+      const size = Array.isArray(input) ? input.length : 1;
+      batches.push(size);
+      if (size > 9) {
+        return {
+          status: 400,
+          json: { error: { message: 'batch size is invalid, it should not be larger than 9.' } },
+          text: '',
+        };
+      }
+      return { status: 200, json: { data: Array.from({ length: size }, (_, index) => ({
+        index, embedding: [1, 0],
+      })) }, text: '' };
+    },
+  });
+  assert.deepEqual(await Promise.all([provider.getPassageBatchSize(), provider.getPassageBatchSize()]), [9, 9]);
+  assert.deepEqual(batches, [24, 9]);
+  assert.equal((await provider.embedPassages(Array(20).fill('passage'))).length, 20);
+  assert.deepEqual(batches, [24, 9, 9, 9, 2]);
+});
+
+test('Automatic batch probing finds a valid size when the server omits a numeric limit', async () => {
+  const batches = [];
+  const provider = new OpenAICompatProvider({
+    model: 'unlisted-model',
+    apiKey: 'test-key',
+    http: async (_method, _url, opts) => {
+      const input = JSON.parse(opts.body).input;
+      const size = Array.isArray(input) ? input.length : 1;
+      batches.push(size);
+      if (size > 7) {
+        return { status: 422, json: { error: { message: 'Too many inputs' } }, text: '' };
+      }
+      return { status: 200, json: { data: Array.from({ length: size }, (_, index) => ({
+        index, embedding: [1, 0],
+      })) }, text: '' };
+    },
+  });
+  const result = await provider.testConnection();
+  assert.equal(result.ok, true);
+  assert.match(result.message, /7 inputs per batch/);
+  assert.deepEqual(batches, [24, 12, 6, 9, 7, 8]);
+});
+
+test('Automatic batch probing surfaces authentication and unrelated validation errors', async () => {
+  for (const [status, message] of [[401, 'Invalid API key'], [400, 'Model is unavailable']]) {
+    let calls = 0;
+    const provider = new OpenAICompatProvider({
+      model: 'unlisted-model',
+      apiKey: 'test-key',
+      http: async () => {
+        calls++;
+        return { status, json: { error: { message } }, text: '' };
+      },
+    });
+    const connection = await provider.testConnection();
+    assert.equal(connection.ok, false);
+    assert.ok(connection.message.includes(message));
+    assert.equal(calls, 1);
+  }
 });
 
 test('LocalOnnxProvider downloads assets with mirror fallback and drives worker protocol', async () => {
