@@ -8,8 +8,12 @@ venv/
 .DS_Store
 Thumbs.db
 
-# skill build outputs
-dist/*.skill
+# build outputs
+node_modules/
+build/
+dist/
+.test-profile/
+*.xpi
 
 # local vector store outputs (do not commit generated user data)
 **/metadata_vectors.json

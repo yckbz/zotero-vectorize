@@ -1,0 +1,12 @@
+zotero-vectorize-item-pane-header =
+    .label = Semantically Similar Papers
+zotero-vectorize-item-pane-sidenav =
+    .tooltiptext = Similar Papers
+zotero-vectorize-menu-palette =
+    .label = Zotero Vectorize Command Palette…
+zotero-vectorize-menu-index-all =
+    .label = Zotero Vectorize: Index Missing / Changed
+zotero-vectorize-menu-settings =
+    .label = Zotero Vectorize Settings…
+zotero-vectorize-menu-index-selected =
+    .label = Vectorize Selected Items

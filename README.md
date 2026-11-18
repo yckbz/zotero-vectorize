@@ -1,180 +1,56 @@
-# zotero-vectorize
+# Zotero Vectorize
 
-A cross-platform, local-first OpenClaw skill for building and maintaining a semantic index over a Zotero library.
+[简体中文](README.zh-CN.md)
 
-It creates **two complementary vector stores**:
+Search your Zotero library by meaning, find the relevant passage in a PDF, and open the matching page in Zotero’s reader. Zotero Vectorize is a desktop plugin designed for local use. It can retrieve English papers from Chinese queries and Chinese papers from English queries.
 
-- `metadata_vectors.json` — embeddings for Zotero item metadata (title, abstract, authors, tags, DOI, URL, etc.)
-- `fulltext_vectors.json` — chunk embeddings extracted from PDF attachments in the Zotero storage directory
+## Install and search
 
-It also supports **incremental updates** with a safety-first workflow:
+1. Download `zotero-vectorize.xpi` from [GitHub Releases](https://github.com/yckbz/zotero-vectorize/releases). You can also [build the package from source](#build-from-source).
+2. In Zotero, open **Tools → Plugins**, then choose **Install Add-on From File…** from the gear menu and select the XPI.
+3. In **Zotero Settings → Zotero Vectorize**, select **Download / Verify Model** to set up the default multilingual MiniLM model. The initial model download requires an internet connection. Inference runs locally after the assets are installed.
+4. Type in Zotero’s toolbar search box or open the command palette with **⌘K** on macOS or **Ctrl+K** on Windows or Linux. Choose **Hybrid**, **Metadata**, or **Fulltext**, and search the whole library or the current collection. Select a passage to jump to its PDF page.
 
-1. detect missing items
-2. report the diff
-3. wait for user confirmation
-4. back up the store
-5. append the missing vectors
-6. retain only the latest and previous backup per file
+Open **Semantically Similar Papers** in the item pane to browse related papers from your library.
 
-## Repository layout
+The package declares Zotero 7.0 as its minimum version. Desktop integration has been tested on Zotero 10.0.9 on macOS. Windows and Linux desktop validation is pending.
 
-```text
-zotero-vectorize/
-├── README.md
-├── LICENSE
-├── .gitignore
-├── .github/workflows/
-├── dist/
-├── tools/
-│   ├── quick_validate.py
-│   └── package_skill.py
-└── skill/
-    └── zotero-vectorize/
-        ├── SKILL.md
-        ├── scripts/
-        └── references/
-```
+## Indexing
 
-The actual skill lives under:
+- Background indexing is enabled by default. Text becomes available for keyword search as the initial scan proceeds. When the embedding model is ready, the plugin can generate vectors and use them for semantic retrieval.
+- The settings page shows **vectorized / indexed** counts for items and passages. For example, `0 / 100` passages means 100 passages are searchable as text and zero have vectors. Use **Index Missing / Changed** to start an incremental scan, such as after switching models.
+- The PDF defaults are **1,024 characters per chunk**, **128 characters of overlap**, and **64 pages per attachment**. Set the page limit to **0** to index all pages. Run **Rebuild All** to apply changed chunking or page limits to already indexed PDFs.
+- The first vector indexing pass can take time on large libraries. Afterward, incremental scans reuse unchanged records.
 
-```text
-skill/zotero-vectorize/
-```
+## Embedding engines
 
-This keeps the skill package itself clean and aligned with OpenClaw skill conventions, while the repository root can still contain GitHub-friendly files such as this README, LICENSE, CI workflow, and packaging helpers.
+| Engine | Setup |
+| --- | --- |
+| **Local ONNX / WASM** (default) | Download a model from the plugin settings. The default is multilingual MiniLM L12. Inference runs in a local CPU worker. |
+| **Ollama** | Start Ollama, choose an embedding model installed on the server, and test the connection in the plugin settings. The default server address is `http://localhost:11434`. |
+| **OpenAI-compatible API** | Set the base URL, API key, and embedding model. The plugin sends the text being embedded to the configured endpoint. |
 
-## What the skill does
+Vectors from different models use different embedding spaces. After switching models, run incremental indexing so the selected model can build its own vectors.
 
-The skill provides:
+## Data and JSON exchange
 
-- path detection for Zotero data directory, database, storage directory, and output directory
-- SQLite snapshot creation before read-heavy operations
-- full build for metadata vectors
-- full build for PDF full-text vectors
-- incremental diff checking
-- incremental append after user confirmation
-- store verification (counts, sizes, metadata)
-- backup retention with only the latest and previous backup kept
+The plugin stores its index in `<Zotero Data Directory>/zotero-vectorize/vectorize.sqlite`. It reads Zotero metadata and PDF text and writes its own index separately from Zotero’s library database and attachments.
 
-## Output files
-
-The store uses explicit filenames:
+The skill uses the same JSON index format for command-line and agent workflows. To exchange indexes, use **Standard 3-File Vector JSON Import / Export** in the plugin settings and put the three files in the same folder.
 
 - `metadata_vectors.json`
 - `fulltext_vectors.json`
 - `vector_store_metadata.json`
-- `README.md`
 
-## Cross-platform design
+## Build from source
 
-The skill is designed for:
+Install Node.js 20 or later and make Python 3 available as `python3`. From the repository root, run:
 
-- **Windows**
-- **macOS**
-- **Linux**
-
-It supports:
-
-- platform defaults for Zotero paths
-- environment variable overrides
-- explicit CLI flags for all critical paths
-
-See:
-
-- `skill/zotero-vectorize/references/windows.md`
-- `skill/zotero-vectorize/references/macos.md`
-- `skill/zotero-vectorize/references/linux.md`
-
-## Dependencies
-
-Typical Python dependencies:
-
-- `sentence-transformers`
-- `torch`
-- `PyMuPDF`
-- `numpy`
-
-## Quick start
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/yckbz/zotero-vectorize
-cd zotero-vectorize
+```sh
+npm ci
+npm run verify
 ```
 
-### 2. Package the skill
+This checks types, builds and validates the XPI, and runs the tests. The installable package is `dist/zotero-vectorize.xpi`. To package without running the full verification suite, use `npm run package`.
 
-```bash
-python3 tools/package_skill.py skill/zotero-vectorize dist
-```
-
-This creates:
-
-```text
-dist/zotero-vectorize.skill
-```
-
-### 3. Import / install into OpenClaw
-
-Install the generated `.skill` file using your preferred OpenClaw / ClawHub workflow.
-
-### 4. Typical usage flow inside OpenClaw
-
-- detect paths
-- snapshot Zotero DB
-- build metadata vectors
-- build full-text vectors
-- check incremental updates
-- apply incremental updates only after user confirmation
-- verify counts and file sizes
-
-## Packaging and validation
-
-This repo includes self-contained tooling so contributors do not need a local OpenClaw source checkout just to validate/package the skill.
-
-### Validate
-
-```bash
-python3 tools/quick_validate.py skill/zotero-vectorize
-```
-
-### Package
-
-```bash
-python3 tools/package_skill.py skill/zotero-vectorize dist
-```
-
-## Safety model
-
-This skill is intentionally conservative:
-
-- Zotero is treated as **read-only input**
-- the skill snapshots the database before reads
-- updates are not applied before reporting the missing items
-- store files are backed up before rewrite
-- only the latest and previous backup are retained
-
-## Current status
-
-This repository contains a tested first release candidate:
-
-- skill structure validated
-- full build tested in an isolated output directory
-- incremental update workflow tested
-- backup retention behavior tested
-- packaging tested
-
-## Suggested roadmap
-
-Future improvements may include:
-
-- OCR fallback for scanned PDFs
-- semantic search CLI helpers
-- optional vector-database backend (Faiss / LanceDB / Qdrant / Chroma)
-- collection-scoped indexing
-- date-window incremental modes
-
-## License
-
-MIT
+[MIT License](LICENSE)
