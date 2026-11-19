@@ -276,7 +276,7 @@ export class VectorizeService {
       await provider.dispose();
     }
     this.indexSync.onConfigChanged();
-    if (!await this.hasLegacyIndexForActiveModel()) void this.startIndexing(false);
+    if (!await this.hasLegacyIndexForActiveModel()) void this.indexer.startLibraryScan(false, true);
   }
 
   async listEmbeddingProfiles() {

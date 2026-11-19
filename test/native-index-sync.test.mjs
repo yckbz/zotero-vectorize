@@ -17,6 +17,7 @@ async function setup(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zv-native-sync-'));
   const { VectorizeService } = await importTs('src/zotero/service.ts');
   const { jumpToSearchHit } = await importTs('src/zotero/navigation.ts');
+  const { OpenAICompatProvider } = await importTs('src/engines/openai.ts');
   const transport = { bytes: null, title: null, offline: false, errors: 0, uploads: 0, downloads: 0, syncs: 0 };
   const live = new Set();
   t.after(async () => {
@@ -69,7 +70,7 @@ async function setup(t) {
       ['sync.storage.verified', true],
     ]);
     const flags = { pdfAvailable: shift === 0, revision: MODEL_REVISION, account: 101, failSharedQuery: false };
-    const events = { calls: [], opened: [], lastModelSetup: null };
+    const events = { calls: [], opened: [], lastModelSetup: null, cloudRequests: [] };
     const items = new Map();
     const makePaper = (id, key, libraryID, title, attachments = []) => ({
       id, key, libraryID, itemType: 'journalArticle',
@@ -187,6 +188,20 @@ async function setup(t) {
       live.add(service);
       service.providerManager.createProvider = (config) => {
         const { engine } = config;
+        if (engine === 'openai' && flags.useCloudHttp) {
+          return new OpenAICompatProvider({
+            baseUrl: config.openaiBaseUrl, apiKey: config.openaiApiKey,
+            model: config.openaiModel, dimensions: config.openaiDimensions, batchSize: config.openaiBatchSize,
+            async http(method, url, request) {
+              const body = JSON.parse(request.body);
+              events.cloudRequests.push({ method, url, authorization: request.headers.Authorization, ...body });
+              const inputs = Array.isArray(body.input) ? body.input : [body.input];
+              return { status: 200, text: '', json: { data: inputs.map((_, index) => ({ index,
+                embedding: Array.from({ length: flags.cloudDimensions ?? 2 }, (_, i) => i === 0 ? 1 : 0),
+              })) } };
+            },
+          });
+        }
         const model = engine === 'local-onnx' ? config.localModelId : engine === 'ollama' ? config.ollamaModel : config.openaiModel;
         const fp = `${engine}:${model}:2`;
         const vector = () => new Float32Array([1, 0]);
@@ -388,4 +403,71 @@ test('an Ollama digest change disables shared neural results without affecting a
   const local = await service.search('diffusion', { mode: 'metadata' });
   assert.ok(local.hits.some((hit) => hit.itemID === 101));
   assert.equal(local.diagnostics.vectorSearchUsed, true);
+});
+
+test('cloud sharing matches the configured endpoint, model and actual dimensions with device-local keys', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const apiUrl = 'https://embeddings.invalid/v1';
+  const model = 'text-embedding-3-small';
+  const publisher = await createDevice('publisher', 0, 'publish', 'openai');
+  publisher.flags.useCloudHttp = true;
+  publisher.prefs.set(PREFIX + 'openaiBaseUrl', apiUrl);
+  publisher.prefs.set(PREFIX + 'openaiApiKey', 'publisher-fixture-key');
+  publisher.prefs.set(PREFIX + 'openaiModel', model);
+  publisher.prefs.set(PREFIX + 'openaiDimensions', 2);
+  publisher.prefs.set(PREFIX + 'openaiBatchSize', 1);
+  const source = await publisher.start();
+  await source.startIndexing();
+  const requestsBeforePublish = publisher.events.cloudRequests.length;
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(publisher.events.cloudRequests.length, requestsBeforePublish);
+  const payload = String(transport.bytes);
+  const manifest = JSON.parse(payload.split('\n')[0]);
+  assert.equal(manifest.engine, 'openai');
+  assert.equal(manifest.model, model);
+  assert.equal(manifest.dimensions, 2);
+  assert.match(manifest.endpointDigest, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(payload, /publisher-fixture-key|embeddings\.invalid|openaiApiKey/);
+  await publisher.shutdown(source);
+
+  for (const [name, overrides, actualDimensions, requests] of [
+    ['missing-key', { openaiApiKey: '' }, 2, 0],
+    ['other-endpoint', { openaiBaseUrl: 'https://other.invalid/v1' }, 2, 0],
+    ['other-model', { openaiModel: 'text-embedding-3-large' }, 2, 0],
+    ['configured-dimension-mismatch', { openaiDimensions: 3 }, 2, 0],
+    ['actual-dimension-mismatch', {}, 3, 1],
+  ]) {
+    const receiver = await createDevice(name, 100, 'receive');
+    receiver.flags.useCloudHttp = true;
+    receiver.flags.cloudDimensions = actualDimensions;
+    for (const [key, value] of Object.entries({ openaiBaseUrl: apiUrl, openaiModel: model,
+      openaiApiKey: 'receiver-fixture-key', ...overrides })) receiver.prefs.set(PREFIX + key, value);
+    const destination = await receiver.start();
+    await destination.indexSync.syncNow();
+    assert.equal(destination.indexSync.getStatus().phase, 'cloud', name);
+    assert.equal(destination.indexSync.active, null);
+    assert.equal(receiver.events.cloudRequests.length, requests, name);
+    await receiver.shutdown(destination);
+  }
+
+  const receiver = await createDevice('subscriber', 100, 'receive');
+  receiver.flags.useCloudHttp = true;
+  receiver.prefs.set(PREFIX + 'openaiApiKey', '');
+  const destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'cloud');
+  await destination.applyEmbeddingConfig({ ...destination.getConfig(), engine: 'openai', openaiModel: model,
+    openaiBaseUrl: 'https://EMBEDDINGS.invalid:443/v1/embeddings/', openaiDimensions: 0,
+    openaiApiKey: 'receiver-fixture-key', openaiBatchSize: 1 }, false);
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.searchIndex.getItemById(101), undefined, 'Applying the API settings must not index My Library again');
+  const result = await destination.search('diffusion', { mode: 'fulltext', filterItemIDs: new Set([101]) });
+  assert.ok(result.hits[0]?.bestChunk?.sourceFileHash);
+  assert.equal(result.diagnostics.vectorSearchUsed, true);
+  assert.ok(receiver.events.cloudRequests.every((request) => request.authorization === 'Bearer receiver-fixture-key' &&
+    new URL(request.url).href === apiUrl + '/embeddings'));
+  assert.ok(receiver.events.cloudRequests.some((request) => request.input === 'diffusion'));
+  assert.ok(receiver.events.cloudRequests.every((request) => !JSON.stringify(request.input).includes('finement')));
 });

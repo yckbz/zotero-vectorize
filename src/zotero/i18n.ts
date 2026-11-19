@@ -94,7 +94,7 @@ export type LocaleStrings = {
   prefIndexSyncTitle: string;
   prefIndexSyncHint: string;
   prefIndexSyncRole: { off: string; publish: string; receive: string };
-  prefIndexSyncState: Record<'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'conflict' | 'error', string>;
+  prefIndexSyncState: Record<'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' | 'error', string>;
   prefIndexSyncNow: string;
   prefItemsIndexed: string;
   prefChunksIndexed: string;
@@ -241,6 +241,7 @@ const ZH_CN: LocaleStrings = {
     ready: '索引已同步。',
     webdav: 'Zotero WebDAV 当前不可用。仍可使用本机已有索引。',
     model: '需要已校验的同版本 ONNX 或 Ollama 模型。',
+    cloud: '请核对两端的 Base URL、模型和输出维度，并在本机填写有效的 API Key。',
     conflict: '检测到多个发布者或附件冲突。请先在 Zotero 中检查共享索引附件。',
     error: '共享索引更新失败。仍可使用本机已有索引。',
   },
@@ -390,6 +391,7 @@ const EN_US: LocaleStrings = {
     ready: 'Index synced.',
     webdav: 'Zotero WebDAV is unavailable. Existing indexes are still searchable.',
     model: 'A matching, verified ONNX or Ollama model is required.',
+    cloud: 'Match the Base URL, model, and output dimensions across devices and enter a valid API key on this device.',
     conflict: 'Multiple publishers or an attachment conflict were detected. Check the shared index attachment in Zotero.',
     error: 'The shared index could not be updated. Existing indexes are still searchable.',
   },

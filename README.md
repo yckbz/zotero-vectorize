@@ -40,7 +40,7 @@ Set up WebDAV attachment sync for My Library on desktop devices signed in to the
 
 The publisher updates one stored attachment in My Library through Zotero. Each publication transfers the current model’s vectors, PDF passages, and index and search settings together. The bundle limit is 512 MiB before WebDAV compression.
 
-Receivers need the same revision of the ONNX or Ollama model. Credentials, paths, and connection settings stay on their own devices.
+ONNX and Ollama models require a matching revision. For OpenAI-compatible models, configure the same Base URL, model, and output dimensions on each device and enter an API key separately on every device. When dimensions are set to `0`, the plugin checks the dimensions actually returned by the service. The attachment contains an endpoint fingerprint for matching. Credentials, paths, and connection settings stay on each device.
 
 Receivers keep the last validated shared index alongside their own local indexes and settings. Existing indexes and manual local indexing remain available when WebDAV is unavailable. A receiver with a usable shared index suspends automatic indexing for My Library. Group libraries continue to use local indexes. Opening a shared passage verifies the PDF version before jumping to its page.
 

@@ -28,9 +28,13 @@ const headerFields = {
   hybridSemanticWeight: z.number().check(z.gte(0), z.lte(1)),
   normalizeNotation: z.boolean(), maxResults: int(3, 40),
 };
-const header = z.strictObject({
-  ...headerFields, engine: z.enum(['local-onnx', 'ollama']), revision,
-});
+const header = z.discriminatedUnion('engine', [
+  z.strictObject({ ...headerFields, engine: z.enum(['local-onnx', 'ollama']), revision }),
+  z.strictObject({ ...headerFields, engine: z.literal('openai'),
+    model: bounded(1, 300).check(z.regex(/^[^\u0000-\u001f\u007f]+$/)),
+    endpointDigest: z.string().check(z.regex(/^[a-f0-9]{64}$/)),
+  }),
+]);
 const vector = z.nullable(bounded(4, 44_000));
 const record = z.union([
   z.tuple([z.literal('item'), key, hash, vector]),
@@ -43,13 +47,25 @@ const record = z.union([
 export type SyncHeader = z.infer<typeof header>;
 export type SyncRecord = Exclude<z.infer<typeof record>, ['end', number]>;
 
+export async function cloudEndpointDigest(baseUrl: string): Promise<string | null> {
+  const input = baseUrl.trim();
+  if (!/^https?:\/\//i.test(input) || /[?#]/.test(input)) return null;
+  let url: URL;
+  try { url = new URL(input); } catch { return null; }
+  if (url.username || url.password) return null;
+  const path = url.pathname.replace(/\/+$/, '').replace(/\/embeddings$/, '');
+  const bytes = new TextEncoder().encode(url.origin + path + '/embeddings');
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 export function syncSearchConfig(settings: SyncHeader, local: PluginConfig): PluginConfig {
   return {
     ...local,
     engine: settings.engine,
     ...(settings.engine === 'local-onnx'
       ? { localModelId: settings.model, localMaxSeqLength: settings.maxSeqLength }
-      : { ollamaModel: settings.model }),
+      : settings.engine === 'ollama' ? { ollamaModel: settings.model } : {}),
     chunkSize: settings.chunkSize, chunkOverlap: settings.chunkOverlap, maxPdfPages: settings.maxPdfPages,
     defaultSearchMode: settings.defaultSearchMode, hybridSemanticWeight: settings.hybridSemanticWeight,
     normalizeNotation: settings.normalizeNotation, maxResults: settings.maxResults,

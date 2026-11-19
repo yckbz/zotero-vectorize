@@ -1,12 +1,12 @@
 import { fnv1a64 } from '../core/hash.ts';
 import type { EmbeddingProvider } from '../engines/provider.ts';
-import type { IndexProgress, PluginConfig } from '../types/vectorize.ts';
+import type { EngineType, IndexProgress, PluginConfig } from '../types/vectorize.ts';
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import { PREF_BRANCH } from './config.ts';
 import { embeddingSettings, resolveEmbeddingProfile } from './embedding-profile.ts';
 import { extractItemMetadata, isIndexableRegularItem } from './extractor.ts';
 import {
-  packVector, readSyncHeader, readSyncSnapshot, snapshotSize, syncSearchConfig, writeSyncSnapshot,
+  cloudEndpointDigest, packVector, readSyncHeader, readSyncSnapshot, snapshotSize, syncSearchConfig, writeSyncSnapshot,
   type ReceivedSnapshot, type SyncHeader, type SyncRecord,
 } from './sync-snapshot.ts';
 import type { VectorStore } from './vector-store.ts';
@@ -17,7 +17,16 @@ const ROLE = PREF_BRANCH + 'syncRole';
 const PUBLISHER = PREF_BRANCH + 'syncPublisher';
 const BINDING = PREF_BRANCH + 'syncAttachment';
 export type SyncRole = 'off' | 'publish' | 'receive';
-type SyncPhase = 'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'conflict' | 'error';
+type SyncPhase = 'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' | 'error';
+const DEVICE_MODEL_SETTINGS = {
+  'local-onnx': ['localModelDir', 'localMirror'],
+  ollama: ['ollamaUrl'],
+  openai: ['openaiBaseUrl', 'openaiModel', 'openaiDimensions', 'openaiApiKey'],
+} as const satisfies Record<EngineType, readonly (keyof PluginConfig)[]>;
+
+type SnapshotModel = { engine: 'openai'; model: string; endpointDigest: string } |
+  { engine: 'local-onnx' | 'ollama'; model: string; revision: string };
+
 interface Context {
   account: number;
   libraryID: number;
@@ -33,7 +42,7 @@ interface IndexSyncDeps {
 }
 
 class SyncIssue extends Error {
-  constructor(readonly phase: 'webdav' | 'model' | 'conflict') { super(phase); }
+  constructor(readonly phase: 'webdav' | 'model' | 'cloud' | 'conflict') { super(phase); }
 }
 
 function publicationSettings(config: PluginConfig): string {
@@ -55,7 +64,7 @@ export class IndexSync {
   private received: (ReceivedSnapshot & { provider: EmbeddingProvider; digest: string }) | null = null;
   private waitingForFirstSnapshot = false;
   private libraryRevision = 0;
-  private deviceModelSettings = '';
+  private deviceConfig: PluginConfig | null = null;
   private readonly listeners = new Set<() => void>();
 
   constructor(private readonly deps: IndexSyncDeps) {}
@@ -106,7 +115,7 @@ export class IndexSync {
     this.role = role;
     this.clearReceived();
     this.needsReconcile = false;
-    this.deviceModelSettings = this.localProviderSettings();
+    this.deviceConfig = this.deps.getConfig();
     this.waitingForFirstSnapshot = role === 'receive';
     this.setPhase(role === 'off' ? 'off' : 'waiting');
     if (wasReceiving && role !== 'receive') this.deps.onLocalAvailable();
@@ -126,20 +135,19 @@ export class IndexSync {
   onConfigChanged(): void {
     if (this.role === 'publish') this.schedule(15_000);
     if (this.role === 'receive') {
-      const settings = this.localProviderSettings();
-      if (this.deviceModelSettings !== settings) {
-        this.deviceModelSettings = settings;
+      const config = this.deps.getConfig();
+      const previous = this.deviceConfig;
+      this.deviceConfig = config;
+      const engine = this.active?.manifest.engine;
+      const keys = engine ? DEVICE_MODEL_SETTINGS[engine] : Object.values(DEVICE_MODEL_SETTINGS).flat();
+      if (keys.some((key) => previous?.[key] !== config[key])) {
         this.teardown++;
         this.clearReceived();
+        this.waitingForFirstSnapshot = true;
       }
       this.needsReconcile = true;
       this.schedule(0);
     }
-  }
-
-  private localProviderSettings(): string {
-    const config = this.deps.getConfig();
-    return JSON.stringify([config.localModelDir, config.localMirror, config.ollamaUrl]);
   }
 
   private releaseLocalIndexing(): void {
@@ -294,13 +302,20 @@ export class IndexSync {
     const config = this.deps.getConfig();
     const settings = publicationSettings(config);
     const profile = this.deps.store.activeProfile;
-    if (config.engine === 'openai' || !profile) throw new SyncIssue('model');
+    if (!profile) throw new SyncIssue('model');
     const provider = this.deps.createProvider(config);
-    let revision: string;
+    let model: SnapshotModel;
     try {
-      const detected = await provider.getModelRevision?.();
-      if (!detected || (await resolveEmbeddingProfile(config, provider))?.id !== profile.id) throw new SyncIssue('model');
-      revision = detected;
+      if ((await resolveEmbeddingProfile(config, provider))?.id !== profile.id) throw new SyncIssue('model');
+      if (config.engine === 'openai') {
+        const endpointDigest = await cloudEndpointDigest(config.openaiBaseUrl);
+        if (!endpointDigest || !config.openaiApiKey.trim()) throw new SyncIssue('cloud');
+        model = { engine: config.engine, model: provider.model, endpointDigest };
+      } else {
+        const revision = await provider.getModelRevision?.();
+        if (!revision) throw new SyncIssue('model');
+        model = { engine: config.engine, model: provider.model, revision };
+      }
     } finally {
       void provider.dispose().catch(() => {});
     }
@@ -332,10 +347,12 @@ export class IndexSync {
       attachments: await this.deps.store.getShareableAttachments(context.libraryID, layout),
       updated: await this.deps.store.getMeta('last_indexed_at'),
     }));
+    const previousDimensions = previous?.engine === model.engine && previous.model === model.model &&
+      (previous.engine === 'openai' ? model.engine === 'openai' && previous.endpointDigest === model.endpointDigest
+        : model.engine !== 'openai' && previous.revision === model.revision) ? previous.dimensions : 0;
     const dimensions = profile.dimensions || source.items.find((entry) => entry.vector)?.dim ||
       source.chunks.find((entry) => entry.vector)?.dim ||
-      (previous?.engine === config.engine && previous.model === provider.model && previous.revision === revision
-        ? previous.dimensions : 0);
+      previousDimensions;
     if (!dimensions) {
       this.setPhase('waiting');
       return;
@@ -343,7 +360,7 @@ export class IndexSync {
     const manifest: SyncHeader = {
       type: 'zotero-vectorize-index', version: 1, account: context.account, publisher,
       generation: Math.max(Date.now(), (previous?.generation ?? 0) + 1),
-      engine: config.engine, model: provider.model, revision, dimensions,
+      ...model, dimensions,
       maxSeqLength: config.localMaxSeqLength, chunkSize: config.chunkSize, chunkOverlap: config.chunkOverlap,
       maxPdfPages: config.maxPdfPages, defaultSearchMode: config.defaultSearchMode,
       hybridSemanticWeight: config.hybridSemanticWeight, normalizeNotation: config.normalizeNotation,
@@ -493,12 +510,23 @@ export class IndexSync {
       throw new SyncIssue('conflict');
     }
     const config = syncSearchConfig(manifest, this.deps.getConfig());
+    if (manifest.engine === 'openai' && (!config.openaiApiKey.trim() || config.openaiModel.trim() !== manifest.model ||
+        (config.openaiDimensions !== 0 && config.openaiDimensions !== manifest.dimensions) ||
+        await cloudEndpointDigest(config.openaiBaseUrl) !== manifest.endpointDigest)) {
+      throw new SyncIssue('cloud');
+    }
+    if (!this.current(epoch, context)) return;
     const provider = this.deps.createProvider(config);
     let adopted = false;
     try {
-      if (await provider.getModelRevision?.() !== manifest.revision) throw new SyncIssue('model');
-      const status = await provider.testConnection();
-      if (!status.ok || status.dimensions !== manifest.dimensions) throw new SyncIssue('model');
+      if (manifest.engine === 'openai') {
+        const vector = await provider.embedQuery('semantic search health check').catch(() => null);
+        if (vector?.length !== manifest.dimensions) throw new SyncIssue('cloud');
+      } else {
+        if (await provider.getModelRevision?.() !== manifest.revision) throw new SyncIssue('model');
+        const status = await provider.testConnection();
+        if (!status.ok || status.dimensions !== manifest.dimensions) throw new SyncIssue('model');
+      }
       const received = await readSyncSnapshot(path, context.account, context.libraryID);
       const hash = digest ?? await Zotero.Utilities.Internal.md5Async(path);
       if (!this.current(epoch, context) || !hash) return;
