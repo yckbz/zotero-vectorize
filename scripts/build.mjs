@@ -76,6 +76,24 @@ async function main() {
     logLevel: 'info',
   });
 
+  await esbuild.build({
+    entryPoints: [path.join(ROOT, 'src/zotero/mcp/listener.ts')],
+    outfile: path.join(BUILD_DIR, 'mcp.js'),
+    bundle: true,
+    format: 'iife',
+    globalName: 'ZoteroVectorizeMcpModule',
+    platform: 'browser',
+    target: 'firefox115',
+    charset: 'utf8',
+    logLevel: 'info',
+  });
+  const licenses = path.join(BUILD_DIR, 'licenses');
+  await fs.mkdir(licenses, { recursive: true });
+  for (const dependency of ['@modelcontextprotocol/core', '@modelcontextprotocol/server', 'zod']) {
+    const filename = dependency.split('/').pop();
+    await fs.copyFile(path.join(ROOT, 'node_modules', dependency, 'LICENSE'), path.join(licenses, `${filename}.txt`));
+  }
+
   if (shouldPackage) {
     await fs.mkdir(DIST_DIR, { recursive: true });
     await fs.rm(XPI_PATH, { force: true });

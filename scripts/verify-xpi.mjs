@@ -12,7 +12,11 @@ const XPI_PATH = path.join(ROOT, 'dist', 'zotero-vectorize.xpi');
 const REQUIRED_FILES = [
   'manifest.json',
   'bootstrap.js',
+  'mcp.js',
   'prefs.js',
+  'licenses/core.txt',
+  'licenses/server.txt',
+  'licenses/zod.txt',
   'chrome/content/preferences.xhtml',
   'chrome/content/preferences.js',
   'chrome/content/preferences.css',
@@ -73,7 +77,7 @@ with zipfile.ZipFile(xpi_path, 'r') as zf:
 
   // 3. Parse-check bundled JS files and verify bootstrap lifecycle exports
   const buildDir = path.join(ROOT, 'build');
-  for (const rel of ['bootstrap.js', 'chrome/content/preferences.js', 'workers/onnx-worker.js']) {
+  for (const rel of ['bootstrap.js', 'mcp.js', 'chrome/content/preferences.js', 'workers/onnx-worker.js']) {
     const code = await fs.readFile(path.join(buildDir, rel), 'utf8');
     new vm.Script(code, { filename: rel });
   }

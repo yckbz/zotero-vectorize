@@ -24,3 +24,5 @@ pref("extensions.zotero-vectorize.popoverMinChars", 2);
 pref("extensions.zotero-vectorize.commandPaletteShortcut", "Mod+K");
 pref("extensions.zotero-vectorize.clearQuickSearchOnJump", false);
 pref("extensions.zotero-vectorize.uiLanguage", "auto");
+pref("extensions.zotero-vectorize.mcpEnabled", false);
+pref("extensions.zotero-vectorize.mcpToken", "");

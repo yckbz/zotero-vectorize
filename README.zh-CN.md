@@ -34,6 +34,16 @@
 
 不同模型的向量属于不同的嵌入空间。切换模型后，运行增量索引，让新模型为文献和分块生成对应的向量。
 
+## 在 Agent 中使用 Zotero Vectorize
+
+在 **Zotero 设置 → Zotero Vectorize → Agent 接入（MCP）** 中启用本机 MCP。点击**复制 Codex 配置**，将内容添加到用户级的 `~/.codex/config.toml`，然后重启 Codex。复制的配置包含访问令牌。使用期间请保持 Zotero 运行。
+
+MCP 已在 macOS 的 Zotero 10.0.9 上验证。
+
+`http://127.0.0.1:23124/mcp` 接收本机只读请求。`search_papers` 使用「我的文库」已有索引，返回题录、候选段落及 PDF 页链接，也可按准确的分类路径限定搜索范围。只有题录的条目仍可通过混合或元数据模式搜到。`read_pdf_pages` 从指定附件读取最多三页连续正文，可以读取超出搜索索引页数上限的页面。附件文件缺失或页面没有可提取文字时，会返回明确状态。
+
+Agent 会收到工具返回的题录和正文。搜索查询使用插件当前配置的嵌入服务。
+
 ## 数据与 JSON 交换
 
 插件索引保存在 `<Zotero 数据目录>/zotero-vectorize/vectorize.sqlite`。插件读取 Zotero 题录和 PDF 正文，将自己的索引与 Zotero 文献库数据库和附件分开存储。

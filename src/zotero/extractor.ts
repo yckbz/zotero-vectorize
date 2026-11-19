@@ -107,6 +107,7 @@ export function extractItemMetadata(item: ZoteroItem): ExtractedItemMetadata {
 
 export interface PdfExtractionResult {
   pages: PdfPageText[];
+  totalPages?: number;
   fileHash: string;
   mtime: number;
   status: 'indexed' | 'no_text' | 'missing' | 'error';
@@ -159,7 +160,8 @@ export async function getAttachmentSignature(
 export async function extractPdfPages(
   attachment: ZoteroItem,
   maxPdfPages: number,
-  signature: Awaited<ReturnType<typeof getAttachmentSignature>>
+  signature: Awaited<ReturnType<typeof getAttachmentSignature>>,
+  options?: { minTextLength: number; signal: AbortSignal }
 ): Promise<PdfExtractionResult> {
   if (!attachment || attachment.deleted || !attachment.isPDFAttachment()) {
     return { pages: [], fileHash: '', mtime: 0, status: 'missing' };
@@ -172,18 +174,22 @@ export async function extractPdfPages(
 
   let rawText = '';
   let firstPageIndex = 0;
+  let totalPages: number | undefined;
   try {
+    options?.signal.throwIfAborted();
     const res = await Zotero.PDFWorker.getFullText(
       attachment.id,
       maxPdfPages > 0 ? maxPdfPages : null,
       false
     );
     rawText = res?.text || '';
+    totalPages = res?.totalPages;
     // Zotero trims the joined result, which removes the separators at blank page edges.
     const delimitedPages = 1 + (rawText.match(/\f/g)?.length ?? 0);
     if (rawText.trim() && res.extractedPages > delimitedPages) {
       let upper = res.extractedPages - delimitedPages;
       while (firstPageIndex < upper) {
+        options?.signal.throwIfAborted();
         const middle = Math.floor((firstPageIndex + upper) / 2);
         const prefix = await Zotero.PDFWorker.getFullText(attachment.id, middle + 1, false);
         if (prefix.text.trim()) upper = middle;
@@ -191,6 +197,7 @@ export async function extractPdfPages(
       }
     }
   } catch (err: any) {
+    options?.signal.throwIfAborted();
     return {
       pages: [],
       fileHash,
@@ -199,6 +206,7 @@ export async function extractPdfPages(
       errorMessage: err?.message || String(err),
     };
   }
+  options?.signal.throwIfAborted();
 
   let pages = splitPdfPagesFromFulltext(rawText, firstPageIndex);
   if (maxPdfPages > 0) {
@@ -206,9 +214,10 @@ export async function extractPdfPages(
   }
 
   const totalTextLen = pages.reduce((acc, p) => acc + p.text.length, 0);
-  if (pages.length === 0 || totalTextLen < 20) {
+  if (pages.length === 0 || totalTextLen < (options?.minTextLength ?? 20)) {
     return {
       pages: [],
+      totalPages,
       fileHash,
       mtime,
       status: 'no_text',
@@ -217,6 +226,7 @@ export async function extractPdfPages(
 
   return {
     pages,
+    totalPages,
     fileHash,
     mtime,
     status: 'indexed',

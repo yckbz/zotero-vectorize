@@ -54,6 +54,13 @@ export type LocaleStrings = {
   prefIndexingSectionTitle: string;
   prefCompatSectionTitle: string;
   prefUiSectionTitle: string;
+  prefMcpTitle: string;
+  prefMcpHint: string;
+  prefMcpEnable: string;
+  prefMcpCopy: string;
+  prefMcpCopied: string;
+  prefMcpStartError: string;
+  prefMcpCopyError: string;
   prefItemsIndexed: string;
   prefChunksIndexed: string;
   prefItemVectorRatio: string;
@@ -155,6 +162,13 @@ const ZH_CN: LocaleStrings = {
   prefIndexingSectionTitle: '文档切片与自动后台索引',
   prefCompatSectionTitle: '标准向量 JSON 兼容导入与导出',
   prefUiSectionTitle: '检索交互与外观',
+  prefMcpTitle: 'Agent 接入（MCP）',
+  prefMcpHint: '允许同一台电脑上的 Agent 只读检索「我的文库」和读取 PDF 指定页。连接时请保持 Zotero 运行。',
+  prefMcpEnable: '启用本机 MCP',
+  prefMcpCopy: '复制 Codex 配置',
+  prefMcpCopied: '已复制 Codex 配置。',
+  prefMcpStartError: '无法启动 MCP。请检查 Zotero 版本和本机端口占用。',
+  prefMcpCopyError: '无法复制 Codex 配置。',
   prefItemsIndexed: '已索引文献',
   prefItemVectorRatio: '文献已向量化 / 已收录',
   prefChunkVectorRatio: '分块已向量化 / 已提取',
@@ -256,6 +270,13 @@ const EN_US: LocaleStrings = {
   prefIndexingSectionTitle: 'Chunking & Silent Background Indexing',
   prefCompatSectionTitle: 'Standard 3-File Vector JSON Import / Export',
   prefUiSectionTitle: 'Search UX & Appearance',
+  prefMcpTitle: 'Agent access (MCP)',
+  prefMcpHint: 'Allow an agent on this computer to search My Library and read selected PDF pages. Keep Zotero running while connected.',
+  prefMcpEnable: 'Enable local MCP',
+  prefMcpCopy: 'Copy Codex configuration',
+  prefMcpCopied: 'Codex configuration copied.',
+  prefMcpStartError: 'MCP could not start. Check the Zotero version and whether the local port is in use.',
+  prefMcpCopyError: 'Could not copy the Codex configuration.',
   prefItemsIndexed: 'Indexed Items',
   prefItemVectorRatio: 'Items with vectors / indexed',
   prefChunkVectorRatio: 'Passages with vectors / extracted',
