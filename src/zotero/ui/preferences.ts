@@ -720,6 +720,42 @@ class VectorizePreferencesController {
       ])
     );
 
+    const mcp = Zotero.VectorizeMcp;
+    if (mcp) {
+      const toggle = el(doc, 'input', { type: 'checkbox' }) as HTMLInputElement;
+      const copy = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefMcpCopy]) as HTMLButtonElement;
+      const status = el(doc, 'div', { className: 'zv-hint', role: 'status' });
+      const update = () => {
+        const state = mcp.getState();
+        toggle.checked = state.running;
+        copy.disabled = !state.running;
+        status.textContent = state.failed ? s.prefMcpStartError : state.running ? mcp.url : '';
+      };
+      toggle.addEventListener('change', async () => {
+        toggle.disabled = true;
+        copy.disabled = true;
+        await mcp.setEnabled(toggle.checked);
+        toggle.disabled = false;
+        update();
+      });
+      copy.addEventListener('click', () => {
+        try {
+          mcp.copyCodexConfig();
+          status.textContent = s.prefMcpCopied;
+        } catch {
+          status.textContent = s.prefMcpCopyError;
+        }
+      });
+      update();
+      this.container.appendChild(el(doc, 'div', { className: 'zv-pref-card' }, [
+        el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefMcpTitle]),
+        el(doc, 'p', { className: 'zv-hint' }, [s.prefMcpHint]),
+        el(doc, 'label', { className: 'zv-check-row' }, [toggle, el(doc, 'span', {}, [s.prefMcpEnable])]),
+        el(doc, 'div', { className: 'zv-btn-row' }, [copy]),
+        status,
+      ]));
+    }
+
     this.updateProgressDom(svc.getIndexProgress());
     void this.refreshStatsAndStatus();
   }

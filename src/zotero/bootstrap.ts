@@ -1,6 +1,7 @@
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import { PLUGIN_ID } from './config.ts';
 import { VectorizeService } from './service.ts';
+import { McpController } from './mcp/controller.ts';
 import { injectWindowStyles, removeWindowStyles } from './ui/styles.ts';
 import { TopSearchPopover } from './ui/search-popover.ts';
 import { CommandPalette } from './ui/command-palette.ts';
@@ -206,6 +207,7 @@ async function startup(data: { id: string; version: string; rootURI: string }, _
     dataDir,
   });
   (Zotero as any).Vectorize = service;
+  Zotero.VectorizeMcp = new McpController(service, data.version, pluginRootURI);
 
   // Register native Preferences pane
   if (Zotero.PreferencePanes?.register) {
@@ -232,6 +234,7 @@ async function startup(data: { id: string; version: string; rootURI: string }, _
 
   // Initialize DB & search index asynchronously (does not block Zotero startup)
   void service.init().catch((e) => Zotero.logError(e));
+  Zotero.VectorizeMcp.restore();
 
   // Attach to any already-open main windows (e.g., on dynamic plugin install/enable)
   const wins = Zotero.getMainWindows?.() ?? [];
@@ -245,6 +248,8 @@ async function startup(data: { id: string; version: string; rootURI: string }, _
 }
 
 async function shutdown(_data: any, _reason: number): Promise<void> {
+  await Zotero.VectorizeMcp?.dispose();
+  delete Zotero.VectorizeMcp;
   for (const win of Array.from(windowHandles.keys())) {
     detachWindow(win);
   }

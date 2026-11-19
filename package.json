@@ -14,5 +14,9 @@
   "devDependencies": {
     "esbuild": "0.28.0",
     "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.6.7"
   }
 }

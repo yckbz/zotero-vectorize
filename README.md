@@ -34,6 +34,16 @@ The package declares Zotero 7.0 as its minimum version. Desktop integration has 
 
 Vectors from different models use different embedding spaces. After switching models, run incremental indexing so the selected model can build its own vectors.
 
+## Use Zotero Vectorize from an agent
+
+In **Zotero Settings → Zotero Vectorize → Agent access (MCP)**, turn on **Enable local MCP**. Use **Copy Codex configuration** to add the server to your user-level `~/.codex/config.toml`, then restart Codex. The copied configuration contains the access token. Keep Zotero running while using the server.
+
+MCP has been verified on Zotero 10.0.9 on macOS.
+
+The endpoint at `http://127.0.0.1:23124/mcp` serves read-only requests from the same computer. `search_papers` searches the existing **My Library** index and returns metadata, candidate passages and PDF page links. It can restrict the search to a collection by its exact path. Items without PDFs still appear in hybrid and metadata searches. `read_pdf_pages` reads up to three consecutive pages directly from a specified attachment, including pages beyond the configured search indexing limit. Missing files and pages with no extractable text have explicit statuses.
+
+The agent receives the returned metadata and text. Search queries use the embedding provider configured in the plugin.
+
 ## Data and JSON exchange
 
 The plugin stores its index in `<Zotero Data Directory>/zotero-vectorize/vectorize.sqlite`. It reads Zotero metadata and PDF text and writes its own index separately from Zotero’s library database and attachments.

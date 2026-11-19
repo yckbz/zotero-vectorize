@@ -152,6 +152,10 @@ export class VectorSearchIndex {
     return this.itemsById.get(itemID);
   }
 
+  getItemChunks(itemID: number): readonly IndexedChunkRecord[] {
+    return this.chunksByItemId.get(itemID) ?? [];
+  }
+
   private checkVectorCompatibility(
     queryVector: Float32Array | null,
     activeModelFingerprint: string,

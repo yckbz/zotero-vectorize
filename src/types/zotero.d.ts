@@ -1,4 +1,4 @@
-export {};
+import type { McpController } from '../zotero/mcp/controller.ts';
 
 declare global {
   const Zotero: ZoteroNamespace;
@@ -35,12 +35,16 @@ export interface ChromeUtilsNamespace {
 }
 
 export interface ComponentsNamespace {
+  classes: Record<string, { createInstance(iface: unknown): any; getService(iface: unknown): any }>;
+  interfaces: Record<string, unknown> & { nsIAsyncInputStream: { readonly WAIT_CLOSURE_ONLY: number } };
   utils: {
     cloneInto<T>(obj: T, targetScope: any, options?: Record<string, any>): T;
   };
 }
 
 export interface ServicesNamespace {
+  appShell: { hiddenDOMWindow: Window & typeof globalThis };
+  tm: { mainThread: unknown };
   wm: {
     getMostRecentWindow(type: string): any;
     getEnumerator(type: string): Iterable<any>;
@@ -138,6 +142,7 @@ export interface ZoteroReaderInstance {
 }
 
 export interface ZoteroNamespace {
+  VectorizeMcp?: McpController;
   version: string;
   platformMajorVersion?: number;
   isMac?: boolean;
@@ -161,6 +166,9 @@ export interface ZoteroNamespace {
   Libraries: {
     userLibraryID: number;
     getAll(): Array<{ libraryID: number; name: string; libraryType: string }>;
+  };
+  Collections: {
+    getByLibrary(libraryID: number, recursive?: boolean): ZoteroCollection[];
   };
   Items: {
     get(ids: number): ZoteroItem | false;
@@ -282,4 +290,10 @@ export interface ZoteroNamespace {
   getMainWindows(): any[];
   getActiveZoteroPane(): any;
   locale?: string;
+}
+
+export interface ZoteroCollection {
+  name: string;
+  getChildCollections(asIDs?: false): ZoteroCollection[] | false;
+  getChildItems(asIDs: true, includeDeleted?: boolean): number[] | false;
 }
