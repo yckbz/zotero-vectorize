@@ -1,9 +1,8 @@
+import * as packagedRuntime from 'onnxruntime-web';
 import { loadTokenizerFromJson, type HuggingFaceTokenizer } from '../core/tokenizer.ts';
 import { clsPoolNormalized, l2Normalize, meanPoolNormalized } from '../core/math.ts';
 
 interface InitPayload {
-  ortModuleCode: string;
-  wasmBinary: ArrayBuffer;
   modelBinary: ArrayBuffer;
   tokenizerJson: string;
   poolingMode?: 'mean' | 'cls';
@@ -22,14 +21,13 @@ interface WorkerRequest {
   payload?: any;
 }
 
-let ortModule: any = null;
 let session: any = null;
 let tokenizer: HuggingFaceTokenizer | null = null;
 let defaultPooling: 'mean' | 'cls' = 'mean';
 let defaultMaxSeqLen = 512;
 let hiddenDim = 0;
 
-export async function handleWorkerMessage(msg: WorkerRequest): Promise<{ result: any; transfer?: Transferable[] }> {
+export async function handleWorkerMessage(msg: WorkerRequest, runtime = packagedRuntime): Promise<{ result: any; transfer?: Transferable[] }> {
   if (msg.type === 'dispose') {
     if (session && typeof session.release === 'function') {
       await session.release();
@@ -41,75 +39,24 @@ export async function handleWorkerMessage(msg: WorkerRequest): Promise<{ result:
 
   if (msg.type === 'init') {
     const p = msg.payload as InitPayload;
-    if (!p || !p.ortModuleCode || !p.wasmBinary || !p.modelBinary || !p.tokenizerJson) {
+    if (!p?.modelBinary || !p.tokenizerJson) {
       throw new Error('Missing ONNX worker initialization assets');
     }
+    runtime.env.wasm.numThreads = 1;
+    runtime.env.wasm.proxy = false;
+    runtime.env.wasm.wasmPaths = { wasm: new URL('./ort-wasm-simd-threaded.wasm', import.meta.url).href };
 
-    if (!ortModule) {
-      const blob = new Blob([p.ortModuleCode], { type: 'text/javascript' });
-      const blobUrl = URL.createObjectURL(blob);
-      try {
-        ortModule = await import(/* @vite-ignore */ blobUrl);
-      } finally {
-        URL.revokeObjectURL(blobUrl);
-      }
-    }
-
-    const ort = ortModule.default ?? ortModule;
-    let wasmBlobUrl: string | null = null;
-    if (typeof Blob !== 'undefined' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
-      try {
-        wasmBlobUrl = URL.createObjectURL(new Blob([p.wasmBinary], { type: 'application/wasm' }));
-      } catch {
-        wasmBlobUrl = null;
-      }
-    }
-    if (ort.env?.wasm) {
-      ort.env.wasm.numThreads = 1;
-      ort.env.wasm.proxy = false;
-      const canFetchBlobWasm = Boolean(
-        wasmBlobUrl &&
-        typeof fetch === 'function' &&
-        (typeof importScripts === 'function' ||
-          typeof window === 'object' ||
-          (typeof self !== 'undefined' && typeof (self as any).postMessage === 'function'))
-      );
-      if (canFetchBlobWasm) {
-        // onnxruntime-web@1.20.1 omits locateFile whenever wasmBinary is set, causing
-        // Emscripten to call `new URL("ort-wasm-simd-threaded.wasm", import.meta.url)`
-        // which throws TypeError: Invalid URL when ORT is imported via a blob: URL.
-        ort.env.wasm.wasmPaths = { wasm: wasmBlobUrl };
-        delete ort.env.wasm.wasmBinary;
-      } else {
-        ort.env.wasm.wasmPaths = {};
-        ort.env.wasm.wasmBinary = p.wasmBinary;
-      }
-    }
-
-    if (session && typeof session.release === 'function') {
-      await session.release();
-    }
-
-    try {
-      session = await ort.InferenceSession.create(new Uint8Array(p.modelBinary), {
-        executionProviders: ['wasm'],
-        graphOptimizationLevel: 'all',
-      });
-    } finally {
-      if (wasmBlobUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
-        try {
-          URL.revokeObjectURL(wasmBlobUrl);
-        } catch {
-          // Ignore
-        }
-      }
-    }
+    if (session) await session.release();
+    session = await runtime.InferenceSession.create(new Uint8Array(p.modelBinary), {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
     tokenizer = loadTokenizerFromJson(p.tokenizerJson);
     defaultPooling = p.poolingMode ?? 'mean';
     defaultMaxSeqLen = p.maxSeqLength ?? 512;
 
     // Warm probe to discover actual output dimension
-    const probe = await runInference(['dimension check'], 16, defaultPooling);
+    const probe = await runInference(['dimension check'], 16, defaultPooling, runtime);
     hiddenDim = probe[0]?.length ?? 0;
 
     return {
@@ -127,7 +74,8 @@ export async function handleWorkerMessage(msg: WorkerRequest): Promise<{ result:
     const vectors = await runInference(
       p.texts ?? [],
       p.maxSeqLength ?? defaultMaxSeqLen,
-      p.poolingMode ?? defaultPooling
+      p.poolingMode ?? defaultPooling,
+      runtime
     );
     const buffers = vectors.map((v) => v.buffer);
     return {
@@ -142,14 +90,14 @@ export async function handleWorkerMessage(msg: WorkerRequest): Promise<{ result:
 async function runInference(
   texts: string[],
   maxSeqLength: number,
-  poolingMode: 'mean' | 'cls'
+  poolingMode: 'mean' | 'cls',
+  runtime: typeof packagedRuntime
 ): Promise<Float32Array[]> {
-  if (!session || !tokenizer || !ortModule) {
+  if (!session || !tokenizer) {
     throw new Error('ONNX session is not initialized');
   }
   if (texts.length === 0) return [];
 
-  const ort = ortModule.default ?? ortModule;
   const encoded = tokenizer.encodeBatch(texts, maxSeqLength);
   const { batchSize, seqLength } = encoded;
 
@@ -158,11 +106,11 @@ async function runInference(
 
   for (const name of inputNames) {
     if (name === 'input_ids') {
-      feeds[name] = new ort.Tensor('int64', encoded.inputIds, [batchSize, seqLength]);
+      feeds[name] = new runtime.Tensor('int64', encoded.inputIds, [batchSize, seqLength]);
     } else if (name === 'attention_mask') {
-      feeds[name] = new ort.Tensor('int64', encoded.attentionMask, [batchSize, seqLength]);
+      feeds[name] = new runtime.Tensor('int64', encoded.attentionMask, [batchSize, seqLength]);
     } else if (name === 'token_type_ids') {
-      feeds[name] = new ort.Tensor('int64', encoded.tokenTypeIds, [batchSize, seqLength]);
+      feeds[name] = new runtime.Tensor('int64', encoded.tokenTypeIds, [batchSize, seqLength]);
     }
   }
 

@@ -68,7 +68,7 @@ When a legacy plugin index is in the same Zotero data directory, the plugin migr
 
 ## Build from source
 
-Install Node.js 22 or later and make Python 3 available as `python3`. From the repository root, run:
+Install Node.js 22 or later and Python 3. Use `python` on Windows and `python3` on macOS and Linux. From the repository root, run:
 
 ```sh
 npm ci

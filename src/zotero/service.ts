@@ -8,7 +8,7 @@ import type {
 } from '../types/vectorize.ts';
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import type { DownloadProgressInfo } from '../engines/local-onnx.ts';
-import { LocalOnnxProvider } from '../engines/local-onnx.ts';
+import { LocalOnnxProvider, ONNX_WORKER_RESOURCE } from '../engines/local-onnx.ts';
 import { OllamaEmbeddingProvider } from '../engines/ollama.ts';
 import { ProviderManager } from '../engines/factory.ts';
 import type { EmbeddingProvider } from '../engines/provider.ts';
@@ -54,7 +54,7 @@ export class VectorizeService {
     this.store = new VectorStore(options.dataDir);
     this.providerManager = new ProviderManager({
       dataDir: options.dataDir,
-      workerScriptUrl: `${options.rootURI}workers/onnx-worker.js`,
+      workerScriptUrl: `resource://${ONNX_WORKER_RESOURCE}/onnx-worker.mjs`,
     });
     this.indexSync = new IndexSync({
       store: this.store,
@@ -212,7 +212,7 @@ export class VectorizeService {
       const provider = this.providerManager.createProvider(draft);
       try {
         if (!(provider instanceof LocalOnnxProvider)) throw new Error('Active engine is not Local ONNX');
-        await provider.downloadModelAndRuntime(onProgress);
+        await provider.downloadModel(onProgress);
       } finally {
         await provider.dispose();
       }
@@ -222,7 +222,7 @@ export class VectorizeService {
     await this.withIndexMaintenance(async () => {
       const provider = await this.getProvider();
       if (!(provider instanceof LocalOnnxProvider)) throw new Error('Active engine is not Local ONNX');
-      await provider.downloadModelAndRuntime(onProgress);
+      await provider.downloadModel(onProgress);
       const profile = await resolveEmbeddingProfile(target, provider, (await provider.getStatus()).dimensions);
       await this.store.activateProfile(profile);
       await this.reloadIndex();

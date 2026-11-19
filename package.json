@@ -1,6 +1,6 @@
 {
   "name": "zotero-vectorize",
-  "version": "1.0.2",
+  "version": "1.0.3-beta.1",
   "description": "Local-first semantic search, cross-lingual recall, full-text passage navigation, and automatic background vectorization plugin for Zotero.",
   "license": "MIT",
   "type": "module",
@@ -8,11 +8,12 @@
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build.mjs",
     "package": "node scripts/build.mjs --xpi",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
     "verify": "npm run typecheck && npm run package && node scripts/verify-xpi.mjs && npm test"
   },
   "devDependencies": {
     "esbuild": "0.28.0",
+    "onnxruntime-web": "1.20.1",
     "typescript": "5.9.3"
   },
   "dependencies": {

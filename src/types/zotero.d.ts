@@ -8,7 +8,6 @@ declare global {
   const ChromeUtils: ChromeUtilsNamespace;
   const Components: ComponentsNamespace;
   const Localization: new (resourceIds: string[], sync?: boolean) => LocalizationInstance;
-  const ChromeWorker: typeof Worker;
 
   interface Document {
     createXULElement?(tagName: string): any;
@@ -43,6 +42,7 @@ export interface ComponentsNamespace {
 }
 
 export interface ServicesNamespace {
+  io: { newURI(uri: string): unknown };
   appShell: { hiddenDOMWindow: Window & typeof globalThis };
   tm: { mainThread: unknown };
   wm: {

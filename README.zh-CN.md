@@ -68,7 +68,7 @@ Agent 会收到工具返回的题录和正文。搜索查询使用插件当前�
 
 ## 从源码构建
 
-安装 Node.js 22 或更新版本，并确保可以通过 `python3` 运行 Python 3。在仓库根目录执行：
+安装 Node.js 22 或更新版本及 Python 3。Windows 使用 `python`，macOS 和 Linux 使用 `python3`。在仓库根目录执行：
 
 ```sh
 npm ci

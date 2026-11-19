@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Zotero Vectorize",
-  "version": "1.0.2",
+  "version": "1.0.3-beta.1",
   "description": "Local-first semantic search, cross-lingual recall, full-text passage navigation, and automatic background vectorization for Zotero.",
   "author": "yckbz",
   "homepage_url": "https://github.com/yckbz/zotero-vectorize",

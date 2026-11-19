@@ -1,10 +1,10 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import esbuild from 'esbuild';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TMP_TEST_BUILD = path.join(os.tmpdir(), `zotero-vectorize-test-${process.pid}`);
 
 export async function importTs(relPath) {

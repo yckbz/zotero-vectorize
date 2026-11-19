@@ -17,6 +17,8 @@ const REQUIRED_FILES = [
   'licenses/core.txt',
   'licenses/server.txt',
   'licenses/zod.txt',
+  'licenses/onnxruntime.txt',
+  'licenses/onnxruntime-third-party.txt',
   'chrome/content/preferences.xhtml',
   'chrome/content/preferences.js',
   'chrome/content/preferences.css',
@@ -24,7 +26,9 @@ const REQUIRED_FILES = [
   'chrome/skin/default/icon-16.svg',
   'locale/en-US/zotero-vectorize.ftl',
   'locale/zh-CN/zotero-vectorize.ftl',
-  'workers/onnx-worker.js',
+  'workers/onnx-worker.mjs',
+  'workers/ort.bundle.min.mjs',
+  'workers/ort-wasm-simd-threaded.wasm',
 ];
 
 async function main() {
@@ -39,7 +43,7 @@ with zipfile.ZipFile(xpi_path, 'r') as zf:
     manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
     bootstrap = zf.read('bootstrap.js').decode('utf-8')
     prefs = zf.read('chrome/content/preferences.js').decode('utf-8')
-    worker = zf.read('workers/onnx-worker.js').decode('utf-8')
+    worker = zf.read('workers/onnx-worker.mjs').decode('utf-8')
     xhtml = zf.read('chrome/content/preferences.xhtml').decode('utf-8')
     ftl_en = zf.read('locale/en-US/zotero-vectorize.ftl').decode('utf-8')
     ftl_zh = zf.read('locale/zh-CN/zotero-vectorize.ftl').decode('utf-8')
@@ -54,7 +58,8 @@ with zipfile.ZipFile(xpi_path, 'r') as zf:
         'ftlZh': ftl_zh,
     }))
 `;
-  const raw = execFileSync('python3', ['-c', pyInspect, XPI_PATH], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+  const raw = execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', pyInspect, XPI_PATH],
+    { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
   const info = JSON.parse(raw);
 
   // 1. Check archive paths (no leading ./, no .ts leaks, all required entries present)
@@ -69,6 +74,8 @@ with zipfile.ZipFile(xpi_path, 'r') as zf:
 
   // 2. Check manifest.json satisfies modern Zotero requirements
   const m = info.manifest;
+  const pkg = JSON.parse(await fs.readFile(path.join(ROOT, 'package.json'), 'utf8'));
+  assert.equal(m.version, pkg.version, 'Package and XPI versions must match');
   assert.equal(m.manifest_version, 2);
   assert.ok(m.applications?.zotero?.id, 'Missing applications.zotero.id');
   assert.ok(m.applications?.zotero?.update_url, 'Missing applications.zotero.update_url');
@@ -77,9 +84,12 @@ with zipfile.ZipFile(xpi_path, 'r') as zf:
 
   // 3. Parse-check bundled JS files and verify bootstrap lifecycle exports
   const buildDir = path.join(ROOT, 'build');
-  for (const rel of ['bootstrap.js', 'mcp.js', 'chrome/content/preferences.js', 'workers/onnx-worker.js']) {
+  for (const rel of ['bootstrap.js', 'mcp.js', 'chrome/content/preferences.js']) {
     const code = await fs.readFile(path.join(buildDir, rel), 'utf8');
     new vm.Script(code, { filename: rel });
+  }
+  for (const rel of ['workers/onnx-worker.mjs', 'workers/ort.bundle.min.mjs']) {
+    execFileSync(process.execPath, ['--check', path.join(buildDir, rel)]);
   }
 
   // Execute bootstrap.js in a minimal sandbox to verify lifecycle symbols are defined on globalThis
