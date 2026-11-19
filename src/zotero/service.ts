@@ -11,6 +11,7 @@ import type { DownloadProgressInfo } from '../engines/local-onnx.ts';
 import { LocalOnnxProvider } from '../engines/local-onnx.ts';
 import { OllamaEmbeddingProvider } from '../engines/ollama.ts';
 import { ProviderManager } from '../engines/factory.ts';
+import type { EmbeddingProvider } from '../engines/provider.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
 import { embeddingSettings, resolveEmbeddingProfile } from './embedding-profile.ts';
 import { extractItemMetadata, isIndexableRegularItem } from './extractor.ts';
@@ -18,17 +19,27 @@ import { rotateBackups } from '../core/compat-json.ts';
 import { observeConfigChanges, readPluginConfig, writePluginConfig } from './config.ts';
 import { VectorStore } from './vector-store.ts';
 import { BackgroundIndexer } from './indexer.ts';
+import { IndexSync } from './index-sync.ts';
+import { syncSearchConfig } from './sync-snapshot.ts';
 
 const ENGINE_SETTINGS = [
   'engine', 'localModelId', 'localModelDir', 'localMirror', 'localMaxSeqLength', 'ollamaUrl', 'ollamaModel',
   'openaiBaseUrl', 'openaiApiKey', 'openaiModel', 'openaiDimensions', 'openaiBatchSize',
 ] as const satisfies readonly (keyof PluginConfig)[];
 
+interface SearchOptions {
+  mode?: SearchMode;
+  filterItemIDs?: Set<number> | null;
+  topK?: number;
+  signal?: AbortSignal;
+}
+
 export class VectorizeService {
   readonly store: VectorStore;
   readonly searchIndex = new VectorSearchIndex();
   readonly providerManager: ProviderManager;
   readonly indexer: BackgroundIndexer;
+  readonly indexSync: IndexSync;
   private config: PluginConfig;
   private stopConfigObserver: (() => void) | null = null;
   private queryVectorCache = new Map<string, { fp: string; vec: Float32Array }>();
@@ -45,11 +56,23 @@ export class VectorizeService {
       dataDir: options.dataDir,
       workerScriptUrl: `${options.rootURI}workers/onnx-worker.js`,
     });
+    this.indexSync = new IndexSync({
+      store: this.store,
+      getConfig: () => this.config,
+      getProgress: () => this.indexer.getProgress(),
+      createProvider: (config) => this.providerManager.createProvider(config),
+      onUpdate: () => {
+        this.indexGeneration++;
+        this.notifyIndexUpdated();
+      },
+      onLocalAvailable: () => this.indexer.scheduleStartupScan(100),
+    });
     this.indexer = new BackgroundIndexer({
       getConfig: () => this.getConfig(),
       getProvider: () => this.getProvider(),
       store: this.store,
       searchIndex: this.searchIndex,
+      shouldAutoIndex: (libraryID) => this.indexSync.shouldAutoIndex(libraryID),
       onItemIndexed: () => this.notifyIndexUpdated(),
     });
   }
@@ -75,6 +98,11 @@ export class VectorizeService {
     return this.config;
   }
 
+  getSearchConfig(): PluginConfig {
+    const shared = this.indexSync.active;
+    return shared ? syncSearchConfig(shared.manifest, this.config) : this.config;
+  }
+
   updateConfig(partial: Partial<PluginConfig>): PluginConfig {
     const preferences = Object.fromEntries(Object.entries(partial).filter(([key]) =>
       !ENGINE_SETTINGS.some((engineKey) => engineKey === key)
@@ -83,6 +111,7 @@ export class VectorizeService {
     const engine = Object.fromEntries(ENGINE_SETTINGS.map((key) => [key, this.config[key]]));
     this.config = { ...next, ...engine };
     this.queryVectorCache.clear();
+    this.indexSync.onConfigChanged();
     return this.config;
   }
 
@@ -105,9 +134,15 @@ export class VectorizeService {
         const engine = Object.fromEntries(ENGINE_SETTINGS.map((key) => [key, this.config[key]]));
         this.config = { ...next, ...engine };
         this.queryVectorCache.clear();
+        this.indexSync.onConfigChanged();
       });
 
       this.indexer.startNotifier();
+      try {
+        this.indexSync.start();
+      } catch {
+        Zotero.debug?.('Zotero Vectorize could not start optional index sync');
+      }
       if (!await this.hasLegacyIndexForActiveModel()) this.indexer.scheduleStartupScan(3500);
       this.initialized = true;
       this.notifyIndexUpdated();
@@ -122,6 +157,7 @@ export class VectorizeService {
   }
 
   async shutdown(): Promise<void> {
+    this.indexSync.dispose();
     if (this.stopConfigObserver) {
       this.stopConfigObserver();
       this.stopConfigObserver = null;
@@ -141,6 +177,17 @@ export class VectorizeService {
     await this.maintenance;
     const provider = await this.getProvider();
     return provider.getStatus();
+  }
+
+  async getSearchEngineStatus(): Promise<EngineHealthStatus> {
+    const shared = this.indexSync.active;
+    if (shared) {
+      try {
+        const status = await shared.provider.getStatus();
+        if (status.neuralAvailable) return status;
+      } catch { /* The local engine still serves search when the shared provider is unavailable. */ }
+    }
+    return this.getEngineStatus();
   }
 
   async testConnection(draft?: PluginConfig): Promise<{ ok: boolean; dimensions: number; message: string }> {
@@ -181,6 +228,7 @@ export class VectorizeService {
       await this.reloadIndex();
     });
     this.indexer.requestModelBackfill(await this.getProvider());
+    this.indexSync.onConfigChanged();
   }
 
   private withIndexMaintenance<T>(operation: () => Promise<T>, affectsActiveIndex = () => true): Promise<T> {
@@ -227,6 +275,7 @@ export class VectorizeService {
     } finally {
       await provider.dispose();
     }
+    this.indexSync.onConfigChanged();
     if (!await this.hasLegacyIndexForActiveModel()) void this.startIndexing(false);
   }
 
@@ -265,13 +314,13 @@ export class VectorizeService {
     }, active);
   }
 
-  private async embedQueryCached(query: string, config: PluginConfig, signal?: AbortSignal): Promise<{
+  private async embedQueryCached(query: string, config: PluginConfig, signal?: AbortSignal, sharedProvider?: EmbeddingProvider): Promise<{
     vec: Float32Array | null;
     fp: string;
     engineLabel: string;
     errorNote?: string;
   }> {
-    const provider = await this.providerManager.getProvider(config);
+    const provider = sharedProvider ?? await this.providerManager.getProvider(config);
     signal?.throwIfAborted();
     const status = await provider.getStatus();
     signal?.throwIfAborted();
@@ -282,11 +331,12 @@ export class VectorizeService {
         vec: null,
         fp: provider.getModelFingerprint(),
         engineLabel,
+        ...(sharedProvider ? { errorNote: 'Shared embedding model is unavailable' } : {}),
       };
     }
 
     const cacheKey = `${provider.engine}:${provider.model}:${query}`;
-    const cached = this.queryVectorCache.get(cacheKey);
+    const cached = sharedProvider ? undefined : this.queryVectorCache.get(cacheKey);
     if (cached) {
       return { vec: cached.vec, fp: cached.fp, engineLabel };
     }
@@ -294,7 +344,7 @@ export class VectorizeService {
     try {
       const vec = await provider.embedQuery(query);
       const fp = provider.getModelFingerprint(vec.length);
-      if (config === this.config && !signal?.aborted) {
+      if (!sharedProvider && config === this.config && !signal?.aborted) {
         if (this.queryVectorCache.size >= 64) {
           const firstKey = this.queryVectorCache.keys().next().value;
           if (firstKey !== undefined) this.queryVectorCache.delete(firstKey);
@@ -312,48 +362,87 @@ export class VectorizeService {
     }
   }
 
-  async search(
-    query: string,
-    options?: {
-      mode?: SearchMode;
-      filterItemIDs?: Set<number> | null;
-      topK?: number;
-      signal?: AbortSignal;
-    }
-  ): Promise<SearchResponse> {
+  async search(query: string, options?: SearchOptions): Promise<SearchResponse> {
     await this.init();
     await this.maintenance;
     const generation = this.indexGeneration;
-    const signal = options?.signal;
-    signal?.throwIfAborted();
+    options?.signal?.throwIfAborted();
     const clean = (query || '').trim();
-    const config = this.config;
+    const shared = this.indexSync.active;
+    let response: SearchResponse | undefined;
+    if (shared) {
+      const config = syncSearchConfig(shared.manifest, this.config);
+      const scope = options?.filterItemIDs;
+      const mode = options?.mode ?? config.defaultSearchMode;
+      const sharedIDs = new Set(shared.index.getAllItems().filter((item) => {
+        if (scope && !scope.has(item.itemID)) return false;
+        const local = this.searchIndex.getItemById(item.itemID);
+        if (!local) return true;
+        if (mode !== 'fulltext' && local.vector && !item.vector) return false;
+        if (mode === 'metadata') return true;
+        const sharedPdfs = new Set(shared.index.getItemChunks(item.itemID).map((chunk) => chunk.attachmentID));
+        return this.searchIndex.getItemChunks(item.itemID).every((chunk) => sharedPdfs.has(chunk.attachmentID));
+      }).map((item) => item.itemID));
+      if (sharedIDs.size) {
+        const sharedOptions = { ...options, mode,
+          topK: options?.topK ?? config.maxResults, filterItemIDs: sharedIDs };
+        let remote: SearchResponse | undefined;
+        try {
+          if (shared.manifest.engine !== 'ollama' || !clean || config.hybridSemanticWeight === 0 || !shared.index.hasVectors(mode) ||
+              (await shared.provider.getModelRevision?.(true)) === shared.manifest.revision) {
+            remote = await this.searchIndexWithConfig(clean, sharedOptions, shared.index, config, shared.provider);
+          }
+        } catch {
+          options?.signal?.throwIfAborted();
+        }
+        if (remote && !remote.diagnostics.mismatchWarning) {
+          const localIDs = new Set(this.searchIndex.getAllItems().map((item) => item.itemID)
+            .filter((id) => !sharedIDs.has(id) && (!scope || scope.has(id))));
+          if (localIDs.size) {
+            const local = await this.searchIndexWithConfig(clean, { ...sharedOptions, filterItemIDs: localIDs }, this.searchIndex, this.config);
+            remote.hits = [...remote.hits, ...local.hits].sort((a, b) =>
+              b.score - a.score || b.semanticScore - a.semanticScore || b.lexicalScore - a.lexicalScore).slice(0, sharedOptions.topK);
+            remote.diagnostics.vectorSearchUsed ||= local.diagnostics.vectorSearchUsed;
+            remote.diagnostics.lexicalFallbackUsed ||= local.diagnostics.lexicalFallbackUsed;
+            remote.diagnostics.totalIndexedItems += localIDs.size;
+            remote.diagnostics.totalIndexedChunks += this.searchIndex.getAllChunks().filter((chunk) => localIDs.has(chunk.itemID)).length;
+          }
+          response = remote;
+        }
+      }
+    }
+    response ??= await this.searchIndexWithConfig(clean, options, this.searchIndex, this.config);
+    return generation === this.indexGeneration ? response : this.search(query, options);
+  }
+
+  private async searchIndexWithConfig(
+    query: string, options: SearchOptions | undefined, index: VectorSearchIndex, config: PluginConfig, provider?: EmbeddingProvider
+  ): Promise<SearchResponse> {
     const mode = options?.mode ?? config.defaultSearchMode;
-    const topK = options?.topK ?? config.maxResults;
-    const { vec, fp, engineLabel, errorNote } = clean && config.hybridSemanticWeight > 0 && this.searchIndex.hasVectors(mode)
-      ? await this.embedQueryCached(clean, config, signal)
+    const { vec, fp, engineLabel, errorNote } = query && config.hybridSemanticWeight > 0 && index.hasVectors(mode)
+      ? await this.embedQueryCached(query, config, options?.signal, provider)
       : { vec: null, fp: '', engineLabel: 'Lexical', errorNote: undefined };
-    if (generation !== this.indexGeneration) return this.search(query, options);
-    const response = await this.searchIndex.searchAsync({
-      query: clean,
+    const response = await index.searchAsync({
+      query,
       queryVector: vec,
       activeModelFingerprint: fp,
       engineLabel,
       mode,
-      topK,
+      topK: options?.topK ?? config.maxResults,
       hybridAlpha: config.hybridSemanticWeight,
       normalizeNotation: config.normalizeNotation,
       filterItemIDs: options?.filterItemIDs,
-    }, signal);
-
-    if (generation !== this.indexGeneration) return this.search(query, options);
-    if (errorNote && !response.diagnostics.mismatchWarning) {
-      response.diagnostics.mismatchWarning = errorNote;
-    }
+    }, options?.signal);
+    if (errorNote && !response.diagnostics.mismatchWarning) response.diagnostics.mismatchWarning = errorNote;
     return response;
   }
 
   findSimilarItems(itemID: number, topK = 5) {
+    const shared = this.indexSync.active;
+    const sharedItem = shared?.index.getItemById(itemID);
+    if (shared && sharedItem && (sharedItem.vector || !this.searchIndex.getItemById(itemID)?.vector)) {
+      return shared.index.findSimilarItems(itemID, { topK, normalizeNotation: shared.manifest.normalizeNotation });
+    }
     return this.searchIndex.findSimilarItems(itemID, { topK, normalizeNotation: this.config.normalizeNotation });
   }
 
@@ -389,6 +478,15 @@ export class VectorizeService {
     await this.init();
     await this.maintenance;
     return this.store.getStats(activeModel);
+  }
+
+  async getSearchCoverage(): Promise<Pick<StoreStats, 'indexedItems' | 'indexedChunks'>> {
+    await this.init();
+    const shared = this.indexSync.active?.index;
+    return shared ? {
+      indexedItems: shared.getItemCount() + this.searchIndex.getAllItems().filter((item) => !shared.getItemById(item.itemID)).length,
+      indexedChunks: shared.getChunkCount() + this.searchIndex.getAllChunks().filter((chunk) => !shared.getItemById(chunk.itemID)).length,
+    } : this.getStats();
   }
 
   async exportCompatJsonToFolder(folderPath: string, profileID?: string): Promise<{ items: number; chunks: number; files: string[] }> {

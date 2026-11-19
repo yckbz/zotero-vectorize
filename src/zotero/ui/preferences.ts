@@ -63,6 +63,7 @@ class VectorizePreferencesController {
   private initialized = false;
   private unsubProgress: (() => void) | null = null;
   private unsubWrites: (() => void) | null = null;
+  private unsubSync: (() => void) | null = null;
   private statsTimer: ReturnType<typeof setTimeout> | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private statsSeq = 0;
@@ -112,6 +113,8 @@ class VectorizePreferencesController {
     }
     this.unsubWrites?.();
     this.unsubWrites = null;
+    this.unsubSync?.();
+    this.unsubSync = null;
     this.cancelScheduledStats();
     if (this.progressFrame !== null) {
       window.cancelAnimationFrame(this.progressFrame);
@@ -722,6 +725,42 @@ class VectorizePreferencesController {
       el(doc, 'div', { id: 'zv-model-indexes' }),
       el(doc, 'div', { className: 'zv-btn-row' }, [importButton, exportButton]),
     ]));
+
+    this.unsubSync?.();
+    if (svc.indexSync) {
+      const sync = svc.indexSync;
+      const state = el(doc, 'p', { className: 'zv-hint', role: 'status' });
+      const button = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefIndexSyncNow]) as HTMLButtonElement;
+      const role = el(doc, 'select', { 'aria-label': s.prefIndexSyncTitle },
+        Object.entries(s.prefIndexSyncRole).map(([value, label]) => el(doc, 'option', { value }, [label]))) as HTMLSelectElement;
+      const update = () => {
+        const status = sync.getStatus();
+        role.value = status.role;
+        button.disabled = status.role === 'off' || status.phase === 'working';
+        state.textContent = [s.prefIndexSyncState[status.phase], status.model,
+          status.lastReceived ? new Date(status.lastReceived).toLocaleString() : ''].filter(Boolean).join(' · ');
+      };
+      role.addEventListener('change', () => {
+        const value = role.value;
+        if (value !== 'off' && value !== 'publish' && value !== 'receive') return;
+        try {
+          sync.setRole(value);
+          update();
+        } catch {
+          update();
+          state.textContent = s.prefIndexSyncState.error;
+        }
+      });
+      button.addEventListener('click', () => void sync.syncNow());
+      this.unsubSync = sync.subscribe(update);
+      update();
+      this.container.appendChild(el(doc, 'div', { className: 'zv-pref-card' }, [
+        el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefIndexSyncTitle]),
+        el(doc, 'p', { className: 'zv-hint' }, [s.prefIndexSyncHint]),
+        el(doc, 'div', { className: 'zv-btn-row' }, [role, button]),
+        state,
+      ]));
+    }
 
     const mcp = Zotero.VectorizeMcp;
     if (mcp) {

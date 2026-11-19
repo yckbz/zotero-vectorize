@@ -46,7 +46,8 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     return (await this.getInstalledModels()).map((model) => model.name || model.model || '').filter(Boolean);
   }
 
-  getModelRevision(): Promise<string | null> {
+  getModelRevision(refresh = false): Promise<string | null> {
+    if (refresh) this.modelRevision = undefined;
     this.modelRevision ??= this.getInstalledModels().then((models) => {
       const canonical = (name: string) => name.split('/').at(-1)?.includes(':') ? name : `${name}:latest`;
       return models.find((model) => canonical(model.name || model.model || '') === canonical(this.model))?.digest ?? null;

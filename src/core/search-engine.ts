@@ -382,6 +382,7 @@ export class VectorSearchIndex {
           semanticScore: sem,
           lexicalScore: lex,
           highlightRanges: [],
+          ...(chunk.sourceFileHash ? { sourceFileHash: chunk.sourceFileHash } : {}),
         });
         chunksByParent.set(chunk.itemID, list);
       }

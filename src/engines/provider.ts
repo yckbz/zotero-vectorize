@@ -248,7 +248,7 @@ export interface EmbeddingProvider {
   readonly model: string;
   getPassageBatchSize(): number | Promise<number>;
   getModelFingerprint(dim?: number): string;
-  getModelRevision?(): Promise<string | null>;
+  getModelRevision?(refresh?: boolean): Promise<string | null>;
   getStatus(): Promise<EngineHealthStatus>;
   embedQuery(text: string): Promise<Float32Array>;
   embedMetadata?(texts: string[]): Promise<Float32Array[]>;

@@ -55,6 +55,7 @@ export interface IndexerDeps {
   getProvider: () => Promise<EmbeddingProvider>;
   store: VectorStore;
   searchIndex: VectorSearchIndex;
+  shouldAutoIndex?: (libraryID: number) => boolean;
   onItemIndexed?: () => void;
 }
 
@@ -77,6 +78,7 @@ export class BackgroundIndexer {
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingDebounceIds = new Set<number>();
+  private pendingExplicitIds = new Set<number>();
   private activeRun: Promise<void> | null = null;
   private activeLibraryVectorProvider: EmbeddingProvider | null = null;
   private pendingModelBackfill: EmbeddingProvider | null = null;
@@ -99,7 +101,7 @@ export class BackgroundIndexer {
         this.queueDeletes([...this.queuedDeletes]);
         this.queuedDeletes.clear();
       }
-      if (this.pendingDebounceIds.size) this.scheduleDebouncedFlush();
+      if (this.pendingDebounceIds.size || this.pendingExplicitIds.size) this.scheduleDebouncedFlush();
     }
   }
 
@@ -192,7 +194,7 @@ export class BackgroundIndexer {
       if (this.disposed) return;
       const cfg = this.deps.getConfig();
       if (cfg.autoIndexOnStartup) {
-        void this.startLibraryScan(false);
+        void this.startLibraryScan(false, true);
       }
     }, delayMs);
   }
@@ -201,10 +203,19 @@ export class BackgroundIndexer {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      if (this.disposed || this.suspended || this.pendingDebounceIds.size === 0) return;
+      if (this.disposed || this.suspended) return;
+      if (this.pendingExplicitIds.size) {
+        const explicit = [...this.pendingExplicitIds];
+        this.pendingExplicitIds.clear();
+        void this.indexItemOrAttachmentIds(explicit, false).finally(() => {
+          if (!this.disposed && !this.activeRun && this.pendingDebounceIds.size) this.scheduleDebouncedFlush(80);
+        });
+        return;
+      }
+      if (this.pendingDebounceIds.size === 0) return;
       const batch = Array.from(this.pendingDebounceIds);
       this.pendingDebounceIds.clear();
-      void this.indexItemOrAttachmentIds(batch, false);
+      void this.indexItemOrAttachmentIds(batch, false, true);
     }, delayMs);
   }
 
@@ -214,10 +225,10 @@ export class BackgroundIndexer {
     this.pendingModelBackfill = null;
     if (this.disposed || this.cancelled) return;
     if (pendingModelBackfill && (this.progress.phase === 'completed' || this.progress.phase === 'incomplete')) {
-      void this.startLibraryScan(false);
+      void this.startLibraryScan(false, true);
       return;
     }
-    if (this.pendingDebounceIds.size > 0) {
+    if (this.pendingDebounceIds.size > 0 || this.pendingExplicitIds.size > 0) {
       this.scheduleDebouncedFlush(80);
     }
   }
@@ -227,7 +238,7 @@ export class BackgroundIndexer {
     if (this.activeRun) {
       this.pendingModelBackfill = provider;
     } else if (this.deps.getConfig().autoIndexOnStartup || this.deps.searchIndex.getItemCount() > 0) {
-      void this.startLibraryScan(false);
+      void this.startLibraryScan(false, true);
     }
   }
 
@@ -237,6 +248,7 @@ export class BackgroundIndexer {
       const id = Number(rawId);
       if (!Number.isFinite(id) || id <= 0) continue;
       this.pendingDebounceIds.delete(id);
+      this.pendingExplicitIds.delete(id);
       try {
         await this.deps.store.removeItem(id);
         this.deps.searchIndex.removeItem(id);
@@ -329,7 +341,7 @@ export class BackgroundIndexer {
     await this.deleteWrites;
   }
 
-  async startLibraryScan(forceRebuild = false): Promise<void> {
+  async startLibraryScan(forceRebuild = false, automatic = false): Promise<void> {
     if (this.disposed || this.cancelled || this.suspended) return;
     if (this.activeRun) {
       return this.activeRun;
@@ -376,7 +388,7 @@ export class BackgroundIndexer {
           }
           await this.reconcileLibrary(regularIds, pdfIDs);
         }
-        await this.processItemIds(Array.from(regularIds), forceRebuild, true);
+        await this.processItemIds(Array.from(regularIds), forceRebuild, true, automatic);
       } catch (err: any) {
         Zotero.logError(err);
         this.emit({
@@ -394,12 +406,13 @@ export class BackgroundIndexer {
     return run;
   }
 
-  async indexItemOrAttachmentIds(rawIds: number[], forceRebuild = false): Promise<void> {
+  async indexItemOrAttachmentIds(rawIds: number[], forceRebuild = false, automatic = false): Promise<void> {
     const resolvedRegularIds = new Set<number>();
     for (const id of rawIds) {
       try {
         const item = await Zotero.Items.getAsync(id);
         if (!item || item.deleted) continue;
+        if (automatic && this.deps.shouldAutoIndex?.(item.libraryID) === false) continue;
         if (isIndexableRegularItem(item)) {
           resolvedRegularIds.add(item.id);
         } else if (item.isAttachment?.() && typeof item.parentItemID === 'number' && item.parentItemID > 0) {
@@ -413,8 +426,9 @@ export class BackgroundIndexer {
 
     if (this.disposed) return;
     if (this.activeRun || this.suspended || this.cancelled) {
+      const queue = automatic ? this.pendingDebounceIds : this.pendingExplicitIds;
       for (const id of resolvedRegularIds) {
-        this.pendingDebounceIds.add(id);
+        queue.add(id);
       }
       return;
     }
@@ -423,7 +437,7 @@ export class BackgroundIndexer {
     this.paused = false;
     const run = (async () => {
       try {
-        await this.processItemIds(Array.from(resolvedRegularIds), forceRebuild);
+        await this.processItemIds(Array.from(resolvedRegularIds), forceRebuild, false, automatic);
       } catch (err: any) {
         Zotero.logError(err);
         this.emit({
@@ -527,7 +541,7 @@ export class BackgroundIndexer {
     return work.remaining ? work : null;
   }
 
-  private async processItemIds(itemIds: number[], force: boolean, libraryScan = false): Promise<void> {
+  private async processItemIds(itemIds: number[], force: boolean, libraryScan = false, automatic = false): Promise<void> {
     if (!(await this.waitIfPaused())) return;
     const cfg = this.deps.getConfig();
     const strings = getStrings(cfg);
@@ -545,6 +559,7 @@ export class BackgroundIndexer {
     });
 
     const { store, searchIndex } = this.deps;
+    const allowed = (item: ZoteroItem) => !automatic || this.deps.shouldAutoIndex?.(item.libraryID) !== false;
     let savedChunks = 0;
     const recordFailure = (message: string): void => {
       this.emit({ failedCount: this.progress.failedCount + 1, lastError: this.progress.lastError ?? message });
@@ -562,7 +577,7 @@ export class BackgroundIndexer {
       for (const itemID of itemIds) {
         if (!(await this.waitIfPaused())) return;
         const item = await Zotero.Items.getAsync(itemID).catch(() => null);
-        if (!isIndexableRegularItem(item)) continue;
+        if (!isIndexableRegularItem(item) || !allowed(item)) continue;
         for (const attachmentID of item.getAttachments?.(false) ?? []) {
           if (!(await this.waitIfPaused())) return;
           const att = await Zotero.Items.getAsync(attachmentID).catch(() => null);
@@ -608,7 +623,7 @@ export class BackgroundIndexer {
     const flushMetadata = async () => {
       if (!metadata.length || !(await this.waitIfPaused())) return;
       const batch = metadata.splice(0);
-      const inputs = batch.filter(({ value }) => value.canonicalText);
+      const inputs = batch.filter(({ item, value }) => allowed(item) && value.canonicalText);
       const embeddings = new Map<number, Float32Array>();
       if (canEmbed && inputs.length) {
         try {
@@ -623,7 +638,7 @@ export class BackgroundIndexer {
       if (!(await this.waitIfPaused())) return;
       const records: IndexedItemRecord[] = [];
       for (const { item, value } of batch) {
-        if (item.deleted || extractItemMetadata(item).metadataHash !== value.metadataHash) continue;
+        if (item.deleted || !allowed(item) || extractItemMetadata(item).metadataHash !== value.metadataHash) continue;
         const previous = searchIndex.getItemById(item.id);
         const vector = embeddings.get(item.id) ?? (previous?.metadataHash === value.metadataHash ? previous.vector : null);
         const { canonicalText: _text, dateModified: _modified, ...fields } = value;
@@ -642,7 +657,7 @@ export class BackgroundIndexer {
       for (const itemID of itemIds) {
         if (!(await this.waitIfPaused())) break;
         const item = await Zotero.Items.getAsync(itemID).catch(() => null);
-        if (isIndexableRegularItem(item)) {
+        if (isIndexableRegularItem(item) && allowed(item)) {
           const value = extractItemMetadata(item);
           const existing = force ? null : await store.getItemSyncInfo(item.id);
           if (existing?.metadataHash === value.metadataHash && (!canEmbed || existing.hasVector || !value.canonicalText)) {
@@ -669,7 +684,7 @@ export class BackgroundIndexer {
       const failed = new Set<number>();
       const flushPassages = async (): Promise<void> => {
         if (!batch.length || !(await this.waitIfPaused())) return;
-        const current = batch.splice(0).filter(({ work }) => this.isCurrent(work) && !failed.has(work.attachment.id));
+        const current = batch.splice(0).filter(({ work }) => allowed(work.item) && this.isCurrent(work) && !failed.has(work.attachment.id));
         if (!current.length) return;
 
         let vectors: Float32Array[];

@@ -448,13 +448,14 @@ export class VectorStore {
     }
   }
 
-  async loadAll(profileId = this.profile?.id ?? ''): Promise<{ items: IndexedItemRecord[]; chunks: IndexedChunkRecord[] }> {
+  async loadAll(profileId = this.profile?.id ?? '', libraryID?: number): Promise<{ items: IndexedItemRecord[]; chunks: IndexedChunkRecord[] }> {
     const conn = await this.ensureConn();
     const itemRows = await conn.queryAsync<Record<string, any>>(
       `SELECT i.*, e.vector, p.dim, p.engine, p.model FROM item_vectors i
        LEFT JOIN metadata_embeddings e ON e.item_id = i.item_id AND e.profile_id = ?
-       LEFT JOIN embedding_profiles p ON p.id = e.profile_id`,
-      [profileId]
+       LEFT JOIN embedding_profiles p ON p.id = e.profile_id
+       ${libraryID === undefined ? '' : 'WHERE i.library_id = ?'}`,
+      libraryID === undefined ? [profileId] : [profileId, libraryID]
     );
 
     const items: IndexedItemRecord[] = [];
@@ -489,17 +490,18 @@ export class VectorStore {
       });
     }
 
-    return { items, chunks: await this.readChunks(conn, profileId) };
+    return { items, chunks: await this.readChunks(conn, profileId, undefined, libraryID) };
   }
 
-  private async readChunks(conn: ZoteroDBConnectionInstance, profileId: string, itemID?: number): Promise<IndexedChunkRecord[]> {
+  private async readChunks(conn: ZoteroDBConnectionInstance, profileId: string, itemID?: number, libraryID?: number): Promise<IndexedChunkRecord[]> {
     const chunkRows = await conn.queryAsync<Record<string, any>>(
       `SELECT c.*, e.vector, p.dim, p.engine, p.model FROM fulltext_chunks c
        LEFT JOIN passage_embeddings e ON e.chunk_id = c.chunk_id AND e.profile_id = ?
        LEFT JOIN embedding_profiles p ON p.id = e.profile_id
-       ${itemID === undefined ? '' : 'WHERE c.item_id = ?'}
+       ${itemID !== undefined ? 'WHERE c.item_id = ?' : libraryID !== undefined
+         ? 'WHERE c.item_id IN (SELECT item_id FROM item_vectors WHERE library_id = ?)' : ''}
        ORDER BY c.attachment_id, c.chunk_index`,
-      itemID === undefined ? [profileId] : [profileId, itemID]
+      itemID === undefined && libraryID === undefined ? [profileId] : [profileId, itemID ?? libraryID]
     );
     const chunks: IndexedChunkRecord[] = [];
     for (const row of chunkRows) {
@@ -692,6 +694,18 @@ export class VectorStore {
     const conn = await this.ensureConn();
     const rows = await conn.queryAsync<{ attachment_id: number }>('SELECT attachment_id FROM attachment_state');
     return rows.map((row) => Number(row.attachment_id));
+  }
+
+  async getShareableAttachments(libraryID: number, chunkingKey: string): Promise<Array<{
+    attachmentID: number; attachmentKey: string; parentItemID: number; fileHash: string;
+  }>> {
+    const conn = await this.ensureConn();
+    const rows = await conn.queryAsync(`SELECT a.attachment_id, a.attachment_key, a.parent_item_id, a.file_hash
+      FROM attachment_state a JOIN item_vectors i ON i.item_id = a.parent_item_id
+      WHERE i.library_id = ? AND a.chunking_key = ? AND a.status = 'indexed' AND a.chunk_count > 0`,
+    [libraryID, chunkingKey]);
+    return rows.map((row) => ({ attachmentID: Number(row.attachment_id), attachmentKey: String(row.attachment_key),
+      parentItemID: Number(row.parent_item_id), fileHash: String(row.file_hash) }));
   }
 
   async removeAttachment(attachmentID: number): Promise<number | null> {

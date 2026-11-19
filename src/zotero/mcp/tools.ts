@@ -146,7 +146,19 @@ async function describePaper(service: VectorizeService, hit: SearchHit, libraryI
     }
 
     const candidates = matches.filter((chunk) => chunk.attachmentID === pdf.id && chunk.attachmentKey === pdf.key);
-    if (state && candidates.length && (status === 'indexed' || status === 'pending' || status === 'error')) {
+    const shared = candidates.filter((chunk) => chunk.sourceFileHash);
+    if (shared.length) {
+      const revision = mtime === null ? pdf.attachmentSyncedHash : await pdf.attachmentHash;
+      const indexed = service.indexSync?.active?.index.getItemChunks(paper.id) ?? [];
+      for (const chunk of shared) {
+        if ((revision && revision !== chunk.sourceFileHash) || !indexed.some((row) => row.chunkId === chunk.chunkId &&
+            row.sourceFileHash === chunk.sourceFileHash && row.text === chunk.text)) continue;
+        const page = chunk.pageIndex + 1;
+        passages.push({ attachment_key: pdf.key, revision: chunk.sourceFileHash!, page,
+          excerpt: buildSnippet(chunk.text, 650), zotero_url: pdfLink(pdf.key, page), rank: matches.indexOf(chunk) });
+      }
+      if (mtime !== null) status = passages.some((passage) => passage.attachment_key === pdf.key) ? 'indexed' : 'stale_index';
+    } else if (state && candidates.length && (status === 'indexed' || status === 'pending' || status === 'error')) {
       const signature = await getAttachmentSignature(pdf);
       if (!signature.filePath) {
         status = 'missing_file';
@@ -201,9 +213,11 @@ async function searchPapers(service: VectorizeService, input: z.infer<typeof sea
   }
   let indexedItems = 0;
   let indexedChunks = 0;
+  const shared = service.indexSync?.active;
   for (const id of scope) {
-    if (service.searchIndex.getItemById(id)) indexedItems++;
-    indexedChunks += service.searchIndex.getItemChunks(id).length;
+    const index = shared?.index.getItemById(id) ? shared.index : service.searchIndex;
+    if (index.getItemById(id)) indexedItems++;
+    indexedChunks += index.getItemChunks(id).length;
   }
 
   return {
@@ -217,7 +231,7 @@ async function searchPapers(service: VectorizeService, input: z.infer<typeof sea
       indexed_items: indexedItems,
       indexed_pdf_chunks: indexedChunks,
       index_phase: service.getIndexProgress().phase,
-      max_indexed_pages_per_pdf: service.getConfig().maxPdfPages,
+      max_indexed_pages_per_pdf: shared?.manifest.maxPdfPages ?? service.getConfig().maxPdfPages,
     },
   };
 }

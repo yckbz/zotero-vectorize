@@ -91,6 +91,11 @@ export type LocaleStrings = {
   prefMcpCopied: string;
   prefMcpStartError: string;
   prefMcpCopyError: string;
+  prefIndexSyncTitle: string;
+  prefIndexSyncHint: string;
+  prefIndexSyncRole: { off: string; publish: string; receive: string };
+  prefIndexSyncState: Record<'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'conflict' | 'error', string>;
+  prefIndexSyncNow: string;
   prefItemsIndexed: string;
   prefChunksIndexed: string;
   prefItemVectorRatio: string;
@@ -226,6 +231,20 @@ const ZH_CN: LocaleStrings = {
   prefMcpCopied: '已复制 Codex 配置。',
   prefMcpStartError: '无法启动 MCP。请检查 Zotero 版本和本机端口占用。',
   prefMcpCopyError: '无法复制 Codex 配置。',
+  prefIndexSyncTitle: '通过 Zotero 同步向量索引',
+  prefIndexSyncHint: '使用「我的文库」已有的 WebDAV。只在一台设备选发布，其它设备选接收。索引附件含提取的 PDF 正文与模型参数，凭据保存在本机。',
+  prefIndexSyncRole: { off: '关闭', publish: '发布本机索引', receive: '接收共享索引' },
+  prefIndexSyncState: {
+    off: '使用本地索引。',
+    waiting: '等待 Zotero 同步或主设备完成向量化。',
+    working: '正在检查共享索引。',
+    ready: '索引已同步。',
+    webdav: 'Zotero WebDAV 当前不可用。仍可使用本机已有索引。',
+    model: '需要已校验的同版本 ONNX 或 Ollama 模型。',
+    conflict: '检测到多个发布者或附件冲突。请先在 Zotero 中检查共享索引附件。',
+    error: '共享索引更新失败。仍可使用本机已有索引。',
+  },
+  prefIndexSyncNow: '立即检查同步',
   prefItemsIndexed: '已索引文献',
   prefItemVectorRatio: '文献已向量化 / 已收录',
   prefChunkVectorRatio: '分块已向量化 / 已提取',
@@ -261,7 +280,7 @@ const ZH_CN: LocaleStrings = {
   prefNormalizeNotation: '允许普通数字匹配上下标数字',
   prefClearOnJump: '点击候选跳转到 PDF 后自动清空顶部检索框',
   prefLanguage: '界面语言',
-  prefPrivacyBadge: '独立存储：vectorize.sqlite · 原库零写入风险',
+  prefPrivacyBadge: '本地索引保存在独立的 vectorize.sqlite 中',
   prefMsgCleared: '向量索引已清空。',
   prefMsgModelReady: (m) => `本地 ONNX 模型已就绪：${m}`,
   prefMsgExported: (i, c, dir) => `已导出 ${i} 篇文献与 ${c} 个全文段落至 ${dir}`,
@@ -361,6 +380,20 @@ const EN_US: LocaleStrings = {
   prefMcpCopied: 'Codex configuration copied.',
   prefMcpStartError: 'MCP could not start. Check the Zotero version and whether the local port is in use.',
   prefMcpCopyError: 'Could not copy the Codex configuration.',
+  prefIndexSyncTitle: 'Sync vector indexes through Zotero',
+  prefIndexSyncHint: 'Uses the existing WebDAV setup for My Library. Choose one publisher and set other devices to receive. The index attachment contains extracted PDF text and model settings. Credentials stay on this device.',
+  prefIndexSyncRole: { off: 'Off', publish: 'Publish this device’s index', receive: 'Receive the shared index' },
+  prefIndexSyncState: {
+    off: 'Using the local index.',
+    waiting: 'Waiting for Zotero sync or for the publisher to finish indexing.',
+    working: 'Checking the shared index.',
+    ready: 'Index synced.',
+    webdav: 'Zotero WebDAV is unavailable. Existing indexes are still searchable.',
+    model: 'A matching, verified ONNX or Ollama model is required.',
+    conflict: 'Multiple publishers or an attachment conflict were detected. Check the shared index attachment in Zotero.',
+    error: 'The shared index could not be updated. Existing indexes are still searchable.',
+  },
+  prefIndexSyncNow: 'Check sync now',
   prefItemsIndexed: 'Indexed Items',
   prefItemVectorRatio: 'Items with vectors / indexed',
   prefChunkVectorRatio: 'Passages with vectors / extracted',
@@ -396,7 +429,7 @@ const EN_US: LocaleStrings = {
   prefNormalizeNotation: 'Match plain digits to superscript and subscript digits',
   prefClearOnJump: 'Clear top search bar after jumping to a PDF page',
   prefLanguage: 'UI Language',
-  prefPrivacyBadge: 'Isolated store: vectorize.sqlite · Zero risk to zotero.sqlite',
+  prefPrivacyBadge: 'Local indexes are stored in a separate vectorize.sqlite file',
   prefMsgCleared: 'Vector index cleared.',
   prefMsgModelReady: (m) => `Local ONNX model ready: ${m}`,
   prefMsgExported: (i, c, dir) => `Exported ${i} items and ${c} chunks to ${dir}`,

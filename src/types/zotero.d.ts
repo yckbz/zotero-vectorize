@@ -64,7 +64,7 @@ export interface ServicesNamespace {
 }
 
 export interface IOUtilsNamespace {
-  read(path: string): Promise<Uint8Array>;
+  read(path: string, options?: { offset?: number; maxBytes?: number }): Promise<Uint8Array>;
   readUTF8(path: string): Promise<string>;
   readJSON(path: string): Promise<any>;
   write(path: string, data: Uint8Array, options?: Record<string, any>): Promise<number>;
@@ -72,8 +72,8 @@ export interface IOUtilsNamespace {
   exists(path: string): Promise<boolean>;
   makeDirectory(path: string, options?: { ignoreExisting?: boolean; createAncestors?: boolean }): Promise<void>;
   remove(path: string, options?: { ignoreAbsent?: boolean; recursive?: boolean }): Promise<void>;
-  move(source: string, dest: string): Promise<void>;
-  copy(source: string, dest: string): Promise<void>;
+  move(source: string, dest: string, options?: { noOverwrite?: boolean }): Promise<void>;
+  copy(source: string, dest: string, options?: { noOverwrite?: boolean }): Promise<void>;
   stat(path: string): Promise<{ size: number; lastModified: number; type: string }>;
   getChildren(path: string): Promise<string[]>;
 }
@@ -120,10 +120,15 @@ export interface ZoteroItem {
   attachmentLinkMode?: number;
   attachmentHash?: Promise<string | null> | string | null;
   attachmentModificationTime?: Promise<number> | number;
+  attachmentSyncedHash?: string | null;
+  attachmentSyncState?: number;
   dateModified: string;
   isRegularItem(): boolean;
   isAttachment(): boolean;
   isPDFAttachment(): boolean;
+  isStoredFileAttachment?(): boolean;
+  addTag?(tag: string): void;
+  saveTx?(): Promise<number | false>;
   getField(field: string, unformatted?: boolean, includeBaseMapped?: boolean): string;
   getCreators(): Array<{ firstName?: string; lastName?: string; name?: string; creatorTypeID?: number }>;
   getTags(): Array<{ tag: string; type?: number }>;
@@ -156,7 +161,8 @@ export interface ZoteroNamespace {
     dir: string;
     getDatabase(name: string): string;
   };
-  Utilities: { Internal: { md5Async(path: string): Promise<string> } };
+  Utilities: { randomString?(length: number): string; Internal: { md5Async(path: string): Promise<string> } };
+  Users?: { getCurrentUserID(): number | null };
   DBConnection: new (dbNameOrPath: string) => ZoteroDBConnectionInstance;
   Prefs: {
     get(pref: string, global?: boolean): any;
@@ -184,6 +190,24 @@ export interface ZoteroNamespace {
   Attachments: {
     LINK_MODE_LINKED_FILE: number;
     getStorageDirectory(item: ZoteroItem): { path: string };
+    importFromFile?(options: { file: string; libraryID: number; title: string; contentType: string }): Promise<ZoteroItem>;
+  };
+  Sync?: {
+    Runner: {
+      readonly enabled: boolean;
+      readonly syncInProgress: boolean;
+      delayIndefinite(): () => void;
+      sync(options: { libraries: number[]; background: boolean; onError?: (error: unknown) => void }): Promise<unknown>;
+      downloadFile(item: ZoteroItem): Promise<unknown>;
+    };
+    Storage: {
+      Local: {
+        readonly SYNC_STATE_IN_SYNC: number;
+        readonly SYNC_STATE_IN_CONFLICT: number;
+        getModeForLibrary(libraryID: number): string;
+        updateSyncStates(items: ZoteroItem[], state: 'to_upload'): Promise<void>;
+      };
+    };
   };
   Fulltext: {
     fulltextCacheFile: string;
