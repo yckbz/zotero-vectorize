@@ -352,6 +352,123 @@ test('Zotero publishes one personal-library attachment and a fresh profile searc
   assert.equal((await destination.search('diffusion', { mode: 'fulltext' })).hits.length, 0);
 });
 
+test('receiving a shorter shared PDF index preserves searches for local pages', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const query = 'spectrochemical calibration';
+  const pages = Array.from({ length: 12 }, (_, index) => index === 9
+    ? 'The spectrochemical calibration is described in this measurement protocol.'
+    : 'Hydrogen motion and diffusion selectivity in confined nanotubes.');
+  const preparePdf = async (device) => {
+    device.flags.pdfAvailable = true;
+    await fs.writeFile(device.pdfFile, pdfBytes);
+    device.prefs.set(PREFIX + 'hybridSemanticWeight', '0');
+    device.zotero.PDFWorker.getFullText = async (_id, limit) => {
+      const extracted = pages.slice(0, limit ?? pages.length);
+      return { text: extracted.join('\f'), extractedPages: extracted.length, totalPages: pages.length };
+    };
+  };
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.prefs.set(PREFIX + 'defaultSearchMode', 'fulltext');
+  await preparePdf(publisher);
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('subscriber', 100, 'off', 'openai');
+  receiver.prefs.set(PREFIX + 'defaultSearchMode', 'metadata');
+  await preparePdf(receiver);
+  const destination = await receiver.start();
+  await destination.startIndexing();
+  const assertLocalPage = async (mode) => {
+    const { hits, diagnostics } = await destination.search(query, { mode, filterItemIDs: new Set([101]) });
+    assert.deepEqual(hits.map(({ itemID, bestChunk }) => [itemID, bestChunk.pageIndex]), [[101, 9]]);
+    assert.equal(hits[0].bestChunk.sourceFileHash, undefined);
+    assert.equal(diagnostics.totalIndexedChunks, 12);
+  };
+  await assertLocalPage('fulltext');
+
+  const localRows = await destination.store.loadAll();
+  const publication = transport.bytes;
+  destination.indexSync.setRole('receive');
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.getSharedStats().indexedChunks, 9);
+  assert.equal((await destination.getSearchCoverage()).indexedChunks, 12);
+  assert.deepEqual(await destination.store.loadAll(), localRows);
+  await assertLocalPage('fulltext');
+  await assertLocalPage('hybrid');
+  await assertLocalPage(undefined);
+
+  await destination.indexItems([101], true);
+  transport.offline = true;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'webdav');
+  await assertLocalPage('fulltext');
+  assert.equal(transport.bytes, publication);
+  assert.equal(transport.uploads, 1);
+});
+
+test('shared passage selection checks the page, text and vector and reports the chosen coverage', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.prefs.set(PREFIX + 'defaultSearchMode', 'metadata');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('subscriber', 100, 'off', 'openai');
+  receiver.flags.pdfAvailable = true;
+  await fs.writeFile(receiver.pdfFile, pdfBytes);
+  const destination = await receiver.start();
+  await destination.startIndexing();
+  destination.indexSync.setRole('receive');
+  await destination.indexSync.syncNow();
+  const [manifest, item, pdf, firstChunk, secondChunk] = String(transport.bytes).trimEnd().split('\n').map(JSON.parse);
+  const options = { mode: 'fulltext', filterItemIDs: new Set([101]) };
+  const assertSearch = async (isShared) => {
+    const { hits } = await destination.search('diffusion', options);
+    assert.deepEqual(hits.map((hit) => hit.itemID), [101]);
+    assert.equal(hits[0].bestChunk.pageIndex, 1);
+    assert.equal(Boolean(hits[0].bestChunk.sourceFileHash), isShared);
+    assert.deepEqual(await destination.getSearchCoverage(), { indexedItems: 2, indexedChunks: 2 });
+  };
+  await assertSearch(true);
+
+  const replacePublication = async (chunks) => {
+    manifest.generation++;
+    const records = [item, pdf, ...chunks];
+    transport.bytes = Buffer.from([manifest, ...records, ['end', records.length]].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    await destination.indexSync.syncNow();
+    assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  };
+
+  const wrongPage = [...secondChunk];
+  wrongPage[3] = firstChunk[3];
+  await replacePublication([firstChunk, wrongPage]);
+  await assertSearch(false);
+
+  const differentText = [...secondChunk];
+  differentText[7] = 'A shorter passage on the same PDF page.';
+  await replacePublication([firstChunk, differentText]);
+  await assertSearch(false);
+
+  const noVector = [...secondChunk];
+  noVector[8] = null;
+  await replacePublication([firstChunk, noVector]);
+  await assertSearch(false);
+
+  await replacePublication([]);
+  assert.equal(destination.indexSync.getSharedStats().indexedChunks, 0);
+  await assertSearch(false);
+  const metadata = await destination.search('diffusion', { ...options, mode: 'metadata' });
+  assert.equal(metadata.diagnostics.engineLabel, manifest.model);
+
+  await replacePublication([firstChunk, secondChunk]);
+  await assertSearch(true);
+});
+
 test('offline sync, corrupted publications, account changes and model drift preserve the local index', async (t) => {
   const { createDevice, transport } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'publish');

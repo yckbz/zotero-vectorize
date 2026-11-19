@@ -1,5 +1,6 @@
 import type {
   EngineHealthStatus,
+  IndexedChunkRecord,
   IndexProgress,
   PluginConfig,
   SearchMode,
@@ -32,6 +33,28 @@ interface SearchOptions {
   filterItemIDs?: Set<number> | null;
   topK?: number;
   signal?: AbortSignal;
+}
+
+function passagePageKey(chunk: IndexedChunkRecord): string {
+  return `${chunk.attachmentID}:${chunk.attachmentKey}:${chunk.pageIndex}`;
+}
+
+function coversLocalPassages(local: readonly IndexedChunkRecord[], shared: readonly IndexedChunkRecord[]): boolean {
+  if (!local.length) return true;
+  if (local.length > shared.length) return false;
+
+  // Each search unit must still be available on the same page, including its semantic representation.
+  const passagesByPage = new Map<string, Map<string, boolean>>();
+  for (const chunk of shared) {
+    const key = passagePageKey(chunk);
+    const passages = passagesByPage.get(key) ?? new Map<string, boolean>();
+    passages.set(chunk.text, chunk.vector !== null || passages.get(chunk.text) === true);
+    passagesByPage.set(key, passages);
+  }
+  return local.every((chunk) => {
+    const vectorized = passagesByPage.get(passagePageKey(chunk))?.get(chunk.text);
+    return vectorized !== undefined && (!chunk.vector || vectorized);
+  });
 }
 
 export class VectorizeService {
@@ -363,6 +386,33 @@ export class VectorizeService {
     }
   }
 
+  private selectSearchSources(shared: VectorSearchIndex, mode: SearchMode, scope?: ReadonlySet<number> | null) {
+    const sharedIDs = new Set<number>();
+    const localIDs = new Set<number>();
+    let indexedChunks = 0;
+    for (const item of shared.getAllItems()) {
+      const local = this.searchIndex.getItemById(item.itemID);
+      if (local && mode !== 'fulltext' && local.vector && !item.vector) continue;
+      const chunks = shared.getItemChunks(item.itemID);
+      if (mode !== 'metadata' && !coversLocalPassages(this.searchIndex.getItemChunks(item.itemID), chunks)) continue;
+      sharedIDs.add(item.itemID);
+      indexedChunks += chunks.length;
+    }
+    for (const { itemID } of this.searchIndex.getAllItems()) {
+      if (sharedIDs.has(itemID)) continue;
+      localIDs.add(itemID);
+      indexedChunks += this.searchIndex.getItemChunks(itemID).length;
+    }
+    // Coverage describes the indexed library, even when the query is scoped to a collection.
+    const coverage = { indexedItems: sharedIDs.size + localIDs.size, indexedChunks };
+    if (scope) {
+      for (const ids of [sharedIDs, localIDs]) {
+        for (const id of ids) if (!scope.has(id)) ids.delete(id);
+      }
+    }
+    return { sharedIDs, localIDs, coverage };
+  }
+
   async search(query: string, options?: SearchOptions): Promise<SearchResponse> {
     await this.init();
     await this.maintenance;
@@ -373,17 +423,8 @@ export class VectorizeService {
     let response: SearchResponse | undefined;
     if (shared) {
       const config = syncSearchConfig(shared.manifest, this.config);
-      const scope = options?.filterItemIDs;
       const mode = options?.mode ?? config.defaultSearchMode;
-      const sharedIDs = new Set(shared.index.getAllItems().filter((item) => {
-        if (scope && !scope.has(item.itemID)) return false;
-        const local = this.searchIndex.getItemById(item.itemID);
-        if (!local) return true;
-        if (mode !== 'fulltext' && local.vector && !item.vector) return false;
-        if (mode === 'metadata') return true;
-        const sharedPdfs = new Set(shared.index.getItemChunks(item.itemID).map((chunk) => chunk.attachmentID));
-        return this.searchIndex.getItemChunks(item.itemID).every((chunk) => sharedPdfs.has(chunk.attachmentID));
-      }).map((item) => item.itemID));
+      const { sharedIDs, localIDs, coverage } = this.selectSearchSources(shared.index, mode, options?.filterItemIDs);
       if (sharedIDs.size) {
         const sharedOptions = { ...options, mode,
           topK: options?.topK ?? config.maxResults, filterItemIDs: sharedIDs };
@@ -397,19 +438,21 @@ export class VectorizeService {
           options?.signal?.throwIfAborted();
         }
         if (remote && !remote.diagnostics.mismatchWarning) {
-          const localIDs = new Set(this.searchIndex.getAllItems().map((item) => item.itemID)
-            .filter((id) => !sharedIDs.has(id) && (!scope || scope.has(id))));
           if (localIDs.size) {
             const local = await this.searchIndexWithConfig(clean, { ...sharedOptions, filterItemIDs: localIDs }, this.searchIndex, this.config);
             remote.hits = [...remote.hits, ...local.hits].sort((a, b) =>
               b.score - a.score || b.semanticScore - a.semanticScore || b.lexicalScore - a.lexicalScore).slice(0, sharedOptions.topK);
             remote.diagnostics.vectorSearchUsed ||= local.diagnostics.vectorSearchUsed;
             remote.diagnostics.lexicalFallbackUsed ||= local.diagnostics.lexicalFallbackUsed;
-            remote.diagnostics.totalIndexedItems += localIDs.size;
-            remote.diagnostics.totalIndexedChunks += this.searchIndex.getAllChunks().filter((chunk) => localIDs.has(chunk.itemID)).length;
           }
           response = remote;
         }
+      } else {
+        response = await this.searchIndexWithConfig(clean, { ...options, mode }, this.searchIndex, this.config);
+      }
+      if (response) {
+        response.diagnostics.totalIndexedItems = coverage.indexedItems;
+        response.diagnostics.totalIndexedChunks = coverage.indexedChunks;
       }
     }
     response ??= await this.searchIndexWithConfig(clean, options, this.searchIndex, this.config);
@@ -483,11 +526,12 @@ export class VectorizeService {
 
   async getSearchCoverage(): Promise<Pick<StoreStats, 'indexedItems' | 'indexedChunks'>> {
     await this.init();
-    const shared = this.indexSync.active?.index;
-    return shared ? {
-      indexedItems: shared.getItemCount() + this.searchIndex.getAllItems().filter((item) => !shared.getItemById(item.itemID)).length,
-      indexedChunks: shared.getChunkCount() + this.searchIndex.getAllChunks().filter((chunk) => !shared.getItemById(chunk.itemID)).length,
-    } : this.getStats();
+    await this.maintenance;
+    const shared = this.indexSync.active;
+    if (!shared) return this.getStats();
+    // The summary includes searchable PDF passages even when the default mode is metadata-only.
+    const mode = shared.manifest.defaultSearchMode === 'fulltext' ? 'fulltext' : 'hybrid';
+    return this.selectSearchSources(shared.index, mode).coverage;
   }
 
   async exportCompatJsonToFolder(folderPath: string, profileID?: string): Promise<{ items: number; chunks: number; files: string[] }> {
