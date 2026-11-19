@@ -98,6 +98,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
   private generation = 0;
   private disposed = false;
   private detectedDim: number;
+  private modelRevision?: Promise<string | null>;
   private lastError = '';
   private nextReqId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
@@ -192,6 +193,22 @@ export class LocalOnnxProvider implements EmbeddingProvider {
 
   getModelFingerprint(dim?: number): string {
     return buildModelFingerprint(this.engine, this.model, dim ?? this.detectedDim);
+  }
+
+  async getModelRevision(): Promise<string | null> {
+    this.modelRevision ??= (async () => {
+      const assets = await this.resolveExistingAssets();
+      if (!assets) return null;
+      const hashes = await Promise.all([
+        Zotero.Utilities.Internal.md5Async(assets.modelPath),
+        Zotero.Utilities.Internal.md5Async(assets.tokenizerPath),
+      ]);
+      if (hashes.some((hash) => !hash)) throw new Error('Could not identify local model files');
+      return hashes.join(':');
+    })();
+    const revision = await this.modelRevision;
+    if (!revision) this.modelRevision = undefined;
+    return revision;
   }
 
   getRuntimeDir(): string {
@@ -587,6 +604,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     }
 
     if (tasks.length > 0 && !this.disposed) {
+      this.modelRevision = undefined;
       this.resetWorkers(new Error('ONNX model is being reinitialized'));
     }
     const ok = await this.ensureInitialized();
@@ -606,12 +624,21 @@ export class LocalOnnxProvider implements EmbeddingProvider {
       texts: [formatted],
       maxSeqLength: this.maxSeqLength,
     });
-    return new Float32Array(res.vectors[0]);
+    return res.vectors[0];
   }
 
-  async embedPassages(texts: string[], onProgress?: (completed: number) => void): Promise<Float32Array[]> {
+  embedMetadata(texts: string[]): Promise<Float32Array[]> {
+    // Preserve single-input inference for metadata. Quantized models can
+    // produce different vectors when texts share a padded input tensor.
+    return this.embedBatches(texts, 1);
+  }
+
+  embedPassages(texts: string[], onProgress?: (completed: number) => void): Promise<Float32Array[]> {
+    return this.embedBatches(texts, this.workerBatchSize, onProgress);
+  }
+
+  private async embedBatches(texts: string[], batchSize: number, onProgress?: (completed: number) => void): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
-    const batchSize = this.workerBatchSize;
     const slots = texts.length > batchSize ? this.workers : [this.workers[0]];
     const generation = this.generation;
     const out = new Array<Float32Array>(texts.length);
@@ -641,7 +668,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
             throw new Error('ONNX worker returned an unexpected number of vectors');
           }
           for (const [index, vector] of res.vectors.entries()) {
-            out[offset + index] = new Float32Array(vector);
+            out[offset + index] = vector;
           }
           completed += batch.length;
           onProgress?.(completed);

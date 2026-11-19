@@ -4,184 +4,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { importTs } from './_helper.mjs';
+import { SqliteConnection } from './_sqlite.mjs';
+import { DatabaseSync } from 'node:sqlite';
 
 test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle + Zotero Sqlite invariants', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'zv-int-'));
-
-  // Minimal in-memory Zotero sandbox mimicking DBConnection, Items, PDFWorker, Notifier, Prefs, IOUtils
-  const tables = {
-    store_meta: new Map(),
-    item_vectors: new Map(),
-    fulltext_chunks: new Map(),
-    attachment_state: new Map(),
-  };
-
-  class StrictMockDBConnection {
-    constructor(dbPath) {
-      this.path = dbPath;
-      this.closed = false;
-    }
-    async executeTransaction(fn) {
-      await fn();
-    }
-    async tableExists() {
-      return true;
-    }
-    async closeDatabase() {
-      this.closed = true;
-    }
-    _validateParams(sql, params) {
-      if (!Array.isArray(params) || params.length === 0) return;
-      // Enforce Gecko Sqlite.sys.mjs rule: params[0] must NEVER be a non-null object (e.g. Uint8Array!)
-      if (typeof params[0] === 'object' && params[0] !== null) {
-        throw new Error(`Sqlite.sys.mjs object-param trap triggered! params[0]=${params[0].constructor?.name} SQL=${sql}`);
-      }
-      for (let i = 0; i < params.length; i++) {
-        if (params[i] === undefined) throw new Error(`Undefined SQL param at index ${i}`);
-        if (params[i] instanceof Uint8Array && params[i].byteLength === 0) {
-          throw new Error(`Empty Uint8Array(0) BLOB disallowed in Gecko bindBlobByIndex at param ${i}: ${sql}`);
-        }
-      }
-    }
-    async queryAsync(sql, params = []) {
-      this._validateParams(sql, params);
-      const s = sql.trim().replace(/\s+/g, ' ');
-      if (s.startsWith('PRAGMA') || s.startsWith('CREATE ')) return [];
-      if (s.startsWith('INSERT OR IGNORE INTO store_meta')) {
-        if (!tables.store_meta.has(params[0])) tables.store_meta.set(params[0], params[1]);
-        return [];
-      }
-      if (s.startsWith('INSERT OR REPLACE INTO store_meta')) {
-        tables.store_meta.set(params[0], params[1]);
-        return [];
-      }
-      if (s.startsWith('INSERT OR REPLACE INTO item_vectors')) {
-        tables.item_vectors.set(params[0], {
-          item_id: params[0], item_key: params[1], library_id: params[2], item_type: params[3],
-          title: params[4], creators: params[5], year: params[6], publication_title: params[7],
-          doi: params[8], url: params[9], tags_json: params[10], abstract_note: params[11],
-          metadata_hash: params[12], vector: params[13] ? new Uint8Array(params[13]) : null, dim: params[14],
-          model_fingerprint: params[15], updated_at: params[16],
-        });
-        return [];
-      }
-      if (s.startsWith('INSERT OR REPLACE INTO fulltext_chunks')) {
-        tables.fulltext_chunks.set(params[0], {
-          chunk_id: params[0], item_id: params[1], item_key: params[2], attachment_id: params[3],
-          attachment_key: params[4], attachment_title: params[5], chunk_index: params[6],
-          page_index: params[7], page_label: params[8], char_start: params[9], char_end: params[10],
-          text: params[11], snippet: params[12], vector: params[13] ? new Uint8Array(params[13]) : null, dim: params[14],
-          model_fingerprint: params[15], updated_at: params[16],
-        });
-        return [];
-      }
-      if (s.startsWith('INSERT OR REPLACE INTO attachment_state')) {
-        tables.attachment_state.set(params[0], {
-          attachment_id: params[0], attachment_key: params[1], parent_item_id: params[2],
-          file_hash: params[3], mtime: params[4], status: params[5], chunk_count: params[6],
-          model_fingerprint: params[7], error_message: params[8], updated_at: params[9],
-          chunking_key: params[10],
-        });
-        return [];
-      }
-      if (s.startsWith('SELECT') && s.includes('FROM item_vectors') && !s.includes('COUNT(*)')) {
-        return Array.from(tables.item_vectors.values());
-      }
-      if (s === 'SELECT attachment_id FROM attachment_state') {
-        return Array.from(tables.attachment_state.values());
-      }
-      if (s === 'SELECT DISTINCT item_id FROM fulltext_chunks WHERE attachment_id = ? AND item_id != ?') {
-        const ids = new Set(Array.from(tables.fulltext_chunks.values())
-          .filter((row) => row.attachment_id === params[0] && row.item_id !== params[1])
-          .map((row) => row.item_id));
-        return Array.from(ids, (item_id) => ({ item_id }));
-      }
-      if (s.startsWith('SELECT') && s.includes('FROM fulltext_chunks') && s.includes('WHERE item_id = ?')) {
-        return Array.from(tables.fulltext_chunks.values()).filter((r) => r.item_id === params[0]);
-      }
-      if (s.startsWith('SELECT') && s.includes('FROM fulltext_chunks')) {
-        return Array.from(tables.fulltext_chunks.values());
-      }
-      if (s.startsWith('DELETE FROM item_vectors WHERE item_id = ?')) {
-        tables.item_vectors.delete(params[0]);
-        return [];
-      }
-      if (s.startsWith('DELETE FROM fulltext_chunks WHERE item_id = ? AND attachment_key = ?')) {
-        for (const [k, v] of tables.fulltext_chunks) {
-          if (v.item_id === params[0] && v.attachment_key === params[1]) tables.fulltext_chunks.delete(k);
-        }
-        return [];
-      }
-      if (s.startsWith('DELETE FROM fulltext_chunks WHERE item_id = ?')) {
-        for (const [k, v] of tables.fulltext_chunks) {
-          if (v.item_id === params[0]) tables.fulltext_chunks.delete(k);
-        }
-        return [];
-      }
-      if (s.startsWith('DELETE FROM fulltext_chunks WHERE attachment_id = ?')) {
-        for (const [k, v] of tables.fulltext_chunks) {
-          if (v.attachment_id === params[0]) tables.fulltext_chunks.delete(k);
-        }
-        return [];
-      }
-      if (s.startsWith('DELETE FROM attachment_state WHERE parent_item_id = ?')) {
-        for (const [k, v] of tables.attachment_state) {
-          if (v.parent_item_id === params[0]) tables.attachment_state.delete(k);
-        }
-        return [];
-      }
-      if (s.startsWith('DELETE FROM attachment_state WHERE attachment_id = ?')) {
-        tables.attachment_state.delete(params[0]);
-        return [];
-      }
-      if (s === 'DELETE FROM item_vectors') { tables.item_vectors.clear(); return []; }
-      if (s === 'DELETE FROM fulltext_chunks') { tables.fulltext_chunks.clear(); return []; }
-      if (s === 'DELETE FROM attachment_state') { tables.attachment_state.clear(); return []; }
-      if (s.startsWith('DELETE FROM store_meta')) { return []; }
-      return [];
-    }
-    async rowQueryAsync(sql, params = []) {
-      this._validateParams(sql, params);
-      const s = sql.trim().replace(/\s+/g, ' ');
-      if (s.includes('FROM item_vectors WHERE item_id = ?')) {
-        return tables.item_vectors.get(params[0]) ?? false;
-      }
-      if (s.includes('FROM attachment_state WHERE attachment_id = ?')) {
-        return tables.attachment_state.get(params[0]) ?? false;
-      }
-      if (s.includes('FROM item_vectors') && s.includes('COUNT(*)')) {
-        const list = Array.from(tables.item_vectors.values());
-        return {
-          total: list.length,
-          vec_count: list.filter((x) => x.dim > 0).length,
-          max_dim: list.reduce((m, x) => Math.max(m, x.dim), 0),
-        };
-      }
-      if (s.includes('FROM fulltext_chunks') && s.includes('COUNT(*)')) {
-        const list = Array.from(tables.fulltext_chunks.values());
-        return {
-          total: list.length,
-          vec_count: list.filter((x) => x.dim > 0).length,
-          max_dim: list.reduce((m, x) => Math.max(m, x.dim), 0),
-        };
-      }
-      if (s.includes('ORDER BY updated_at DESC LIMIT 1')) {
-        const list = Array.from(tables.item_vectors.values()).filter((x) => x.dim > 0);
-        return list[0] ? { model_fingerprint: list[0].model_fingerprint } : false;
-      }
-      return false;
-    }
-    async valueQueryAsync(sql, params = []) {
-      this._validateParams(sql, params);
-      const s = sql.trim().replace(/\s+/g, ' ');
-      if (s.includes('FROM store_meta')) return tables.store_meta.get(params[0]) ?? false;
-      if (s.includes('FROM attachment_state WHERE attachment_id')) {
-        return tables.attachment_state.get(params[0])?.parent_item_id ?? false;
-      }
-      if (s.includes('FROM attachment_state')) return tables.attachment_state.size;
-      return 0;
-    }
-  }
 
   // Create dummy PDF file on disk for stat/exists
   const pdfFile = path.join(tmpDir, 'paper.pdf');
@@ -266,7 +93,7 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
   };
   globalThis.Zotero = {
     DataDirectory: { dir: tmpDir },
-    DBConnection: StrictMockDBConnection,
+    DBConnection: SqliteConnection,
     Prefs: {
       get: (k) => prefsMap.get(k),
       set: (k, v) => prefsMap.set(k, v),
@@ -351,9 +178,7 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
 
     // 5. Export & import JSON compat roundtrip (verifies vector_store_metadata.json!)
     const exportDir = path.join(tmpDir, 'export');
-    const exp = await svc.exportCompatJsonToFolder(exportDir);
-    assert.equal(exp.files.length, 3);
-    assert.ok(exp.files.some((p) => p.endsWith('vector_store_metadata.json')), 'Expected vector_store_metadata.json');
+    await assert.rejects(svc.exportCompatJsonToFolder(exportDir), /has no vectors/);
 
     // 5b. Pending debounce IDs queued while activeRun is busy MUST drain and index after completion
     paperTitle = 'Attention Updated During Scan';
@@ -404,6 +229,9 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
         {
           zotero_item_key: 'PAPER10',
           title: paperTitle,
+          creators: 'Ashish Vaswani',
+          year: '2017',
+          tags: ['transformer'],
           abstractNote: 'The dominant sequence transduction models rely on self-attention.',
           embedding: [0.8, 0.6, 0, 0],
         },
@@ -413,7 +241,8 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
       path.join(compatImportDir, 'fulltext_vectors.json'),
       JSON.stringify([
         {
-          chunk_id: 'ATT20#2',
+          chunk_id: 'ATT20#1',
+          chunk_index: 1,
           item_key: 'PAPER10',
           attachment_key: 'ATT20',
           page_index: 2,
@@ -436,14 +265,12 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
     assert.equal(imp.importedItems, 1);
     assert.equal(imp.importedChunks, 1);
 
-    // Clear attachment_state as happens on fresh JSON import before any local scan, then run incremental scan in lexical-only mode
-    tables.attachment_state.clear();
     await svc.indexer.indexItemOrAttachmentIds([10], false);
-    const statsAfter = await svc.getStats();
-    assert.equal(statsAfter.vectorizedItems, 1);
-    assert.equal(statsAfter.vectorizedChunks, 1);
-    assert.equal(statsAfter.dimensions, 4);
-    assert.equal(svc.searchIndex.getItemById(10)?.dim, 4);
+    const archived = (await svc.listEmbeddingProfiles()).find((entry) => entry.model === 'Xenova/multilingual-e5-small');
+    assert.deepEqual([archived.items, archived.chunks, archived.dimensions, archived.active], [1, 1, 4, false]);
+    assert.equal(svc.searchIndex.getItemById(10)?.vector, null);
+    const exp = await svc.exportCompatJsonToFolder(exportDir, archived.id);
+    assert.deepEqual([exp.items, exp.chunks, exp.files.length], [1, 1, 3]);
 
     // Also verify hashMetadataFields matches extractItemMetadata when full metadata fields are provided
     const extractor = await importTs('src/zotero/extractor.ts');
@@ -569,34 +396,37 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
 
     // Fresh Ollama providers do not know the dimension of a tagged model until inference.
     let embeddingCalls = 0;
-    svc.providerManager.getProvider = async () => ({
+    const provider = {
       engine: 'ollama',
       model: 'nomic-embed-text:latest',
       getPassageBatchSize: () => 16,
       getModelFingerprint: () => 'ollama:nomic-embed-text:latest',
       getStatus: async () => ({ neuralAvailable: true, dimensions: 0 }),
-      embedPassages: async (texts, onProgress) => {
-        embeddingCalls++;
-        onProgress?.(texts.length);
+      embedPassages: async (texts) => {
+        embeddingCalls += texts.length;
         return texts.map(() => new Float32Array([1, 0]));
       },
-    });
+    };
+    await svc.store.activateProfile({ id: 'nomic-test', engine: provider.engine, model: provider.model,
+      dimensions: 0, provenance: 'verified' });
+    svc.providerManager.getProvider = async () => provider;
     const phases = [];
     const stopProgress = svc.subscribeProgress((p) => phases.push(p.message));
     await svc.startIndexing(true);
     stopProgress();
-    assert.ok(phases.includes('正在向量化 PDF 分块 0/2'));
+    assert.ok(phases.includes('正在索引题录'));
+    assert.ok(phases.includes('正在索引 PDF 全文'));
     assert.ok(phases.includes('正在向量化 PDF 分块 2/2'));
-    assert.equal(embeddingCalls, 2);
+    assert.equal(embeddingCalls, 3);
     await svc.startIndexing(false);
-    assert.equal(embeddingCalls, 2);
+    assert.equal(embeddingCalls, 3);
     assert.equal(svc.searchIndex.getItemById(10)?.modelFingerprint, 'ollama:nomic-embed-text:latest:2');
 
     // A foreign item key must never resolve through a colliding numeric ID.
     const collisionDir = path.join(tmpDir, 'compat-collision');
     await fs.mkdir(collisionDir);
     await fs.writeFile(path.join(collisionDir, 'metadata_vectors.json'), JSON.stringify([
-      { itemID: 10, key: 'PAPER10', title: paperTitle, vector: [1, 0] },
+      { itemID: 10, key: 'PAPER10', title: paperTitle, metadata_hash: expectedMeta.metadataHash, vector: [1, 0] },
       { itemID: 10, key: 'FOREIGN10', title: 'Foreign record', vector: [1, 0] },
     ]));
     await fs.writeFile(path.join(collisionDir, 'fulltext_vectors.json'), JSON.stringify([
@@ -629,7 +459,9 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
     itemsMap.delete(30);
     await svc.startIndexing(false);
     assert.equal(svc.searchIndex.getItemById(30), undefined);
-    assert.equal(tables.item_vectors.has(30), false);
+    const db = new DatabaseSync(svc.store.getDbPath(), { readOnly: true });
+    assert.equal(db.prepare("SELECT item_id FROM item_vectors WHERE item_id = 30").get(), undefined);
+    db.close();
 
     svc.updateConfig({ hybridSemanticWeight: 0 });
     svc.providerManager.getProvider = async () => { throw new Error('Lexical search called the embedding provider'); };

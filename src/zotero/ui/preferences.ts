@@ -1,4 +1,6 @@
-import type { EngineType, HfMirrorMode, SearchMode, UiLanguage } from '../../types/vectorize.ts';
+import type { EngineType, HfMirrorMode, PluginConfig, SearchMode, UiLanguage } from '../../types/vectorize.ts';
+import type { EmbeddingProfileStats } from '../embedding-profile.ts';
+import { embeddingSettings } from '../embedding-profile.ts';
 import type { VectorizeService } from '../service.ts';
 import { MODEL_PRESETS } from '../../engines/provider.ts';
 import { resolveUiLocale } from '../config.ts';
@@ -16,32 +18,44 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-async function pickFolder(win: any, title: string): Promise<string | null> {
-  try {
-    const mod = ChromeUtils.importESModule('chrome://zotero/content/modules/filePicker.mjs');
-    if (mod?.FilePicker) {
-      const fp = new mod.FilePicker();
-      fp.init(win, title, fp.modeGetFolder);
-      const rv = await fp.show();
-      if (rv === fp.returnOK && fp.file) return String(fp.file);
-      return null;
-    }
-  } catch {
-    // Fallback to nsIFilePicker
+async function pickPath(title: string, mode: 'folder' | 'open' | 'save'): Promise<string | null> {
+  const { FilePicker } = ChromeUtils.importESModule('chrome://zotero/content/modules/filePicker.mjs');
+  const picker = new FilePicker();
+  picker.init(window, title, mode === 'folder' ? picker.modeGetFolder : mode === 'open' ? picker.modeOpen : picker.modeSave);
+  if (mode !== 'folder') picker.appendFilter('SQLite', '*.sqlite');
+  if (mode === 'save') {
+    picker.defaultString = 'zotero-vectorize-index.sqlite';
+    picker.defaultExtension = 'sqlite';
   }
-  try {
-    const Ci = (Components as any).interfaces;
-    const Cc = (Components as any).classes;
-    const fp = Cc['@mozilla.org/filepicker;1'].createInstance(Ci.nsIFilePicker);
-    fp.init(win?.browsingContext || win, title, Ci.nsIFilePicker.modeGetFolder);
-    return await new Promise((resolve) => {
-      fp.open((res: number) => {
-        resolve(res === Ci.nsIFilePicker.returnOK && fp.file ? String(fp.file.path) : null);
-      });
-    });
-  } catch {
-    return null;
+  const result = await picker.show();
+  return (result === picker.returnOK || result === picker.returnReplace) && picker.file ? String(picker.file) : null;
+}
+
+function choose<T extends string>(parent: HTMLElement, title: string, options: Array<[T, string]>,
+  cancel: string, details?: string): Promise<T | null> {
+  const doc = parent.ownerDocument;
+  const dialog = el(doc, 'dialog', { className: 'zv-pref-dialog', 'aria-label': title });
+  dialog.appendChild(el(doc, 'h2', { className: 'zv-pref-h2' }, [title]));
+  if (details) dialog.appendChild(el(doc, 'p', { className: 'zv-hint' }, [details]));
+  const actions = el(doc, 'div', { className: 'zv-btn-row' });
+  for (const [value, label] of options) {
+    const button = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [label]);
+    button.addEventListener('click', () => dialog.close(value));
+    actions.appendChild(button);
   }
+  const cancelButton = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [cancel]);
+  cancelButton.addEventListener('click', () => dialog.close());
+  actions.appendChild(cancelButton);
+  dialog.appendChild(actions);
+  parent.appendChild(dialog);
+  return new Promise((resolve) => {
+    dialog.addEventListener('close', () => {
+      const selected = options.find(([value]) => value === dialog.returnValue);
+      dialog.remove();
+      resolve(selected?.[0] ?? null);
+    }, { once: true });
+    dialog.showModal();
+  });
 }
 
 class VectorizePreferencesController {
@@ -56,6 +70,7 @@ class VectorizePreferencesController {
   private feedbackMessage = '';
   private feedbackKind: 'info' | 'ok' | 'err' = 'info';
   private busyAction = false;
+  private engineDraft: PluginConfig | null = null;
   private downloadProgressText = '';
 
   onLoad(vboxEl?: Element): void {
@@ -105,6 +120,7 @@ class VectorizePreferencesController {
     this.statsSeq++;
     this.initialized = false;
     this.container = null;
+    this.engineDraft = null;
   }
 
   private setFeedback(msg: string, kind: 'info' | 'ok' | 'err' = 'info'): void {
@@ -130,11 +146,14 @@ class VectorizePreferencesController {
     const s = getStrings(svc?.getConfig());
 
     const active = p.phase === 'indexing' || p.phase === 'scanning' || p.phase === 'paused';
-    const pct = p.totalItems > 0 ? Math.min(100, Math.round((p.processedItems / p.totalItems) * 100)) : 0;
+    const pct = p.stage === 'metadata' && p.totalItems > 0 ? Math.min(100, Math.round((p.processedItems / p.totalItems) * 100)) : 0;
+    bar.classList.toggle('is-indeterminate', active && p.stage === 'fulltext' && p.phase !== 'paused');
     bar.style.width = `${active ? Math.max(4, pct) : p.phase === 'completed' ? 100 : 0}%`;
 
     if (p.phase === 'indexing' || p.phase === 'scanning') {
-      text.textContent = `${p.message} (${p.processedItems}/${p.totalItems}) ${p.currentTitle ? '· ' + p.currentTitle : ''}`;
+      text.textContent = p.stage
+        ? s.prefIndexStage(p.message, p.processedItems, p.totalItems, p.processedAttachments, p.embeddedChunks)
+        : p.message;
     } else if (p.phase === 'paused') {
       text.textContent = `${p.message} (${p.processedItems}/${p.totalItems})`;
     } else if (p.phase === 'error') {
@@ -184,10 +203,11 @@ class VectorizePreferencesController {
     const svc = getService();
     if (!svc || !this.container) return;
     const seq = ++this.statsSeq;
-    let stats, status;
+    let stats, status, profiles: EmbeddingProfileStats[] = [];
     try {
       status = await svc.getEngineStatus();
       stats = await svc.getStats(status);
+      if (document.getElementById('zv-model-indexes')) profiles = await svc.listEmbeddingProfiles();
     } catch (error) {
       if (seq === this.statsSeq) this.setFeedback(String(error), 'err');
       return;
@@ -202,6 +222,7 @@ class VectorizePreferencesController {
     setTxt('zv-stat-db', formatBytes(stats.dbSizeBytes));
     setTxt('zv-stat-fp', status.modelFingerprint || '—');
     const s = getStrings(svc.getConfig());
+    this.renderProfiles(svc, profiles, stats.indexedItems, stats.indexedChunks);
     const unfinished = stats.pendingAttachments + stats.failedAttachments;
     setTxt('zv-stat-attachment-issues', unfinished || stats.missingAttachments || stats.noTextAttachments
       ? s.indexAttachmentIssues(unfinished, stats.missingAttachments, stats.noTextAttachments)
@@ -302,6 +323,7 @@ class VectorizePreferencesController {
       s.clearIndex,
     ]);
     btnClear.addEventListener('click', async () => {
+      if (!this.container || !await choose(this.container, s.clearIndex, [['clear', s.clearIndex]], s.prefCancel, s.prefClearAllHint)) return;
       await svc.clearIndex();
       this.setFeedback(s.prefMsgCleared, 'ok');
       await this.refreshStatsAndStatus();
@@ -326,37 +348,38 @@ class VectorizePreferencesController {
     );
 
     // 2. Engine Selection & Config Card
+    const draft = this.engineDraft ??= { ...cfg };
     const engineSelect = el(doc, 'select', { className: 'zv-input' }, [
-      el(doc, 'option', { value: 'local-onnx', selected: cfg.engine === 'local-onnx' }, [s.prefEngineLocal]),
-      el(doc, 'option', { value: 'ollama', selected: cfg.engine === 'ollama' }, [s.prefEngineOllama]),
-      el(doc, 'option', { value: 'openai', selected: cfg.engine === 'openai' }, [s.prefEngineOpenai]),
+      el(doc, 'option', { value: 'local-onnx', selected: draft.engine === 'local-onnx' }, [s.prefEngineLocal]),
+      el(doc, 'option', { value: 'ollama', selected: draft.engine === 'ollama' }, [s.prefEngineOllama]),
+      el(doc, 'option', { value: 'openai', selected: draft.engine === 'openai' }, [s.prefEngineOpenai]),
     ]) as HTMLSelectElement;
-    engineSelect.value = cfg.engine;
+    engineSelect.value = draft.engine;
 
     engineSelect.addEventListener('change', () => {
-      svc.updateConfig({ engine: engineSelect.value as EngineType });
+      draft.engine = engineSelect.value as EngineType;
       void this.renderAll();
     });
 
     const engineBody = el(doc, 'div', { className: 'zv-engine-body' });
 
-    if (cfg.engine === 'local-onnx') {
+    if (draft.engine === 'local-onnx') {
       const presets = MODEL_PRESETS.filter((p) => p.engine === 'local-onnx');
       const presetSelect = el(
         doc,
         'select',
         { className: 'zv-input' },
         presets.map((p) =>
-          el(doc, 'option', { value: p.id, selected: cfg.localModelId === p.id }, [p.label])
+          el(doc, 'option', { value: p.id, selected: draft.localModelId === p.id }, [p.label])
         )
       ) as HTMLSelectElement;
-      presetSelect.value = cfg.localModelId;
+      presetSelect.value = draft.localModelId;
       presetSelect.addEventListener('change', () => {
-        svc.updateConfig({ localModelId: presetSelect.value });
+        draft.localModelId = presetSelect.value;
         void this.renderAll();
       });
 
-      const selectedPreset = presets.find((p) => p.id === cfg.localModelId);
+      const selectedPreset = presets.find((p) => p.id === draft.localModelId);
       const locale = resolveUiLocale(cfg);
       const presetDesc = el(doc, 'div', { className: 'zv-hint' }, [
         selectedPreset
@@ -365,38 +388,36 @@ class VectorizePreferencesController {
       ]);
 
       const mirrorSelect = el(doc, 'select', { className: 'zv-input' }, [
-        el(doc, 'option', { value: 'huggingface', selected: cfg.localMirror === 'huggingface' }, [
+        el(doc, 'option', { value: 'huggingface', selected: draft.localMirror === 'huggingface' }, [
           'HuggingFace Official (huggingface.co)',
         ]),
-        el(doc, 'option', { value: 'hf-mirror', selected: cfg.localMirror === 'hf-mirror' }, [
+        el(doc, 'option', { value: 'hf-mirror', selected: draft.localMirror === 'hf-mirror' }, [
           'HF-Mirror (hf-mirror.com · 国内加速)',
         ]),
       ]) as HTMLSelectElement;
-      mirrorSelect.value = cfg.localMirror;
+      mirrorSelect.value = draft.localMirror;
       mirrorSelect.addEventListener('change', () => {
-        svc.updateConfig({ localMirror: mirrorSelect.value as HfMirrorMode });
+        draft.localMirror = mirrorSelect.value as HfMirrorMode;
       });
 
       const dirInput = el(doc, 'input', {
         type: 'text',
         className: 'zv-input',
-        value: cfg.localModelDir,
+        value: draft.localModelDir,
         placeholder: `${svc.store.getStoreDir()}/models/...`,
       }) as HTMLInputElement;
       dirInput.addEventListener('change', () => {
-        svc.updateConfig({ localModelDir: dirInput.value.trim() });
-        void this.refreshStatsAndStatus();
+        draft.localModelDir = dirInput.value.trim();
       });
 
       const browseDirBtn = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [
         s.prefLocalBrowseDir,
       ]);
       browseDirBtn.addEventListener('click', async () => {
-        const dir = await pickFolder(window, s.prefLocalCustomDir);
+        const dir = await pickPath(s.prefLocalCustomDir, 'folder');
         if (dir) {
           dirInput.value = dir;
-          svc.updateConfig({ localModelDir: dir });
-          await this.refreshStatsAndStatus();
+          draft.localModelDir = dir;
         }
       });
 
@@ -411,9 +432,9 @@ class VectorizePreferencesController {
           await svc.downloadLocalModel((p) => {
             this.downloadProgressText = `${p.file} · ${p.percent}%`;
             dlBtn.textContent = this.downloadProgressText;
-          });
+          }, { ...draft });
           this.downloadProgressText = '';
-          this.setFeedback(s.prefMsgModelReady(svc.getConfig().localModelId), 'ok');
+          this.setFeedback(s.prefMsgModelReady(draft.localModelId), 'ok');
           await this.refreshStatsAndStatus();
         } catch (err: any) {
           this.downloadProgressText = '';
@@ -425,7 +446,7 @@ class VectorizePreferencesController {
         }
       });
 
-      const testBtn = this.buildTestConnBtn(doc, svc, s);
+      const testBtn = this.buildTestConnBtn(doc, svc, s, draft);
 
       engineBody.appendChild(this.fieldRow(doc, s.prefLocalModelPreset, presetSelect));
       if (selectedPreset) engineBody.appendChild(presetDesc);
@@ -438,25 +459,24 @@ class VectorizePreferencesController {
         )
       );
       engineBody.appendChild(el(doc, 'div', { className: 'zv-btn-row' }, [dlBtn, testBtn]));
-    } else if (cfg.engine === 'ollama') {
+    } else if (draft.engine === 'ollama') {
       const urlInput = el(doc, 'input', {
         type: 'text',
         className: 'zv-input',
-        value: cfg.ollamaUrl,
+        value: draft.ollamaUrl,
       }) as HTMLInputElement;
       urlInput.addEventListener('change', () => {
-        svc.updateConfig({ ollamaUrl: urlInput.value.trim() });
+        draft.ollamaUrl = urlInput.value.trim();
       });
 
       const modelInput = el(doc, 'input', {
         type: 'text',
         className: 'zv-input',
-        value: cfg.ollamaModel,
+        value: draft.ollamaModel,
         list: 'zv-ollama-models-list',
       }) as HTMLInputElement;
       modelInput.addEventListener('change', () => {
-        svc.updateConfig({ ollamaModel: modelInput.value.trim() });
-        void this.refreshStatsAndStatus();
+        draft.ollamaModel = modelInput.value.trim();
       });
 
       const datalist = el(
@@ -473,7 +493,7 @@ class VectorizePreferencesController {
       ]);
       detectBtn.addEventListener('click', async () => {
         try {
-          const models = await svc.detectOllamaModels();
+          const models = await svc.detectOllamaModels(draft);
           datalist.textContent = '';
           for (const m of models) {
             datalist.appendChild(el(doc, 'option', { value: m }, [m]));
@@ -487,7 +507,7 @@ class VectorizePreferencesController {
         }
       });
 
-      const testBtn = this.buildTestConnBtn(doc, svc, s);
+      const testBtn = this.buildTestConnBtn(doc, svc, s, draft);
 
       engineBody.appendChild(this.fieldRow(doc, s.prefOllamaUrl, urlInput));
       engineBody.appendChild(
@@ -502,33 +522,30 @@ class VectorizePreferencesController {
       const baseInput = el(doc, 'input', {
         type: 'text',
         className: 'zv-input',
-        value: cfg.openaiBaseUrl,
+        value: draft.openaiBaseUrl,
       }) as HTMLInputElement;
       baseInput.addEventListener('change', () => {
-        svc.updateConfig({ openaiBaseUrl: baseInput.value.trim() });
-        void this.refreshStatsAndStatus();
+        draft.openaiBaseUrl = baseInput.value.trim();
       });
 
       const keyInput = el(doc, 'input', {
         type: 'password',
         className: 'zv-input',
-        value: cfg.openaiApiKey,
+        value: draft.openaiApiKey,
         placeholder: 'sk-...',
       }) as HTMLInputElement;
       keyInput.addEventListener('change', () => {
-        svc.updateConfig({ openaiApiKey: keyInput.value.trim() });
-        void this.refreshStatsAndStatus();
+        draft.openaiApiKey = keyInput.value.trim();
       });
 
       const modelInput = el(doc, 'input', {
         type: 'text',
         className: 'zv-input',
-        value: cfg.openaiModel,
+        value: draft.openaiModel,
         list: 'zv-openai-models-list',
       }) as HTMLInputElement;
       modelInput.addEventListener('change', () => {
-        svc.updateConfig({ openaiModel: modelInput.value.trim() });
-        void this.refreshStatsAndStatus();
+        draft.openaiModel = modelInput.value.trim();
       });
 
       const datalist = el(
@@ -544,18 +561,17 @@ class VectorizePreferencesController {
         type: 'number',
         className: 'zv-input',
         min: 0,
-        max: 4096,
-        value: cfg.openaiDimensions,
+        max: 8192,
+        value: draft.openaiDimensions,
       }) as HTMLInputElement;
       dimInput.addEventListener('change', () => {
-        svc.updateConfig({ openaiDimensions: Math.max(0, Number(dimInput.value) || 0) });
-        void this.refreshStatsAndStatus();
+        draft.openaiDimensions = Math.max(0, Number(dimInput.value) || 0);
       });
 
-      const batchInput = this.numberInput(doc, cfg.openaiBatchSize, 0, 256, (value) =>
-        svc.updateConfig({ openaiBatchSize: value })
-      );
-      const testBtn = this.buildTestConnBtn(doc, svc, s);
+      const batchInput = this.numberInput(doc, draft.openaiBatchSize, 0, 256, (value) => {
+        draft.openaiBatchSize = value;
+      });
+      const testBtn = this.buildTestConnBtn(doc, svc, s, draft);
 
       engineBody.appendChild(this.fieldRow(doc, s.prefOpenaiBaseUrl, baseInput));
       engineBody.appendChild(this.fieldRow(doc, s.prefOpenaiApiKey, keyInput));
@@ -565,11 +581,38 @@ class VectorizePreferencesController {
       engineBody.appendChild(el(doc, 'div', { className: 'zv-btn-row' }, [testBtn]));
     }
 
+    const apply = el(doc, 'button', { type: 'button', className: 'zv-btn zv-btn-primary' }, [s.prefApplyModel]);
+    apply.addEventListener('click', async () => {
+      if (this.busyAction || !this.container) return;
+      const target = { ...draft };
+      this.busyAction = true;
+      apply.disabled = true;
+      try {
+        let discard = false;
+        const active = (await svc.listEmbeddingProfiles()).find((profile) => profile.active);
+        if (active && (active.items || active.chunks) && embeddingSettings(target) !== embeddingSettings(svc.getConfig())) {
+          const choice = await choose(this.container, s.prefApplyModel,
+            [['keep', s.prefKeepModel], ['discard', s.prefDiscardModel]], s.prefCancel, s.prefSwitchModelHint(active.model));
+          if (!choice) return;
+          discard = choice === 'discard';
+        }
+        await svc.applyEmbeddingConfig(target, discard);
+        this.engineDraft = null;
+        this.setFeedback(s.prefModelApplied, 'ok');
+        this.renderAll();
+      } catch (error) {
+        this.setFeedback(error instanceof Error ? error.message : String(error), 'err');
+      } finally {
+        this.busyAction = false;
+        apply.disabled = false;
+      }
+    });
     this.container.appendChild(
       el(doc, 'div', { className: 'zv-pref-card' }, [
         el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefEngineSectionTitle]),
         this.fieldRow(doc, s.prefEngineLabel, engineSelect),
         engineBody,
+        el(doc, 'div', { className: 'zv-btn-row' }, [apply]),
       ])
     );
 
@@ -669,56 +712,16 @@ class VectorizePreferencesController {
       ])
     );
 
-    // 5. JSON Import / Export Card (standard 3-file vector JSON format)
-    const exportBtn = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefExportJson]) as HTMLButtonElement;
-    exportBtn.addEventListener('click', async () => {
-      if (this.busyAction) return;
-      const dir = await pickFolder(window, s.prefExportJson);
-      if (!dir) return;
-      this.busyAction = true;
-      exportBtn.disabled = true;
-      this.setFeedback(s.prefMsgWorking, 'info');
-      try {
-        const res = await svc.exportCompatJsonToFolder(dir);
-        this.setFeedback(s.prefMsgExported(res.items, res.chunks, dir), 'ok');
-      } catch (err: any) {
-        this.setFeedback(err?.message || String(err), 'err');
-      } finally {
-        this.busyAction = false;
-        exportBtn.disabled = false;
-      }
-    });
-
-    const importBtn = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefImportJson]) as HTMLButtonElement;
-    importBtn.addEventListener('click', async () => {
-      if (this.busyAction) return;
-      const dir = await pickFolder(window, s.prefImportJson);
-      if (!dir) return;
-      this.busyAction = true;
-      importBtn.disabled = true;
-      this.setFeedback(s.prefMsgWorking, 'info');
-      try {
-        const res = await svc.importCompatJsonFromFolder(dir);
-        this.setFeedback(
-          s.prefMsgImported(res.importedItems, res.importedChunks, res.skippedItems, res.skippedChunks),
-          'ok'
-        );
-        await this.refreshStatsAndStatus();
-      } catch (err: any) {
-        this.setFeedback(err?.message || String(err), 'err');
-      } finally {
-        this.busyAction = false;
-        importBtn.disabled = false;
-      }
-    });
-
-    this.container.appendChild(
-      el(doc, 'div', { className: 'zv-pref-card' }, [
-        el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefCompatSectionTitle]),
-        el(doc, 'div', { className: 'zv-hint' }, [s.prefCompatHint]),
-        el(doc, 'div', { className: 'zv-btn-row' }, [importBtn, exportBtn]),
-      ])
-    );
+    const importButton = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefIndexImport]);
+    const exportButton = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefIndexExport]);
+    importButton.addEventListener('click', () => void this.transferIndex(svc, true));
+    exportButton.addEventListener('click', () => void this.transferIndex(svc, false));
+    this.container.appendChild(el(doc, 'div', { className: 'zv-pref-card' }, [
+      el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefIndexManager]),
+      el(doc, 'div', { className: 'zv-hint' }, [s.prefIndexManagerHint]),
+      el(doc, 'div', { id: 'zv-model-indexes' }),
+      el(doc, 'div', { className: 'zv-btn-row' }, [importButton, exportButton]),
+    ]));
 
     const mcp = Zotero.VectorizeMcp;
     if (mcp) {
@@ -760,12 +763,113 @@ class VectorizePreferencesController {
     void this.refreshStatsAndStatus();
   }
 
-  private buildTestConnBtn(doc: Document, svc: VectorizeService, s: ReturnType<typeof getStrings>) {
+  private profileLabel(profile: EmbeddingProfileStats): string {
+    return [profile.engine, profile.model, profile.dimensions ? `${profile.dimensions}d` : '', profile.id.slice(-6)]
+      .filter(Boolean).join(' · ');
+  }
+
+  private renderProfiles(svc: VectorizeService, profiles: EmbeddingProfileStats[], items: number, chunks: number): void {
+    const target = document.getElementById('zv-model-indexes');
+    if (!target) return;
+    const s = getStrings(svc.getConfig());
+    target.replaceChildren();
+    if (!profiles.length) target.appendChild(el(document, 'p', { className: 'zv-hint' }, [s.prefNoModelIndexes]));
+    for (const profile of profiles) {
+      const title = this.profileLabel(profile);
+      const label = profile.active ? s.prefActiveIndex : profile.provenance === 'legacy' ? s.prefLegacyIndex : s.prefSavedIndex;
+      const actions = el(document, 'div', { className: 'zv-btn-row' });
+      const remove = el(document, 'button', { type: 'button', className: 'zv-btn zv-btn-danger' }, [s.prefDeleteModelIndex]);
+      remove.disabled = !(profile.items || profile.chunks);
+      remove.addEventListener('click', () => void this.manageProfile(svc, profile, false));
+      actions.appendChild(remove);
+      if (profile.provenance === 'legacy' && profiles.some((current) =>
+        current.active && current.engine === profile.engine && current.model === profile.model)) {
+        const reuse = el(document, 'button', { type: 'button', className: 'zv-btn' }, [s.prefReuseLegacy]);
+        reuse.addEventListener('click', () => void this.manageProfile(svc, profile, true));
+        actions.appendChild(reuse);
+      }
+      target.appendChild(el(document, 'div', { className: 'zv-model-index' }, [
+        el(document, 'div', {}, [
+          el(document, 'strong', {}, [title]),
+          el(document, 'div', { className: 'zv-hint' }, [`${label} · ${s.prefModelCoverage(profile.items, items, profile.chunks, chunks)}`]),
+        ]),
+        actions,
+      ]));
+    }
+  }
+
+  private async manageProfile(svc: VectorizeService, profile: EmbeddingProfileStats, reuse: boolean): Promise<void> {
+    if (this.busyAction || !this.container) return;
+    this.busyAction = true;
+    const s = getStrings(svc.getConfig());
+    const title = reuse ? s.prefReuseLegacy : s.prefDeleteModelIndex;
+    try {
+      if (!await choose(this.container, title, [['confirm', title]], s.prefCancel,
+        reuse ? s.prefReuseLegacyHint : s.prefDeleteModelHint(profile.model))) return;
+      if (reuse) await svc.reuseLegacyIndex(profile.id);
+      else await svc.deleteEmbeddingProfile(profile.id);
+      this.setFeedback(s.prefIndexChanged, 'ok');
+      await this.refreshStatsAndStatus();
+    } catch (error) {
+      this.setFeedback(error instanceof Error ? error.message : String(error), 'err');
+    } finally {
+      this.busyAction = false;
+    }
+  }
+
+  private async transferIndex(svc: VectorizeService, importing: boolean): Promise<void> {
+    if (this.busyAction || !this.container) return;
+    this.busyAction = true;
+    const s = getStrings(svc.getConfig());
+    const title = importing ? s.prefIndexImport : s.prefIndexExport;
+    try {
+      const format = await choose(this.container, title, [['json', s.prefIndexFormatJson], ['sqlite', s.prefIndexFormatNative]], s.prefCancel);
+      if (!format) return;
+      if (format === 'json') {
+        let profileID: string | undefined;
+        if (!importing) {
+          const profiles = (await svc.listEmbeddingProfiles()).filter((profile) => profile.items || profile.chunks)
+            .sort((a, b) => Number(b.active) - Number(a.active));
+          if (!profiles.length) throw new Error(s.prefNoModelIndexes);
+          profileID = profiles.length === 1 ? profiles[0].id :
+            (await choose(this.container, s.prefSelectExportModel,
+              profiles.map((profile) => [profile.id, this.profileLabel(profile)]), s.prefCancel)) ?? undefined;
+          if (!profileID) return;
+        }
+        const folder = await pickPath(title, 'folder');
+        if (!folder) return;
+        this.setFeedback(s.prefMsgWorking);
+        if (importing) {
+          const result = await svc.importCompatJsonFromFolder(folder);
+          this.setFeedback(s.prefMsgImported(result.importedItems, result.importedChunks, result.skippedItems, result.skippedChunks), 'ok');
+        } else {
+          const result = await svc.exportCompatJsonToFolder(folder, profileID);
+          this.setFeedback(s.prefMsgExported(result.items, result.chunks, folder), 'ok');
+        }
+      } else {
+        const path = await pickPath(title, importing ? 'open' : 'save');
+        if (!path) return;
+        if (importing && !await choose(this.container, title,
+          [['restore', s.prefRestoreNative]], s.prefCancel, s.prefRestoreNativeHint)) return;
+        this.setFeedback(s.prefMsgWorking);
+        if (importing) await svc.restoreNativeIndex(path);
+        else await svc.exportNativeIndex(path);
+        this.setFeedback(importing ? s.prefNativeRestored : s.prefNativeExported, 'ok');
+      }
+      await this.refreshStatsAndStatus();
+    } catch (error) {
+      this.setFeedback(error instanceof Error ? error.message : String(error), 'err');
+    } finally {
+      this.busyAction = false;
+    }
+  }
+
+  private buildTestConnBtn(doc: Document, svc: VectorizeService, s: ReturnType<typeof getStrings>, draft: PluginConfig) {
     const btn = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefTestConnection]);
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       try {
-        const res = await svc.testConnection();
+        const res = await svc.testConnection({ ...draft });
         this.setFeedback(res.message, res.ok ? 'ok' : 'err');
         await this.refreshStatsAndStatus();
       } catch (err: any) {

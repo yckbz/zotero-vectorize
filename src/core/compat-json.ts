@@ -35,6 +35,7 @@ export function serializeVectorStoreJson(params: {
   engine: string;
   model: string;
   modelFingerprint: string;
+  profileID?: string;
   dimension: number;
   createdAt?: string;
 }): SerializedCompatBundle {
@@ -79,9 +80,11 @@ export function serializeVectorStoreJson(params: {
   }
 
   const fulltextVectors: CompatFulltextChunkEntry[] = [];
+  const libraryByItem = new Map(params.items.map((item) => [item.itemID, item.libraryID]));
   for (const chunk of params.chunks) {
     if (!chunk.vector || chunk.vector.length === 0) continue;
     fulltextVectors.push({
+      library_id: libraryByItem.get(chunk.itemID),
       chunk_id: chunk.chunkId,
       item_key: chunk.itemKey,
       attachment_key: chunk.attachmentKey,
@@ -109,6 +112,7 @@ export function serializeVectorStoreJson(params: {
     engine: params.engine,
     model: params.model,
     model_fingerprint: params.modelFingerprint || buildModelFingerprint(params.engine, params.model, inferredDim),
+    embedding_profile_id: params.profileID,
     dimension: inferredDim,
     item_count: metadataVectors.length,
     chunk_count: fulltextVectors.length,
@@ -134,6 +138,8 @@ function flattenFulltextParentEntry(entry: Record<string, any>): any[] {
   for (const field of [
     'itemID',
     'item_id',
+    'library_id',
+    'libraryID',
     'key',
     'item_key',
     'itemKey',
@@ -293,16 +299,16 @@ function extractCompatItemKey(row: Record<string, any>): string {
  * Parse standard 3-file vector store JSON files cleanly, tolerating nested data-format.md layouts,
  * flat arrays, keyed maps, and camelCase / snake_case field aliases.
  */
+export type CompatItemResolver = (itemKey: string, fallbackID?: number, libraryID?: number) =>
+  { itemID: number; libraryID: number; itemKey?: string; metadataHash?: string } | null;
+
 export function parseVectorStoreJson(
   input: {
     metadataJson?: any;
     fulltextJson?: any;
     storeMetaJson?: any;
   },
-  resolveItemIDByKey: (
-    itemKey: string,
-    fallbackID?: number
-  ) => { itemID: number; libraryID: number; itemKey?: string } | null,
+  resolveItemIDByKey: CompatItemResolver,
   resolveAttachmentIDByKey?: (
     attachmentKey: string,
     parentItemID: number,
@@ -346,8 +352,6 @@ export function parseVectorStoreJson(
     ) || 0;
 
   const items: IndexedItemRecord[] = [];
-  const itemByKey = new Map<string, IndexedItemRecord>();
-  const itemById = new Map<number, IndexedItemRecord>();
   let skippedItems = 0;
 
   for (const row of rawItems) {
@@ -357,6 +361,7 @@ export function parseVectorStoreJson(
     }
     const rawItemID = extractNumericId(row.itemID ?? row.item_id);
     const rawItemKey = extractCompatItemKey(row);
+    const libraryID = extractNumericId(row.library_id ?? row.libraryID);
     const rawEmb = row.embedding || row.vector;
     if ((!rawItemKey && !rawItemID) || !Array.isArray(rawEmb) || rawEmb.length === 0 || !isFiniteVector(rawEmb)) {
       skippedItems++;
@@ -368,7 +373,7 @@ export function parseVectorStoreJson(
       skippedItems++;
       continue;
     }
-    const resolved = resolveItemIDByKey(rawItemKey, rawItemID);
+    const resolved = resolveItemIDByKey(rawItemKey, rawItemID, libraryID);
     if (!resolved) {
       skippedItems++;
       continue;
@@ -397,7 +402,7 @@ export function parseVectorStoreJson(
     const record: IndexedItemRecord = {
       itemID: resolved.itemID,
       itemKey,
-      libraryID: Number(row.library_id ?? row.libraryID ?? resolved.libraryID) || 1,
+      libraryID: resolved.libraryID,
       itemType: String(row.item_type || row.itemType || meta.itemType || meta.item_type || 'journalArticle'),
       title,
       creators,
@@ -425,12 +430,11 @@ export function parseVectorStoreJson(
       modelFingerprint,
       updatedAt: Number.isFinite(parsedUpdated) ? parsedUpdated : Date.now(),
     };
-    items.push(record);
-    itemByKey.set(itemKey, record);
-    itemById.set(record.itemID, record);
-    if (rawItemID && rawItemID !== record.itemID && !itemById.has(rawItemID)) {
-      itemById.set(rawItemID, record);
+    if (resolved.metadataHash && resolved.metadataHash !== record.metadataHash) {
+      skippedItems++;
+      continue;
     }
+    items.push(record);
   }
 
   const chunks: IndexedChunkRecord[] = [];
@@ -444,6 +448,7 @@ export function parseVectorStoreJson(
     }
     const rawItemID = extractNumericId(row.itemID ?? row.item_id);
     const rawItemKey = extractCompatItemKey(row);
+    const libraryID = extractNumericId(row.library_id ?? row.libraryID);
     const rawEmb = row.embedding || row.vector;
     const text = String(row.text || row.text_content || row.content || '').trim();
     if ((!rawItemKey && !rawItemID) || !text || !Array.isArray(rawEmb) || rawEmb.length === 0 || !isFiniteVector(rawEmb)) {
@@ -457,9 +462,7 @@ export function parseVectorStoreJson(
       continue;
     }
 
-    const parentResolved =
-      (rawItemKey ? itemByKey.get(rawItemKey) : rawItemID ? itemById.get(rawItemID) : undefined) ??
-      resolveItemIDByKey(rawItemKey, rawItemID);
+    const parentResolved = resolveItemIDByKey(rawItemKey, rawItemID, libraryID);
     if (!parentResolved) {
       skippedChunks++;
       continue;
@@ -468,18 +471,19 @@ export function parseVectorStoreJson(
     const itemKey = rawItemKey || parentResolved.itemKey || String(parentResolved.itemID);
     const rawAttID = extractNumericId(row.attachmentID ?? row.attachment_id);
     const rawAttKey = String(row.attachment_key || row.attachmentKey || '').trim();
-    const lookupAttKey = rawAttKey || String(row.filename || row.pdf_file || row.pdfFile || itemKey);
+    const lookupAttKey = rawAttKey || (rawAttID ? '' : String(row.filename || row.pdf_file || row.pdfFile || ''));
     const attResolved = resolveAttachmentIDByKey
       ? resolveAttachmentIDByKey(lookupAttKey, parentResolved.itemID, rawAttID)
       : rawAttID ?? 0;
-    const attachmentID =
-      typeof attResolved === 'number'
-        ? attResolved || rawAttID || 0
-        : attResolved?.attachmentID || rawAttID || 0;
+    const attachmentID = typeof attResolved === 'number' ? attResolved : attResolved.attachmentID;
+    if (resolveAttachmentIDByKey && !attachmentID) {
+      skippedChunks++;
+      continue;
+    }
     const resolvedAttKey =
       typeof attResolved === 'object' && attResolved?.attachmentKey ? attResolved.attachmentKey : '';
     const attachmentKey =
-      rawAttKey || resolvedAttKey || String(row.filename || row.pdf_file || row.pdfFile || itemKey);
+      resolvedAttKey || rawAttKey || String(row.filename || row.pdf_file || row.pdfFile || itemKey);
 
     const pageIndex = parseCompatPageIndex(row);
     const chunkIndex = typeof row.chunk_index === 'number' ? row.chunk_index : idx;

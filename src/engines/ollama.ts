@@ -16,6 +16,7 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   private readonly baseUrl: string;
   private readonly http: HttpRequestFn;
   private detectedDim: number;
+  private modelRevision?: Promise<string | null>;
   private useLegacyApi = false;
 
   constructor(options: {
@@ -33,13 +34,24 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     return buildModelFingerprint(this.engine, this.model, dim ?? this.detectedDim);
   }
 
-  async listModels(): Promise<string[]> {
+  private async getInstalledModels(): Promise<Array<{ name?: string; model?: string; digest?: string }>> {
     const res = await this.http('GET', `${this.baseUrl}/api/tags`, { timeoutMs: 6000 });
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`Ollama /api/tags failed (HTTP ${res.status}): ${res.text.slice(0, 200)}`);
     }
-    const models = Array.isArray(res.json?.models) ? res.json.models : [];
-    return models.map((m: any) => String(m.name || m.model || '')).filter(Boolean);
+    return Array.isArray(res.json?.models) ? res.json.models : [];
+  }
+
+  async listModels(): Promise<string[]> {
+    return (await this.getInstalledModels()).map((model) => model.name || model.model || '').filter(Boolean);
+  }
+
+  getModelRevision(): Promise<string | null> {
+    this.modelRevision ??= this.getInstalledModels().then((models) => {
+      const canonical = (name: string) => name.split('/').at(-1)?.includes(':') ? name : `${name}:latest`;
+      return models.find((model) => canonical(model.name || model.model || '') === canonical(this.model))?.digest ?? null;
+    }, () => null);
+    return this.modelRevision;
   }
 
   private async embedWithModernApi(inputs: string[]): Promise<Float32Array[]> {

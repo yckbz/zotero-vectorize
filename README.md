@@ -19,8 +19,8 @@ The package declares Zotero 7.0 as its minimum version. Desktop integration has 
 
 ## Indexing
 
-- Background indexing is enabled by default. Text becomes available for keyword search as the initial scan proceeds. When the embedding model is ready, the plugin can generate vectors and use them for semantic retrieval.
-- The settings page shows **vectorized / indexed** counts for items and passages. For example, `0 / 100` passages means 100 passages are searchable as text and zero have vectors. Use **Index Missing / Changed** to start an incremental scan, such as after switching models.
+- Background indexing is enabled by default. A library scan indexes metadata first while preparing PDF passages in the background. Full-text embedding follows metadata embedding. Each stage publishes its results as it progresses.
+- The settings page shows **vectorized / indexed** counts for items and passages. For example, `0 / 100` passages means 100 passages are searchable as text and zero have vectors. Use **Index Missing / Changed** to start an incremental scan.
 - The PDF defaults are **1,024 characters per chunk**, **128 characters of overlap**, and **64 pages per attachment**. Set the page limit to **0** to index all pages. Run **Rebuild All** to apply changed chunking or page limits to already indexed PDFs.
 - The first vector indexing pass can take time on large libraries. Afterward, incremental scans reuse unchanged records.
 
@@ -32,7 +32,7 @@ The package declares Zotero 7.0 as its minimum version. Desktop integration has 
 | **Ollama** | Start Ollama, choose an embedding model installed on the server, and test the connection in the plugin settings. The default server address is `http://localhost:11434`. |
 | **OpenAI-compatible API** | Set the base URL, API key, and embedding model. The plugin sends the text being embedded to the configured endpoint. |
 
-Vectors from different models use different embedding spaces. After switching models, run incremental indexing so the selected model can build its own vectors.
+Click **Apply Model Settings** to switch models. Choose whether to keep the previous vectors. Returning to a saved model loads its vectors and checks for library changes. **Vector Indexes** lists coverage for each saved model and lets you delete its vectors.
 
 ## Use Zotero Vectorize from an agent
 
@@ -44,15 +44,17 @@ The endpoint at `http://127.0.0.1:23124/mcp` serves read-only requests from the 
 
 The agent receives the returned metadata and text. Search queries use the embedding provider configured in the plugin.
 
-## Data and JSON exchange
+## Index export and restore
 
 The plugin stores its index in `<Zotero Data Directory>/zotero-vectorize/vectorize.sqlite`. It reads Zotero metadata and PDF text and writes its own index separately from Zotero’s library database and attachments.
 
-The skill uses the same JSON index format for command-line and agent workflows. To exchange indexes, use **Standard 3-File Vector JSON Import / Export** in the plugin settings and put the three files in the same folder.
+Under **Vector Indexes**, select **Native SQLite Index** to export or restore a complete snapshot of the plugin index for the same Zotero library. It contains all saved model vectors, PDF passages, and indexing checkpoints. **Three-File Vector JSON** transfers one model index at a time for use with the skill. Keep these files together.
 
 - `metadata_vectors.json`
 - `fulltext_vectors.json`
 - `vector_store_metadata.json`
+
+When a legacy plugin index is in the same Zotero data directory, the plugin migrates it on startup. You can also import a closed legacy SQLite database from **Import Index → Native SQLite Index**. Legacy vectors are saved under their recorded model. If you know the active configuration matches the original model files and settings or the original API endpoint and version, choose **Reuse for Active Model** in the legacy index row, then let the plugin check for changes.
 
 ## Build from source
 

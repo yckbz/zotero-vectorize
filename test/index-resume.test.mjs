@@ -6,31 +6,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { importTs } from './_helper.mjs';
 
-class SqliteConnection {
-  constructor(filename) {
-    this.db = new DatabaseSync(filename);
-    this.closed = false;
-  }
-  async queryAsync(sql, params = []) { return this.db.prepare(sql).all(...params); }
-  async rowQueryAsync(sql, params = []) { return this.db.prepare(sql).get(...params); }
-  async valueQueryAsync(sql, params = []) {
-    return Object.values(await this.rowQueryAsync(sql, params) ?? {})[0];
-  }
-  async executeTransaction(fn) {
-    this.db.exec('BEGIN');
-    try {
-      await fn();
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
-  }
-  async closeDatabase() {
-    this.db.close();
-    this.closed = true;
-  }
-}
+import { SqliteConnection } from './_sqlite.mjs';
 
 test('Indexing discovers the gateway batch limit and resumes PDF batches across failure and shutdown', async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'zv-resume-'));
@@ -146,11 +122,11 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
     await service.init();
   };
   await open();
-  assert.equal(await service.store.getMeta('schema_version'), '2');
+  assert.equal(await service.store.getMeta('schema_version'), '3');
   assert.equal((await service.store.getAttachmentState(21)).chunkingKey, '');
 
   const reader = new DatabaseSync(dbPath, { readOnly: true });
-  const countVectors = reader.prepare('SELECT count(vector) AS count FROM fulltext_chunks');
+  const countVectors = reader.prepare('SELECT count(vector) AS count FROM passage_embeddings');
   const observations = [];
   const unsubscribeWrites = service.store.subscribeWrites(() => {
     observations.push([service.getIndexProgress().phase, countVectors.get().count]);
@@ -202,17 +178,13 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
   assert.equal(extractionCalls, 1);
   assert.equal(service.getIndexProgress().embeddedChunks, 0);
 
-  // Reopen a v1 index with a PDF's old text and a subset of matching vectors.
+  // Checkpoint reuse when an older extraction lacks its layout signature.
   await service.shutdown();
   const legacy = new DatabaseSync(dbPath);
   legacy.exec(`
-    ALTER TABLE attachment_state DROP COLUMN chunking_key;
-    UPDATE store_meta SET value = '1' WHERE key = 'schema_version';
-    UPDATE attachment_state SET status = 'error', model_fingerprint = '',
-      error_message = 'Embedding API error (400): batch size should not be larger than 20'
-    WHERE attachment_id = 20;
-    UPDATE fulltext_chunks SET vector = NULL, dim = 0, model_fingerprint = ''
-    WHERE attachment_id = 20 AND chunk_index >= 20;
+    UPDATE attachment_state SET chunking_key = '' WHERE attachment_id = 20;
+    UPDATE attachment_embeddings SET status = 'error' WHERE attachment_id = 20;
+    DELETE FROM passage_embeddings WHERE chunk_id IN (SELECT chunk_id FROM fulltext_chunks WHERE chunk_index >= 20);
   `);
   legacy.close();
   await open();

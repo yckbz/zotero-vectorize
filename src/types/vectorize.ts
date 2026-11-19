@@ -214,6 +214,7 @@ export interface EngineHealthStatus {
 
 export interface IndexProgress {
   phase: 'idle' | 'scanning' | 'indexing' | 'paused' | 'completed' | 'incomplete' | 'error';
+  stage?: 'metadata' | 'fulltext';
   totalItems: number;
   processedItems: number;
   totalAttachments: number;
@@ -263,6 +264,7 @@ export interface CompatMetadataVectorEntry {
 }
 
 export interface CompatFulltextChunkEntry {
+  library_id?: number;
   chunk_id: string;
   item_key: string;
   attachment_key?: string;
@@ -283,6 +285,7 @@ export interface CompatStoreMetadata {
   engine: EngineType | string;
   model: string;
   model_fingerprint: string;
+  embedding_profile_id?: string;
   dimension: number;
   item_count: number;
   chunk_count: number;

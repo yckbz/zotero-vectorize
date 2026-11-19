@@ -248,8 +248,10 @@ export interface EmbeddingProvider {
   readonly model: string;
   getPassageBatchSize(): number | Promise<number>;
   getModelFingerprint(dim?: number): string;
+  getModelRevision?(): Promise<string | null>;
   getStatus(): Promise<EngineHealthStatus>;
   embedQuery(text: string): Promise<Float32Array>;
+  embedMetadata?(texts: string[]): Promise<Float32Array[]>;
   embedPassages(texts: string[], onProgress?: (completed: number) => void): Promise<Float32Array[]>;
   testConnection(): Promise<{ ok: boolean; dimensions: number; message: string }>;
   dispose(): Promise<void>;

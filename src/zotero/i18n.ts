@@ -34,6 +34,37 @@ export type LocaleStrings = {
   indexReadingPdf: string;
   indexEmbeddingPdf: (completed: number, total: number) => string;
   indexReadTimeout: (stage: string, title: string, seconds: number) => string;
+  prefCancel: string;
+  prefApplyModel: string;
+  prefKeepModel: string;
+  prefDiscardModel: string;
+  prefModelApplied: string;
+  prefIndexManager: string;
+  prefIndexManagerHint: string;
+  prefNoModelIndexes: string;
+  prefActiveIndex: string;
+  prefLegacyIndex: string;
+  prefSavedIndex: string;
+  prefDeleteModelIndex: string;
+  prefIndexChanged: string;
+  prefReuseLegacy: string;
+  prefReuseLegacyHint: string;
+  prefIndexImport: string;
+  prefIndexExport: string;
+  prefIndexFormatJson: string;
+  prefIndexFormatNative: string;
+  prefSelectExportModel: string;
+  prefRestoreNative: string;
+  prefRestoreNativeHint: string;
+  prefNativeRestored: string;
+  prefNativeExported: string;
+  prefClearAllHint: string;
+  prefSwitchModelHint: (model: string) => string;
+  prefDeleteModelHint: (model: string) => string;
+  prefModelCoverage: (items: number, allItems: number, chunks: number, allChunks: number) => string;
+  prefIndexStage: (stage: string, items: number, total: number, pdfs: number, chunks: number) => string;
+  indexingMetadata: string;
+  indexingFulltext: string;
   indexTextDone: (items: number, chunks: number) => string;
   indexVectorDone: (items: number, chunks: number) => string;
   indexIncomplete: (items: number, failures: number, error: string) => string;
@@ -52,7 +83,6 @@ export type LocaleStrings = {
   prefStatusCardTitle: string;
   prefEngineSectionTitle: string;
   prefIndexingSectionTitle: string;
-  prefCompatSectionTitle: string;
   prefUiSectionTitle: string;
   prefMcpTitle: string;
   prefMcpHint: string;
@@ -96,9 +126,6 @@ export type LocaleStrings = {
   prefNormalizeNotation: string;
   prefClearOnJump: string;
   prefLanguage: string;
-  prefExportJson: string;
-  prefImportJson: string;
-  prefCompatHint: string;
   prefPrivacyBadge: string;
   prefMsgCleared: string;
   prefMsgModelReady: (modelId: string) => string;
@@ -140,6 +167,37 @@ const ZH_CN: LocaleStrings = {
   indexCheckingFile: '正在检查附件',
   indexReadingPdf: '正在抽取 PDF 正文',
   indexEmbeddingPdf: (completed, total) => `正在向量化 PDF 分块 ${completed}/${total}`,
+  prefCancel: '取消',
+  prefApplyModel: '应用模型设置',
+  prefKeepModel: '保留旧模型索引',
+  prefDiscardModel: '删除旧模型索引',
+  prefModelApplied: '已应用模型设置，正在检查索引。',
+  prefIndexManager: '向量索引管理',
+  prefIndexManagerHint: '各模型共用题录和 PDF 切片。原生 SQLite 快照包含完整的插件索引。',
+  prefNoModelIndexes: '暂无已保存的模型索引。',
+  prefActiveIndex: '当前模型',
+  prefLegacyIndex: '旧版或外部导入',
+  prefSavedIndex: '已保留',
+  prefDeleteModelIndex: '删除向量',
+  prefIndexChanged: '索引已更新。',
+  prefReuseLegacy: '用作当前模型索引',
+  prefReuseLegacyHint: '仅在确认旧向量由相同模型文件、推理设置或相同 API 端点及模型版本生成时继续。已有的当前模型向量会保留。',
+  prefIndexImport: '导入索引…',
+  prefIndexExport: '导出索引…',
+  prefIndexFormatJson: '三文件向量 JSON',
+  prefIndexFormatNative: '原生 SQLite 向量库',
+  prefSelectExportModel: '选择要导出的模型索引',
+  prefRestoreNative: '恢复索引',
+  prefRestoreNativeHint: '恢复将替换插件中的所有模型索引和全文缓存。',
+  prefNativeRestored: '已恢复 SQLite 向量库，正在检查文献变更。',
+  prefNativeExported: '已导出 SQLite 向量库。',
+  prefClearAllHint: '这会删除全部模型向量和全文缓存。',
+  prefSwitchModelHint: (model) => `是否保留 ${model} 的向量？`,
+  prefDeleteModelHint: (model) => `删除 ${model} 的题录和全文向量。共享的题录与 PDF 切片会保留。`,
+  prefModelCoverage: (i, ni, c, nc) => `题录 ${i}/${ni} · 全文 ${c}/${nc}`,
+  prefIndexStage: (stage, i, n, p, c) => `${stage} · 已检查题录 ${i}/${n} · 已检查 PDF ${p} · 已向量化分块 ${c}`,
+  indexingMetadata: '正在索引题录',
+  indexingFulltext: '正在索引 PDF 全文',
   indexTextDone: (items, chunks) => `文本索引完成。本轮处理 ${items} 篇文献、保存 ${chunks} 个分块，未生成向量。`,
   indexVectorDone: (items, chunks) => `向量索引扫描完成。本轮处理 ${items} 篇文献、生成 ${chunks} 个正文向量。`,
   indexIncomplete: (items, failures, error) => `索引未完成。本轮检查 ${items} 篇文献，${failures} 项失败。首个错误：${error}`,
@@ -160,7 +218,6 @@ const ZH_CN: LocaleStrings = {
   prefStatusCardTitle: '向量索引状态与控制',
   prefEngineSectionTitle: 'Embedding 向量引擎',
   prefIndexingSectionTitle: '文档切片与自动后台索引',
-  prefCompatSectionTitle: '标准向量 JSON 兼容导入与导出',
   prefUiSectionTitle: '检索交互与外观',
   prefMcpTitle: 'Agent 接入（MCP）',
   prefMcpHint: '允许同一台电脑上的 Agent 只读检索「我的文库」和读取 PDF 指定页。连接时请保持 Zotero 运行。',
@@ -204,9 +261,6 @@ const ZH_CN: LocaleStrings = {
   prefNormalizeNotation: '允许普通数字匹配上下标数字',
   prefClearOnJump: '点击候选跳转到 PDF 后自动清空顶部检索框',
   prefLanguage: '界面语言',
-  prefExportJson: '导出三文件向量 JSON…',
-  prefImportJson: '导入三文件向量 JSON…',
-  prefCompatHint: '导入/导出标准三文件向量 JSON 格式（metadata_vectors.json / fulltext_vectors.json / vector_store_metadata.json），所有索引与向量独立存储，绝不修改 zotero.sqlite。',
   prefPrivacyBadge: '独立存储：vectorize.sqlite · 原库零写入风险',
   prefMsgCleared: '向量索引已清空。',
   prefMsgModelReady: (m) => `本地 ONNX 模型已就绪：${m}`,
@@ -248,6 +302,37 @@ const EN_US: LocaleStrings = {
   indexCheckingFile: 'Checking attachment',
   indexReadingPdf: 'Extracting PDF text',
   indexEmbeddingPdf: (completed, total) => `Embedding PDF passages ${completed}/${total}`,
+  prefCancel: 'Cancel',
+  prefApplyModel: 'Apply Model Settings',
+  prefKeepModel: 'Keep Previous Index',
+  prefDiscardModel: 'Discard Previous Index',
+  prefModelApplied: 'Model settings applied. Checking the index.',
+  prefIndexManager: 'Vector Indexes',
+  prefIndexManagerHint: 'Models share metadata and PDF passages. A SQLite snapshot contains the entire plugin index.',
+  prefNoModelIndexes: 'No saved model indexes.',
+  prefActiveIndex: 'Active',
+  prefLegacyIndex: 'Legacy or imported',
+  prefSavedIndex: 'Saved',
+  prefDeleteModelIndex: 'Delete Vectors',
+  prefIndexChanged: 'Index updated.',
+  prefReuseLegacy: 'Reuse for Active Model',
+  prefReuseLegacyHint: 'Continue only if the original model files and settings, or the API endpoint and model revision, match the active model. Existing active vectors will be kept.',
+  prefIndexImport: 'Import Index…',
+  prefIndexExport: 'Export Index…',
+  prefIndexFormatJson: 'Three-File Vector JSON',
+  prefIndexFormatNative: 'Native SQLite Index',
+  prefSelectExportModel: 'Choose a Model Index to Export',
+  prefRestoreNative: 'Restore Index',
+  prefRestoreNativeHint: 'Restoring replaces all model indexes and cached passages in this plugin.',
+  prefNativeRestored: 'SQLite index restored. Checking for library changes.',
+  prefNativeExported: 'SQLite index exported.',
+  prefClearAllHint: 'This deletes all model vectors and cached passages.',
+  prefSwitchModelHint: (model) => `Keep the saved vectors for ${model}?`,
+  prefDeleteModelHint: (model) => `Delete the metadata and full-text vectors for ${model}. Shared metadata and PDF passages will be kept.`,
+  prefModelCoverage: (i, ni, c, nc) => `Metadata ${i}/${ni} · Passages ${c}/${nc}`,
+  prefIndexStage: (stage, i, n, p, c) => `${stage} · Checked metadata ${i}/${n} · PDFs checked ${p} · Passages embedded ${c}`,
+  indexingMetadata: 'Indexing metadata',
+  indexingFulltext: 'Indexing PDF full text',
   indexTextDone: (items, chunks) => `Text indexing completed. Processed ${items} items, saved ${chunks} passages, and generated no vectors in this scan.`,
   indexVectorDone: (items, chunks) => `Vector indexing scan completed. Processed ${items} items and generated ${chunks} passage vectors.`,
   indexIncomplete: (items, failures, error) => `Indexing incomplete. Checked ${items} items with ${failures} failures. First error: ${error}`,
@@ -268,7 +353,6 @@ const EN_US: LocaleStrings = {
   prefStatusCardTitle: 'Vector Index Status & Controls',
   prefEngineSectionTitle: 'Embedding Engine',
   prefIndexingSectionTitle: 'Chunking & Silent Background Indexing',
-  prefCompatSectionTitle: 'Standard 3-File Vector JSON Import / Export',
   prefUiSectionTitle: 'Search UX & Appearance',
   prefMcpTitle: 'Agent access (MCP)',
   prefMcpHint: 'Allow an agent on this computer to search My Library and read selected PDF pages. Keep Zotero running while connected.',
@@ -312,9 +396,6 @@ const EN_US: LocaleStrings = {
   prefNormalizeNotation: 'Match plain digits to superscript and subscript digits',
   prefClearOnJump: 'Clear top search bar after jumping to a PDF page',
   prefLanguage: 'UI Language',
-  prefExportJson: 'Export 3-File Vector JSON…',
-  prefImportJson: 'Import 3-File Vector JSON…',
-  prefCompatHint: 'Exports and imports the standard 3-file vector JSON format (metadata_vectors.json, fulltext_vectors.json, vector_store_metadata.json). Isolated storage — never writes to zotero.sqlite.',
   prefPrivacyBadge: 'Isolated store: vectorize.sqlite · Zero risk to zotero.sqlite',
   prefMsgCleared: 'Vector index cleared.',
   prefMsgModelReady: (m) => `Local ONNX model ready: ${m}`,

@@ -129,6 +129,7 @@ export interface ZoteroItem {
   getTags(): Array<{ tag: string; type?: number }>;
   getAttachments(includeTrashed?: boolean): number[];
   getCollections(): number[];
+  attachmentFilename?: string;
   getFilePathAsync(): Promise<string | false>;
   getDisplayTitle(includeDeleted?: boolean): string;
 }
@@ -155,6 +156,7 @@ export interface ZoteroNamespace {
     dir: string;
     getDatabase(name: string): string;
   };
+  Utilities: { Internal: { md5Async(path: string): Promise<string> } };
   DBConnection: new (dbNameOrPath: string) => ZoteroDBConnectionInstance;
   Prefs: {
     get(pref: string, global?: boolean): any;

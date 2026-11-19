@@ -5,6 +5,7 @@ import type {
   IndexedItemRecord,
   PluginConfig,
 } from '../types/vectorize.ts';
+import type { ExtractedItemMetadata } from '../types/vectorize.ts';
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import type { EmbeddingProvider } from '../engines/provider.ts';
 import { chunkDocumentPages } from '../core/chunker.ts';
@@ -42,6 +43,13 @@ function fingerprintMatches(storedFp: string, targetFp: string, targetHasDim: bo
     /^[1-9]\d*$/.test(storedFp.slice(targetFp.length + 1));
 }
 
+interface PreparedAttachment {
+  item: ZoteroItem;
+  attachment: ZoteroItem;
+  state: AttachmentStateRecord;
+  remaining: number;
+}
+
 export interface IndexerDeps {
   getConfig: () => PluginConfig;
   getProvider: () => Promise<EmbeddingProvider>;
@@ -75,6 +83,33 @@ export class BackgroundIndexer {
   private paused = false;
   private cancelled = false;
   private disposed = false;
+  private suspended = false;
+  private deleteWrites = Promise.resolve();
+  private queuedDeletes = new Set<number>();
+
+  async withWritesSuspended<T>(operation: () => Promise<T>): Promise<T> {
+    this.suspended = true;
+    try {
+      await this.cancel();
+      await this.deleteWrites;
+      return await operation();
+    } finally {
+      this.suspended = false;
+      if (this.queuedDeletes.size) {
+        this.queueDeletes([...this.queuedDeletes]);
+        this.queuedDeletes.clear();
+      }
+      if (this.pendingDebounceIds.size) this.scheduleDebouncedFlush();
+    }
+  }
+
+  private queueDeletes(ids: Array<number | string>): void {
+    if (this.suspended) {
+      for (const id of ids) this.queuedDeletes.add(Number(id));
+      return;
+    }
+    this.deleteWrites = this.deleteWrites.then(() => this.handleDeletes(ids));
+  }
 
   constructor(deps: IndexerDeps) {
     this.deps = deps;
@@ -115,14 +150,14 @@ export class BackgroundIndexer {
     if (this.notifierID || typeof Zotero === 'undefined' || !Zotero?.Notifier) return;
     this.notifierID = Zotero.Notifier.registerObserver(
       {
-        notify: (event, type, ids, extraData) => {
+        notify: (event, type, ids) => {
           if (this.disposed) return;
           const cfg = this.deps.getConfig();
           if (!cfg.autoIndexOnChange) return;
 
           if (type === 'item') {
             if (event === 'delete' || event === 'trash') {
-              void this.handleDeletes(ids, extraData);
+              this.queueDeletes(ids);
               return;
             }
             if (event === 'add' || event === 'modify') {
@@ -166,7 +201,7 @@ export class BackgroundIndexer {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      if (this.disposed || this.pendingDebounceIds.size === 0) return;
+      if (this.disposed || this.suspended || this.pendingDebounceIds.size === 0) return;
       const batch = Array.from(this.pendingDebounceIds);
       this.pendingDebounceIds.clear();
       void this.indexItemOrAttachmentIds(batch, false);
@@ -196,7 +231,7 @@ export class BackgroundIndexer {
     }
   }
 
-  private async handleDeletes(ids: Array<number | string>, _extraData: Record<string, any>): Promise<void> {
+  private async handleDeletes(ids: Array<number | string>): Promise<void> {
     let changed = false;
     for (const rawId of ids) {
       const id = Number(rawId);
@@ -291,10 +326,11 @@ export class BackgroundIndexer {
       this.notifierID = null;
     }
     await this.cancel();
+    await this.deleteWrites;
   }
 
   async startLibraryScan(forceRebuild = false): Promise<void> {
-    if (this.disposed || this.cancelled) return;
+    if (this.disposed || this.cancelled || this.suspended) return;
     if (this.activeRun) {
       return this.activeRun;
     }
@@ -375,7 +411,8 @@ export class BackgroundIndexer {
     }
     if (resolvedRegularIds.size === 0) return;
 
-    if (this.activeRun) {
+    if (this.disposed) return;
+    if (this.activeRun || this.suspended || this.cancelled) {
       for (const id of resolvedRegularIds) {
         this.pendingDebounceIds.add(id);
       }
@@ -403,372 +440,320 @@ export class BackgroundIndexer {
     return run;
   }
 
-  private async saveAttachmentChunks(chunks: IndexedChunkRecord[], state: AttachmentStateRecord): Promise<void> {
-    const { searchIndex, store } = this.deps;
-    const previousParents = await store.saveAttachmentChunksAndState(chunks, state, 'replace');
-    for (const id of [...(previousParents ?? []), state.parentItemID]) {
-      searchIndex.replaceItemChunks(id, await store.getChunksForItem(id));
-    }
+  private isCurrent(work: PreparedAttachment): boolean {
+    return !work.item.deleted && !work.attachment.deleted && work.attachment.parentItemID === work.item.id;
   }
 
-  private async processItemIds(itemIds: number[], forceRebuild: boolean, libraryScan = false): Promise<void> {
+  private async prepareAttachment(
+    item: ZoteroItem, att: ZoteroItem, provider: EmbeddingProvider, canEmbed: boolean,
+    force: boolean, cfg: PluginConfig,
+    recordFailure: (message: string) => void,
+    recordText: (count: number) => void
+  ): Promise<PreparedAttachment | null> {
+    const { store, searchIndex } = this.deps;
+    const strings = getStrings(cfg);
+    const title = att.getDisplayTitle?.() || att.key;
+    const sig = await waitForAttachmentRead(
+      getAttachmentSignature(att),
+      strings.indexReadTimeout(strings.indexCheckingFile, title, ATTACHMENT_READ_TIMEOUT_MS / 1000)
+    );
+    const previous = await store.getAttachmentState(att.id);
+    const chunkingKey = `1:${cfg.chunkSize}:${cfg.chunkOverlap}:${cfg.maxPdfPages}`;
+    const sameSource = previous !== null && previous.parentItemID === item.id && previous.attachmentKey === att.key &&
+      previous.fileHash === sig.fileHash && previous.mtime === sig.mtime;
+    const sameLayout = !force && sameSource && previous.chunkingKey === chunkingKey;
+    const model = provider.getModelFingerprint();
+    const hasDimension = model !== buildModelFingerprint(provider.engine, provider.model);
+    if (sameLayout && (previous.status === 'no_text' || previous.status === 'missing' ||
+        (previous.status === 'indexed' && (!canEmbed || fingerprintMatches(previous.modelFingerprint, model, hasDimension))))) {
+      this.emit({ skippedUnchanged: this.progress.skippedUnchanged + 1 });
+      return null;
+    }
+
+    const existing = searchIndex.getItemChunks(item.id).some((chunk) => chunk.attachmentID === att.id)
+      ? (await store.getChunksForItem(item.id)).filter((chunk) => chunk.attachmentID === att.id && chunk.attachmentKey === att.key)
+      : [];
+    const reuseLayout = sameLayout && existing.length > 0 && existing.length === previous.chunkCount;
+    const state: AttachmentStateRecord = {
+      attachmentID: att.id, attachmentKey: att.key, parentItemID: item.id, fileHash: sig.fileHash,
+      mtime: sig.mtime, chunkingKey, status: 'indexed', chunkCount: 0, modelFingerprint: '', updatedAt: Date.now(),
+    };
+    const work: PreparedAttachment = { item, attachment: att, state, remaining: 0 };
+    let chunks = existing;
+    if (!reuseLayout) {
+      const extracted = await waitForAttachmentRead(
+        extractPdfPages(att, cfg.maxPdfPages, sig),
+        strings.indexReadTimeout(strings.indexReadingPdf, title, ATTACHMENT_READ_TIMEOUT_MS / 1000)
+      );
+      if (!(await this.waitIfPaused()) || !this.isCurrent(work)) return null;
+      state.status = extracted.status;
+      state.errorMessage = extracted.errorMessage;
+      if (extracted.status === 'error') {
+        recordFailure(extracted.errorMessage || strings.indexReadingPdf);
+        if (previous?.chunkCount) return null;
+      }
+
+      const byId = new Map(existing.map((chunk) => [chunk.chunkIndex, chunk]));
+      chunks = chunkDocumentPages(extracted.pages, {
+        itemID: item.id, itemKey: item.key, attachmentID: att.id, attachmentKey: att.key,
+        attachmentTitle: title, chunkSize: cfg.chunkSize, chunkOverlap: cfg.chunkOverlap,
+      }).map((chunk) => {
+        const stored = byId.get(chunk.chunkIndex);
+        const match = stored?.text === chunk.text ? stored : undefined;
+        const preserved = !force && match ? match : null;
+        return { ...chunk, chunkId: match?.chunkId ?? `${att.id}:${chunk.chunkId}`,
+          vector: preserved?.vector ?? null, dim: preserved?.dim ?? 0,
+          modelFingerprint: preserved?.modelFingerprint ?? '', updatedAt: preserved?.updatedAt ?? state.updatedAt };
+      });
+      if (!chunks.length && state.status === 'indexed') state.status = 'no_text';
+    }
+
+    if (!(await this.waitIfPaused()) || !this.isCurrent(work)) return null;
+    state.chunkCount = chunks.length;
+    work.remaining = canEmbed ? chunks.filter((chunk) => !chunk.vector).length : 0;
+    if (work.remaining) state.status = 'pending';
+    if (!reuseLayout) {
+      const parents = await store.saveAttachmentChunksAndState(chunks, state, 'replace', force);
+      await store.readCommitted(async () => {
+        for (const id of new Set([...(parents ?? []), item.id])) {
+          searchIndex.replaceItemChunks(id, await store.getChunksForItem(id));
+        }
+      });
+      recordText(chunks.length);
+      this.deps.onItemIndexed?.();
+    } else if (canEmbed) {
+      if (await store.saveAttachmentChunksAndState([], state, 'checkpoint') === null) return null;
+    }
+    return work.remaining ? work : null;
+  }
+
+  private async processItemIds(itemIds: number[], force: boolean, libraryScan = false): Promise<void> {
+    if (!(await this.waitIfPaused())) return;
     const cfg = this.deps.getConfig();
     const strings = getStrings(cfg);
     const provider = await this.deps.getProvider();
     const status = await provider.getStatus();
-    const canEmbedNeural = status.neuralAvailable;
-    if (libraryScan && canEmbedNeural) {
+    const canEmbed = status.neuralAvailable && this.deps.store.activeProfile !== null;
+    if (libraryScan && canEmbed) {
       this.activeLibraryVectorProvider = provider;
       if (this.pendingModelBackfill === provider) this.pendingModelBackfill = null;
     }
-    const initialFp = provider.getModelFingerprint();
-    const targetHasDim = status.dimensions > 0;
-    const chunkingKey = `1:${cfg.chunkSize}:${cfg.chunkOverlap}:${cfg.maxPdfPages}`;
-
-    const indexingMessage = canEmbedNeural
-      ? `Indexing with ${provider.model}…`
-      : 'Indexing text for lexical search (neural model pending)…';
     this.emit({
-      phase: 'indexing',
-      totalItems: itemIds.length,
-      processedItems: 0,
-      totalAttachments: 0,
-      processedAttachments: 0,
-      embeddedChunks: 0,
-      skippedUnchanged: 0,
-      failedCount: 0,
-      message: indexingMessage,
-      lastError: undefined,
+      phase: 'indexing', stage: 'metadata', totalItems: itemIds.length, processedItems: 0, totalAttachments: 0,
+      processedAttachments: 0, embeddedChunks: 0, skippedUnchanged: 0,
+      failedCount: 0, currentTitle: '', lastError: undefined, message: strings.indexingMetadata,
     });
 
-    let processedItems = 0;
-    let totalAttachments = 0;
-    let processedAttachments = 0;
-    let embeddedChunks = 0;
+    const { store, searchIndex } = this.deps;
     let savedChunks = 0;
-    let skippedUnchanged = 0;
-    let failedCount = 0;
-    let passageBatchSize: Promise<number> | undefined;
     const recordFailure = (message: string): void => {
-      failedCount++;
-      this.emit({ failedCount, lastError: this.progress.lastError ?? message });
+      this.emit({ failedCount: this.progress.failedCount + 1, lastError: this.progress.lastError ?? message });
+    };
+    const validateVectors = (vectors: Float32Array[], count: number): void => {
+      const dim = vectors[0]?.length;
+      if (!dim || vectors.length !== count || vectors.some((vector) => vector.length !== dim || !isFiniteVector(vector))) {
+        throw new Error('Embedding provider returned invalid or incompatible vectors');
+      }
+    };
+    const ready: PreparedAttachment[] = [];
+    let reader: Promise<void> | undefined;
+
+    const preparePdfs = async function* (this: BackgroundIndexer) {
+      for (const itemID of itemIds) {
+        if (!(await this.waitIfPaused())) return;
+        const item = await Zotero.Items.getAsync(itemID).catch(() => null);
+        if (!isIndexableRegularItem(item)) continue;
+        for (const attachmentID of item.getAttachments?.(false) ?? []) {
+          if (!(await this.waitIfPaused())) return;
+          const att = await Zotero.Items.getAsync(attachmentID).catch(() => null);
+          if (!att || att.deleted || !att.isPDFAttachment()) continue;
+          this.emit({ totalAttachments: this.progress.totalAttachments + 1 });
+          let work;
+          try {
+            work = await this.prepareAttachment(item, att, provider, canEmbed, force, cfg, recordFailure,
+              (count) => { savedChunks += count; });
+          } catch (error) {
+            if (error instanceof AttachmentReadTimeout) throw error;
+            recordFailure(error instanceof Error ? error.message : String(error));
+            Zotero.logError(error);
+          } finally {
+            this.emit({ processedAttachments: this.progress.processedAttachments + 1 });
+          }
+          if (work) yield work;
+        }
+        await yieldToEventLoop(0);
+      }
+    }.call(this);
+
+    // Only one PDF read is in flight. Its text is persisted immediately and the
+    // queue holds attachment checkpoints, not another copy of the text.
+    let pdfDone = false;
+    let pdfError: unknown;
+    const prefetch = () => {
+      if (reader || pdfDone || this.cancelled || this.disposed) return;
+      reader = (async () => {
+        while ((this.progress.stage === 'metadata' || ready.length < 2) && !pdfDone && !this.cancelled && !this.disposed) {
+          const result = await preparePdfs.next();
+          if (result.done) pdfDone = true;
+          else ready.push(result.value);
+        }
+      })().catch((error: unknown) => {
+        pdfDone = true;
+        pdfError = error;
+      }).finally(() => { reader = undefined; });
     };
 
-    for (const itemID of itemIds) {
-      if (!(await this.waitIfPaused())) break;
-
-      let item: ZoteroItem | null = null;
-      try {
-        item = await Zotero.Items.getAsync(itemID);
-      } catch {
-        item = null;
-      }
-      if (!isIndexableRegularItem(item)) {
-        processedItems++;
-        this.emit({ processedItems });
-        continue;
-      }
-
-      const meta = extractItemMetadata(item);
-      this.emit({ currentTitle: meta.title || item.key, message: indexingMessage });
-
-      // 1. Metadata incremental check
-      try {
-        const existing = forceRebuild ? null : await this.deps.store.getItemSyncInfo(item.id);
-        const existingMem = !forceRebuild ? this.deps.searchIndex.getItemById(item.id) : undefined;
-        const metaMatches =
-          existing !== null &&
-          existing.metadataHash === meta.metadataHash &&
-          (!canEmbedNeural || (existing.hasVector && fingerprintMatches(existing.modelFingerprint, initialFp, targetHasDim)));
-
-        if (metaMatches) {
-          skippedUnchanged++;
-        } else {
-          let vector: Float32Array | null = null;
-          let fp = '';
-          let embedFailed = false;
-          if (canEmbedNeural && meta.canonicalText) {
-            try {
-              const vecs = await provider.embedPassages([meta.canonicalText]);
-              vector = vecs[0] ?? null;
-              fp = vector ? buildModelFingerprint(provider.engine, provider.model, vector.length) : '';
-            } catch (err: any) {
-              embedFailed = true;
-              recordFailure(err?.message || String(err));
-            }
-          }
-
-          const hasPreservableVector =
-            !forceRebuild &&
-            existing !== null &&
-            existing.hasVector &&
-            Boolean(existingMem?.vector && existingMem.dim > 0);
-
-          const preserveExistingVector =
-            embedFailed && hasPreservableVector && existing!.metadataHash === meta.metadataHash;
-
-          if (!preserveExistingVector && !item.deleted) {
-            const reuseExistingVector = !vector && hasPreservableVector && (!canEmbedNeural || embedFailed);
-            const recordVector = reuseExistingVector ? existingMem!.vector : vector;
-            const recordDim = reuseExistingVector ? existingMem!.dim : vector ? vector.length : 0;
-            const recordFp = reuseExistingVector ? existingMem!.modelFingerprint : fp;
-            const recordHash = reuseExistingVector && existing ? existing.metadataHash : meta.metadataHash;
-
-            const record: IndexedItemRecord = {
-              itemID: meta.itemID,
-              itemKey: meta.itemKey,
-              libraryID: meta.libraryID,
-              itemType: meta.itemType,
-              title: meta.title,
-              creators: meta.creators,
-              year: meta.year,
-              publicationTitle: meta.publicationTitle,
-              doi: meta.doi,
-              url: meta.url,
-              tags: meta.tags,
-              abstractNote: meta.abstractNote,
-              metadataHash: recordHash,
-              vector: recordVector,
-              dim: recordDim,
-              modelFingerprint: recordFp,
-              updatedAt: Date.now(),
-            };
-            await this.deps.store.upsertItem(record);
-            this.deps.searchIndex.upsertItem(record);
-          }
-        }
-      } catch (err: any) {
-        Zotero.logError(err);
-        recordFailure(err?.message || String(err));
-      }
-
-      // 2. PDF Attachments incremental check
-      const attIds = item.getAttachments?.(false) ?? [];
-      const pdfAttachments: ZoteroItem[] = [];
-      for (const attId of attIds) {
+    const metadataBatchSize = canEmbed && provider.embedMetadata ? await provider.getPassageBatchSize() : 1;
+    const metadata: Array<{ item: ZoteroItem; value: ExtractedItemMetadata }> = [];
+    const flushMetadata = async () => {
+      if (!metadata.length || !(await this.waitIfPaused())) return;
+      const batch = metadata.splice(0);
+      const inputs = batch.filter(({ value }) => value.canonicalText);
+      const embeddings = new Map<number, Float32Array>();
+      if (canEmbed && inputs.length) {
         try {
-          const att = await Zotero.Items.getAsync(attId);
-          if (att && !att.deleted && att.isPDFAttachment()) {
-            pdfAttachments.push(att);
-          }
-        } catch {
-          // Ignore broken attachment
+          const texts = inputs.map(({ value }) => value.canonicalText);
+          const vectors = provider.embedMetadata ? await provider.embedMetadata(texts) : await provider.embedPassages(texts);
+          validateVectors(vectors, inputs.length);
+          inputs.forEach(({ item }, index) => embeddings.set(item.id, vectors[index]));
+        } catch (error) {
+          recordFailure(error instanceof Error ? error.message : String(error));
         }
       }
-      totalAttachments += pdfAttachments.length;
-      this.emit({ totalAttachments });
-
-      for (const att of pdfAttachments) {
-        if (!(await this.waitIfPaused())) break;
-        try {
-          const attachmentTitle = att.getDisplayTitle?.() || att.key;
-          this.emit({ message: strings.indexCheckingFile });
-          const sig = await waitForAttachmentRead(
-            getAttachmentSignature(att),
-            strings.indexReadTimeout(strings.indexCheckingFile, attachmentTitle, ATTACHMENT_READ_TIMEOUT_MS / 1000)
-          );
-          const { store, searchIndex } = this.deps;
-          const prevState = await store.getAttachmentState(att.id);
-          const sameSource = prevState !== null &&
-            prevState.parentItemID === item.id &&
-            prevState.attachmentKey === att.key &&
-            prevState.fileHash === sig.fileHash &&
-            prevState.mtime === sig.mtime;
-          const sameLayout = !forceRebuild && sameSource && prevState.chunkingKey === chunkingKey;
-          const modelFp = provider.getModelFingerprint();
-          const modelHasDim = targetHasDim || modelFp !== initialFp;
-          const isCurrent = () => !item.deleted && !att.deleted && att.parentItemID === item.id;
-
-          if (sameLayout && (prevState.status === 'no_text' || prevState.status === 'missing' ||
-              (prevState.status === 'indexed' &&
-                (!canEmbedNeural || fingerprintMatches(prevState.modelFingerprint, modelFp, modelHasDim))))) {
-            skippedUnchanged++;
-            processedAttachments++;
-            this.emit({ skippedUnchanged, processedAttachments });
-            continue;
-          }
-
-          const existing = !forceRebuild && (sameSource || (prevState === null && !canEmbedNeural))
-            ? (await store.getChunksForItem(item.id)).filter((chunk) => chunk.attachmentID === att.id)
-            : [];
-          if (!canEmbedNeural && prevState === null && existing.some((chunk) => chunk.vector)) {
-            skippedUnchanged++;
-            processedAttachments++;
-            this.emit({ skippedUnchanged, processedAttachments });
-            continue;
-          }
-
-          const reuseLayout = sameLayout && existing.length > 0 && existing.length === prevState.chunkCount;
-          const state: AttachmentStateRecord = {
-            attachmentID: att.id,
-            attachmentKey: att.key,
-            parentItemID: item.id,
-            fileHash: sig.fileHash,
-            mtime: sig.mtime,
-            chunkingKey,
-            status: 'indexed',
-            chunkCount: 0,
-            modelFingerprint: '',
-            updatedAt: Date.now(),
-          };
-          let chunks = existing;
-          if (!reuseLayout) {
-            this.emit({ message: strings.indexReadingPdf });
-            const extracted = await waitForAttachmentRead(
-              extractPdfPages(att, cfg.maxPdfPages, sig),
-              strings.indexReadTimeout(strings.indexReadingPdf, attachmentTitle, ATTACHMENT_READ_TIMEOUT_MS / 1000)
-            );
-            if (!isCurrent() || this.cancelled || this.disposed) break;
-            state.status = extracted.status;
-            state.errorMessage = extracted.errorMessage;
-            if (extracted.status === 'indexed') {
-              const byId = new Map(existing.map((chunk) => [chunk.chunkId, chunk]));
-              chunks = chunkDocumentPages(extracted.pages, {
-                itemID: item.id,
-                itemKey: item.key,
-                attachmentID: att.id,
-                attachmentKey: att.key,
-                attachmentTitle,
-                chunkSize: cfg.chunkSize,
-                chunkOverlap: cfg.chunkOverlap,
-              }).map((chunk) => {
-                // After a layout change, reuse only vectors verified against the new chunk text.
-                const stored = byId.get(chunk.chunkId);
-                const match = stored?.text === chunk.text ? stored : undefined;
-                return {
-                  ...chunk,
-                  vector: match?.vector ?? null,
-                  dim: match?.dim ?? 0,
-                  modelFingerprint: match?.modelFingerprint ?? '',
-                  updatedAt: match?.updatedAt ?? state.updatedAt,
-                };
-              });
-              if (!chunks.length) state.status = 'no_text';
-            } else {
-              if (extracted.status === 'error' && existing.length) {
-                recordFailure(extracted.errorMessage || strings.indexReadingPdf);
-                processedAttachments++;
-                this.emit({ processedAttachments });
-                continue;
-              }
-              chunks = [];
-            }
-          }
-
-          state.chunkCount = chunks.length;
-          if (!isCurrent()) continue;
-          if (state.status !== 'indexed' || !canEmbedNeural) {
-            if (!reuseLayout) {
-              await this.saveAttachmentChunks(chunks, state);
-              savedChunks += chunks.length;
-            }
-            if (state.status === 'error') recordFailure(state.errorMessage || strings.indexReadingPdf);
-            processedAttachments++;
-            this.emit({ processedAttachments });
-            continue;
-          }
-
-          const matchingFingerprint = chunks.find((chunk) =>
-            chunk.vector && fingerprintMatches(chunk.modelFingerprint, modelFp, modelHasDim)
-          )?.modelFingerprint;
-          state.modelFingerprint = matchingFingerprint || (modelHasDim ? modelFp : '');
-          const needed = chunks.filter((chunk) =>
-            !chunk.vector || chunk.modelFingerprint !== state.modelFingerprint
-          );
-          state.status = needed.length ? 'pending' : 'indexed';
-          if (!reuseLayout) {
-            await this.saveAttachmentChunks(chunks, state);
-          } else {
-            const written = await store.saveAttachmentChunksAndState([], state, 'checkpoint');
-            if (written === null) continue;
-          }
-          savedChunks += chunks.length;
-
-          try {
-            let completed = chunks.length - needed.length;
-            this.emit({ message: strings.indexEmbeddingPdf(completed, chunks.length) });
-            for (let start = 0; start < needed.length;) {
-              if (!(await this.waitIfPaused()) || !isCurrent()) break;
-              let batch: IndexedChunkRecord[];
-              let vectors: Float32Array[];
-              try {
-                const batchSize = await (passageBatchSize ??= Promise.resolve(provider.getPassageBatchSize()));
-                if (!(await this.waitIfPaused()) || !isCurrent()) break;
-                batch = needed.slice(start, start + batchSize);
-                vectors = await provider.embedPassages(batch.map((chunk) => chunk.text));
-                const dim = vectors[0]?.length;
-                const fp = buildModelFingerprint(provider.engine, provider.model, dim);
-                if (!dim || vectors.length !== batch.length ||
-                    vectors.some((vector) => vector.length !== dim || !isFiniteVector(vector)) ||
-                    (state.modelFingerprint && state.modelFingerprint !== fp)) {
-                  throw new Error('Embedding provider returned invalid or incompatible PDF vectors');
-                }
-                state.modelFingerprint = fp;
-              } catch (err: any) {
-                if (isCurrent() && !this.cancelled && !this.disposed) {
-                  state.status = 'error';
-                  const message = err?.message || String(err);
-                  state.errorMessage = message;
-                  state.updatedAt = Date.now();
-                  const written = await store.saveAttachmentChunksAndState([], state, 'checkpoint');
-                  if (written !== null) recordFailure(message);
-                }
-                break;
-              }
-              if (!isCurrent()) break;
-              state.status = start + batch.length === needed.length ? 'indexed' : 'pending';
-              state.updatedAt = Date.now();
-              const checkpoint = batch.map((chunk, index) => ({
-                ...chunk,
-                vector: vectors[index],
-                dim: vectors[index].length,
-                modelFingerprint: state.modelFingerprint,
-                updatedAt: state.updatedAt,
-              }));
-              const written = await store.saveAttachmentChunksAndState(checkpoint, state, 'checkpoint');
-              if (written === null) break;
-              start += batch.length;
-              completed += batch.length;
-              embeddedChunks += batch.length;
-              if (!this.paused && !this.cancelled) {
-                this.emit({ embeddedChunks, message: strings.indexEmbeddingPdf(completed, chunks.length) });
-              }
-            }
-          } finally {
-            searchIndex.replaceItemChunks(item.id, await store.getChunksForItem(item.id));
-          }
-          processedAttachments++;
-          this.emit({ embeddedChunks, processedAttachments });
-        } catch (err: any) {
-          recordFailure(err?.message || String(err));
-          if (err instanceof AttachmentReadTimeout) {
-            // A stalled Zotero PDF worker may block the shared queue.
-            throw err;
-          }
-          processedAttachments++;
-          Zotero.logError(err);
-          this.emit({ processedAttachments });
-        }
-        await yieldToEventLoop(10);
+      if (!(await this.waitIfPaused())) return;
+      const records: IndexedItemRecord[] = [];
+      for (const { item, value } of batch) {
+        if (item.deleted || extractItemMetadata(item).metadataHash !== value.metadataHash) continue;
+        const previous = searchIndex.getItemById(item.id);
+        const vector = embeddings.get(item.id) ?? (previous?.metadataHash === value.metadataHash ? previous.vector : null);
+        const { canonicalText: _text, dateModified: _modified, ...fields } = value;
+        records.push({ ...fields, vector, dim: vector?.length ?? 0,
+          modelFingerprint: vector ? buildModelFingerprint(provider.engine, provider.model, vector.length) : '',
+          updatedAt: Date.now() });
       }
-
-      processedItems++;
-      this.emit({ processedItems, skippedUnchanged });
+      await store.upsertItems(records.map((record) => embeddings.has(record.itemID) ? record : { ...record, vector: null }));
+      for (const record of records) searchIndex.upsertItem(record);
       this.deps.onItemIndexed?.();
-      await yieldToEventLoop(12);
+    };
+
+    prefetch();
+    try {
+      let visited = 0;
+      for (const itemID of itemIds) {
+        if (!(await this.waitIfPaused())) break;
+        const item = await Zotero.Items.getAsync(itemID).catch(() => null);
+        if (isIndexableRegularItem(item)) {
+          const value = extractItemMetadata(item);
+          const existing = force ? null : await store.getItemSyncInfo(item.id);
+          if (existing?.metadataHash === value.metadataHash && (!canEmbed || existing.hasVector || !value.canonicalText)) {
+            this.emit({ skippedUnchanged: this.progress.skippedUnchanged + 1 });
+          } else {
+            metadata.push({ item, value });
+          }
+        }
+        visited++;
+        if (metadata.length >= metadataBatchSize || visited % 32 === 0) {
+          await flushMetadata();
+          this.emit({ processedItems: visited });
+          await yieldToEventLoop(0);
+        }
+      }
+      await flushMetadata();
+      this.emit({ processedItems: visited });
+
+      if (!this.cancelled && !this.disposed) {
+        this.emit({ stage: 'fulltext', message: strings.indexingFulltext });
+      }
+      let limit: number | undefined;
+      const batch: Array<{ work: PreparedAttachment; chunk: IndexedChunkRecord }> = [];
+      const failed = new Set<number>();
+      const flushPassages = async (): Promise<void> => {
+        if (!batch.length || !(await this.waitIfPaused())) return;
+        const current = batch.splice(0).filter(({ work }) => this.isCurrent(work) && !failed.has(work.attachment.id));
+        if (!current.length) return;
+
+        let vectors: Float32Array[];
+        try {
+          vectors = await provider.embedPassages(current.map(({ chunk }) => chunk.text));
+          validateVectors(vectors, current.length);
+        } catch (error) {
+          if (this.cancelled || this.disposed) return;
+          const message = error instanceof Error ? error.message : String(error);
+          for (const work of new Set(current.map((entry) => entry.work))) {
+            if (!this.isCurrent(work)) continue;
+            failed.add(work.attachment.id);
+            if (await store.saveAttachmentChunksAndState([], { ...work.state, status: 'error', errorMessage: message },
+              'checkpoint') !== null) recordFailure(message);
+          }
+          return;
+        }
+
+        if (!(await this.waitIfPaused())) return;
+        const checkpoints = new Map<PreparedAttachment, IndexedChunkRecord[]>();
+        for (const [index, { work, chunk }] of current.entries()) {
+          const vector = vectors[index];
+          const list = checkpoints.get(work) ?? [];
+          list.push({ ...chunk, vector, dim: vector.length,
+            modelFingerprint: buildModelFingerprint(provider.engine, provider.model, vector.length), updatedAt: Date.now() });
+          checkpoints.set(work, list);
+        }
+        for (const [work, rows] of checkpoints) {
+          if (this.cancelled || this.disposed || !this.isCurrent(work)) continue;
+          work.remaining -= rows.length;
+          const complete = work.remaining === 0;
+          const committed = await store.saveAttachmentChunksAndState(rows, {
+            ...work.state, status: complete ? 'indexed' : 'pending', updatedAt: Date.now(),
+          }, 'checkpoint');
+          if (committed === null) continue;
+          await store.readCommitted(async () => {
+            const byID = new Map(rows.map((row) => [row.chunkId, row]));
+            searchIndex.replaceItemChunks(work.item.id, searchIndex.getItemChunks(work.item.id)
+              .map((chunk) => byID.get(chunk.chunkId) ?? chunk));
+          });
+          this.deps.onItemIndexed?.();
+          this.emit({
+            embeddedChunks: this.progress.embeddedChunks + rows.length,
+            message: strings.indexEmbeddingPdf(work.state.chunkCount - work.remaining, work.state.chunkCount),
+          });
+        }
+      };
+
+      while (await this.waitIfPaused()) {
+        if (!ready.length && !pdfDone) {
+          prefetch();
+          await reader;
+        }
+        const work = ready.shift();
+        if (!work) break;
+        prefetch();
+        if (!this.isCurrent(work)) continue;
+        const chunks = searchIndex.getItemChunks(work.item.id)
+          .filter((chunk) => chunk.attachmentID === work.attachment.id && !chunk.vector);
+        if (!chunks.length) continue;
+        limit ??= await provider.getPassageBatchSize();
+        for (const chunk of chunks) {
+          if (failed.has(work.attachment.id) || this.cancelled || this.disposed) break;
+          batch.push({ work, chunk });
+          if (batch.length === limit) await flushPassages();
+        }
+        await flushPassages();
+      }
+      await flushPassages();
+      if (pdfError) throw pdfError;
+    } finally {
+      await reader;
+      await preparePdfs.return(undefined);
     }
 
-    if (this.cancelled) {
-      this.emit({ phase: 'idle', currentTitle: '', message: 'Cancelled' });
+    if (this.cancelled || this.disposed) {
+      this.emit({ phase: 'idle', stage: undefined, currentTitle: '', message: 'Cancelled' });
     } else {
       this.emit({
-        phase: failedCount ? 'incomplete' : 'completed',
-        currentTitle: '',
-        message: failedCount
-          ? strings.indexIncomplete(processedItems, failedCount, this.progress.lastError || '')
-          : canEmbedNeural
-            ? strings.indexVectorDone(processedItems, embeddedChunks)
-            : strings.indexTextDone(processedItems, savedChunks),
+        phase: this.progress.failedCount ? 'incomplete' : 'completed', stage: undefined, currentTitle: '',
+        message: this.progress.failedCount
+          ? strings.indexIncomplete(this.progress.processedItems, this.progress.failedCount, this.progress.lastError || '')
+          : canEmbed ? strings.indexVectorDone(this.progress.processedItems, this.progress.embeddedChunks)
+            : strings.indexTextDone(this.progress.processedItems, savedChunks),
       });
     }
   }

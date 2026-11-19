@@ -280,3 +280,39 @@
   color: var(--zv-muted);
   line-height: 1.45;
 }
+
+.zv-pref-dialog {
+  color: var(--fill-primary, inherit);
+  background: var(--material-background, Canvas);
+  border: 1px solid var(--stroke-secondary, GrayText);
+  border-radius: 8px;
+  padding: 18px;
+  max-width: min(520px, 90vw);
+}
+
+.zv-model-index {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.zv-model-index > .zv-btn-row {
+  flex-shrink: 0;
+}
+
+.zv-progress-fill.is-indeterminate {
+  width: 24% !important;
+  animation: zv-indexing 1.8s ease-in-out infinite alternate;
+}
+
+@keyframes zv-indexing {
+  to { transform: translateX(315%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .zv-progress-fill.is-indeterminate {
+    animation: none;
+  }
+}

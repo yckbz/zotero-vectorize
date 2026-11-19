@@ -362,6 +362,17 @@ test('Local ONNX passage workers keep input order and report completed batches',
     assert.deepEqual((await embed).map((v) => v[0]), texts.map(Number));
     assert.deepEqual(progress, [8, 9, 17]);
 
+    const metadata = provider.embedMetadata(['18', '19']);
+    await flush();
+    assert.equal(requests.length, 2);
+    const [firstItem, secondItem] = requests.splice(0);
+    assert.notEqual(firstItem.worker, secondItem.worker);
+    assert.deepEqual(firstItem.texts, ['passage: 18']);
+    assert.deepEqual(secondItem.texts, ['passage: 19']);
+    secondItem.finish();
+    firstItem.finish();
+    assert.deepEqual((await metadata).map((vector) => vector[0]), [18, 19]);
+
     const interrupted = provider.embedPassages(texts);
     const interruptedCheck = assert.rejects(interrupted, /Test worker crashed/);
     await flush();

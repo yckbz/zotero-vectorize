@@ -39,6 +39,15 @@ export class ProviderManager {
     }
 
     const previousProvider = this.activeProvider;
+    const provider = this.createProvider(config);
+
+    this.activeProvider = provider;
+    this.activeSignature = sig;
+    await previousProvider?.dispose().catch(() => {});
+    return provider;
+  }
+
+  createProvider(config: PluginConfig): EmbeddingProvider {
     let provider: EmbeddingProvider;
     if (config.engine === 'ollama') {
       provider = new OllamaEmbeddingProvider({
@@ -64,9 +73,6 @@ export class ProviderManager {
       });
     }
 
-    this.activeProvider = provider;
-    this.activeSignature = sig;
-    await previousProvider?.dispose().catch(() => {});
     return provider;
   }
 
