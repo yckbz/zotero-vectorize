@@ -4,6 +4,7 @@ import { importTs } from './_helper.mjs';
 
 const { createMcpRequestHandler } = await importTs('src/zotero/mcp/tools.ts');
 const { McpController } = await importTs('src/zotero/mcp/controller.ts');
+const { startMcpListener } = await importTs('src/zotero/mcp/listener.ts');
 
 function fixture() {
   const paper = {
@@ -267,6 +268,75 @@ test('A second PDF read waits for the first while search continues independently
   }
   assert.equal((await first).structuredContent.pages[0].page, 2);
   assert.equal((await second).structuredContent.pages[0].page, 4);
+});
+
+test('Closing the HTTP socket aborts the tool and clears the disconnect watcher', { timeout: 5000 }, async (t) => {
+  const globals = { Services: globalThis.Services, Components: globalThis.Components, ChromeUtils: globalThis.ChromeUtils };
+  const { service } = fixture();
+  let handle;
+  class HttpServer {
+    registerPathHandler(_path, callback) { handle = callback; }
+    start() {}
+    stop(callback) { callback(); }
+  }
+  const mainThread = {};
+  globalThis.Services = { appShell: { hiddenDOMWindow: globalThis }, tm: { mainThread } };
+  globalThis.Components = { interfaces: { nsIAsyncInputStream: { WAIT_CLOSURE_ONLY: 1 } } };
+  globalThis.ChromeUtils = { importESModule: (uri) => uri.endsWith('httpd.sys.mjs')
+    ? { HttpServer }
+    : { NetUtil: { readInputStreamToString: (stream) => stream.body } },
+  };
+  let started;
+  const searchStarted = new Promise((resolve) => { started = resolve; });
+  service.search = async (_query, { signal }) => {
+    started(signal);
+    await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+    signal.throwIfAborted();
+  };
+
+  const stop = startMcpListener(service, '1.0.2', 23124, 'fixture-token');
+  t.after(async () => {
+    try {
+      await stop();
+    } finally {
+      Object.assign(globalThis, globals);
+    }
+  });
+  const body = JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'tools/call',
+    params: { name: 'search_papers', arguments: { query: 'hydrogen' } },
+  });
+  const headers = new Headers({
+    Host: '127.0.0.1:23124', Authorization: 'Bearer fixture-token',
+    'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
+    'MCP-Protocol-Version': '2025-11-25',
+  });
+  const statusLines = [];
+  let watcher;
+  let finish;
+  const finished = new Promise((resolve) => { finish = resolve; });
+  handle({
+    method: 'POST', httpVersion: '1.1',
+    hasHeader: (name) => headers.has(name), getHeader: (name) => headers.get(name),
+    bodyInputStream: { body, available: () => body.length },
+  }, {
+    _connection: { input: { asyncWait: (callback, flags, _count, target) => {
+      if (callback) {
+        assert.equal(flags, 1);
+        assert.equal(target, mainThread);
+      }
+      watcher = callback;
+    } } },
+    processAsync() {},
+    setStatusLine: (_version, status) => statusLines.push(status),
+    finish,
+  });
+  const signal = await searchStarted;
+  watcher.onInputStreamReady();
+  await finished;
+  assert.equal(signal.aborted, true);
+  assert.equal(watcher, null);
+  assert.deepEqual(statusLines, []);
 });
 
 test('MCP is lazy by default and waits for the port to close before reopening', async (t) => {

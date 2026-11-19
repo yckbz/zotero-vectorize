@@ -36,7 +36,7 @@ export interface ChromeUtilsNamespace {
 
 export interface ComponentsNamespace {
   classes: Record<string, { createInstance(iface: unknown): any; getService(iface: unknown): any }>;
-  interfaces: Record<string, unknown>;
+  interfaces: Record<string, unknown> & { nsIAsyncInputStream: { readonly WAIT_CLOSURE_ONLY: number } };
   utils: {
     cloneInto<T>(obj: T, targetScope: any, options?: Record<string, any>): T;
   };
@@ -44,6 +44,7 @@ export interface ComponentsNamespace {
 
 export interface ServicesNamespace {
   appShell: { hiddenDOMWindow: Window & typeof globalThis };
+  tm: { mainThread: unknown };
   wm: {
     getMostRecentWindow(type: string): any;
     getEnumerator(type: string): Iterable<any>;

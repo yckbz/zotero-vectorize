@@ -14,6 +14,17 @@ interface GeckoRequest {
 }
 
 interface GeckoResponse {
+  // httpd.sys.mjs exposes the underlying connection on its response object.
+  _connection: {
+    input: {
+      asyncWait(
+        callback: { onInputStreamReady(): void } | null,
+        flags: number,
+        count: number,
+        target: unknown
+      ): void;
+    };
+  };
   setStatusLine(version: string, status: number, reason: string): void;
   setHeader(name: string, value: string, merge: boolean): void;
   processAsync(): void;
@@ -81,8 +92,18 @@ export function startMcpListener(service: VectorizeService, version: string, por
     active.add(controller);
     response.processAsync();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const socketInput = response._connection.input;
+    let clientDisconnected = false;
     void (async () => {
       try {
+        // The request body is already buffered. Watch the socket for peer closure while the tool waits or runs.
+        socketInput.asyncWait({
+          onInputStreamReady() {
+            if (!active.has(controller)) return;
+            clientDisconnected = true;
+            controller.abort();
+          },
+        }, Components.interfaces.nsIAsyncInputStream.WAIT_CLOSURE_ONLY, 0, Services.tm.mainThread);
         const headers = new Headers();
         for (const name of ['Accept', 'Content-Type', 'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name']) {
           if (request.hasHeader(name)) headers.set(name, request.getHeader(name));
@@ -113,6 +134,7 @@ export function startMcpListener(service: VectorizeService, version: string, por
           stream.writeString(content);
         }
       } catch {
+        if (clientDisconnected) return;
         if (controller.signal.aborted) {
           sendStatus(request, response, lifetime.signal.aborted ? 503 : 504, lifetime.signal.aborted ? 'Service Unavailable' : 'Gateway Timeout');
         } else {
@@ -121,7 +143,11 @@ export function startMcpListener(service: VectorizeService, version: string, por
       } finally {
         clearTimeout(timer);
         active.delete(controller);
-        response.finish();
+        try {
+          socketInput.asyncWait(null, 0, 0, null);
+        } finally {
+          response.finish();
+        }
       }
     })().catch(() => {
       // A closed client socket must not escape into the Zotero plugin lifecycle.
