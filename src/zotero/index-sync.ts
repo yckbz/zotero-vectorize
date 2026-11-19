@@ -1,4 +1,4 @@
-import { fnv1a64 } from '../core/hash.ts';
+import { buildModelFingerprint, fnv1a64 } from '../core/hash.ts';
 import type { EmbeddingProvider } from '../engines/provider.ts';
 import type { EngineType, IndexProgress, PluginConfig } from '../types/vectorize.ts';
 import type { ZoteroItem } from '../types/zotero.d.ts';
@@ -79,6 +79,22 @@ export class IndexSync {
     return { role: this.role, phase: this.phase, lastReceived: manifest?.generation, model: manifest?.model };
   }
 
+  getSharedStats() {
+    const shared = this.active;
+    if (!shared) return null;
+    const items = shared.index.getAllItems();
+    const chunks = shared.index.getAllChunks();
+    const { engine, model, dimensions, generation } = shared.manifest;
+    return {
+      indexedItems: items.length,
+      vectorizedItems: items.reduce((count, item) => count + Number(item.vector !== null), 0),
+      indexedChunks: chunks.length,
+      vectorizedChunks: chunks.reduce((count, chunk) => count + Number(chunk.vector !== null), 0),
+      modelFingerprint: buildModelFingerprint(engine, model, dimensions),
+      publishedAt: generation,
+    };
+  }
+
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
@@ -86,6 +102,10 @@ export class IndexSync {
 
   private setPhase(phase: SyncPhase): void {
     this.phase = phase;
+    this.notifyStatus();
+  }
+
+  private notifyStatus(): void {
     for (const listener of this.listeners) {
       try { listener(); } catch { /* A preferences window cannot stop synchronization. */ }
     }
@@ -184,7 +204,10 @@ export class IndexSync {
       changed = true;
     }
     // Resolve keys again after item and file sync have finished.
-    if (changed) this.deps.onUpdate();
+    if (changed) {
+      this.deps.onUpdate();
+      this.notifyStatus();
+    }
   }
 
   private schedule(delay: number): void {
@@ -250,7 +273,7 @@ export class IndexSync {
       throw new SyncIssue('webdav');
     }
     if (sync.Runner.syncInProgress) {
-      this.setPhase(this.active ? 'ready' : 'waiting');
+      this.setPhase('waiting');
       return;
     }
     if (role === 'receive' && (manual || (!this.active && this.waitingForFirstSnapshot))) {
@@ -471,16 +494,16 @@ export class IndexSync {
     if (!this.current(epoch, context)) return;
     if (!item) {
       this.releaseLocalIndexing();
-      this.setPhase(this.active ? 'ready' : 'waiting');
+      this.setPhase('waiting');
       return;
     }
     const sync = Zotero.Sync!;
     if (item.attachmentSyncState === sync.Storage.Local.SYNC_STATE_IN_CONFLICT) throw new SyncIssue('conflict');
     const dest = this.pathFor(item);
     // The native runner checks remote attachment metadata before downloading.
-    await sync.Runner.downloadFile(item);
+    const result = await sync.Runner.downloadFile(item);
     if (!this.current(epoch, context)) return;
-    if (!await IOUtils.exists(dest)) throw new SyncIssue('webdav');
+    if (result === false || !await IOUtils.exists(dest)) throw new SyncIssue('webdav');
     if (this.active && item.attachmentSyncedHash === this.active.digest && !this.needsReconcile) {
       this.setPhase('ready');
       return;
@@ -494,7 +517,9 @@ export class IndexSync {
       if (this.active?.digest !== digest || this.needsReconcile) {
         await this.accept(stage, context, epoch, true, digest);
       }
-      if (this.current(epoch, context)) this.setPhase(this.active ? 'ready' : 'waiting');
+      if (this.current(epoch, context)) {
+        this.setPhase(this.active?.digest === digest && !this.needsReconcile ? 'ready' : 'waiting');
+      }
     } finally {
       await IOUtils.remove(stage, { ignoreAbsent: true });
     }
@@ -540,23 +565,25 @@ export class IndexSync {
         this.schedule(500);
         return;
       }
-      this.clearReceived();
-      this.received = { ...received, provider, digest: hash };
       adopted = true;
-      this.releaseLocalIndexing();
       this.needsReconcile = false;
-      this.deps.onUpdate();
+      this.setReceived({ ...received, provider, digest: hash });
+      this.releaseLocalIndexing();
     } finally {
       if (!adopted) void provider.dispose().catch(() => {});
     }
   }
 
   private clearReceived(): void {
-    if (!this.received) return;
+    if (this.received) this.setReceived(null);
+  }
+
+  private setReceived(received: IndexSync['received']): void {
     const previous = this.received;
-    this.received = null;
-    void previous.provider.dispose().catch(() => {});
+    this.received = received;
+    void previous?.provider.dispose().catch(() => {});
     this.deps.onUpdate();
+    this.notifyStatus();
   }
 
   private stopObservers(): void {

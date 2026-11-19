@@ -99,6 +99,8 @@ class VectorizePreferencesController {
       this.onLoad(document.getElementById('zv-prefpane') || undefined);
       return;
     }
+    const svc = getService();
+    if (svc?.indexSync) this.updateSharedIndex(svc);
     void this.refreshStatsAndStatus();
   }
 
@@ -199,6 +201,31 @@ class VectorizePreferencesController {
     if (this.statsTimer !== null) {
       clearTimeout(this.statsTimer);
       this.statsTimer = null;
+    }
+  }
+
+  private updateSharedIndex(svc: VectorizeService): void {
+    const card = document.getElementById('zv-shared-index');
+    if (!card) return;
+    const stats = svc.indexSync.getSharedStats();
+    card.hidden = !stats;
+    if (!stats) return;
+
+    const config = svc.getConfig();
+    const s = getStrings(config);
+    const { phase } = svc.indexSync.getStatus();
+    const fields = {
+      'zv-shared-items': `${stats.vectorizedItems} / ${stats.indexedItems}`,
+      'zv-shared-chunks': `${stats.vectorizedChunks} / ${stats.indexedChunks}`,
+      'zv-shared-model': stats.modelFingerprint,
+      'zv-shared-published': new Date(stats.publishedAt).toLocaleString(resolveUiLocale(config)),
+      'zv-shared-index-cache': phase === 'ready' ? '' : phase === 'working' ? s.prefSharedChecking : s.prefSharedCached,
+    };
+    for (const [id, value] of Object.entries(fields)) {
+      const node = document.getElementById(id);
+      if (!node) continue;
+      node.textContent = value;
+      if (id === 'zv-shared-model' || id === 'zv-shared-published') node.title = value;
     }
   }
 
@@ -336,6 +363,17 @@ class VectorizePreferencesController {
       this.setFeedback(s.prefMsgCleared, 'ok');
       await this.refreshStatsAndStatus();
     });
+
+    this.container.appendChild(el(doc, 'section', { id: 'zv-shared-index', className: 'zv-pref-card', hidden: true }, [
+      el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefSharedIndexTitle]),
+      el(doc, 'div', { className: 'zv-stat-grid' }, [
+        statCard(s.prefSharedItems, 'zv-shared-items', '—'),
+        statCard(s.prefSharedChunks, 'zv-shared-chunks', '—'),
+        statCard(s.prefActiveModel, 'zv-shared-model', '—'),
+        statCard(s.prefSharedPublishedAt, 'zv-shared-published', '—'),
+      ]),
+      el(doc, 'div', { id: 'zv-shared-index-cache', className: 'zv-progress-text', role: 'status' }),
+    ]));
 
     this.container.appendChild(
       el(doc, 'div', { className: 'zv-pref-card' }, [
@@ -743,8 +781,9 @@ class VectorizePreferencesController {
         const status = sync.getStatus();
         role.value = status.role;
         button.disabled = status.role === 'off' || status.phase === 'working';
-        state.textContent = [s.prefIndexSyncState[status.phase], status.model,
-          status.lastReceived ? new Date(status.lastReceived).toLocaleString() : ''].filter(Boolean).join(' · ');
+        state.textContent = status.role === 'receive' && status.phase === 'ready'
+          ? s.prefSharedReady : s.prefIndexSyncState[status.phase];
+        this.updateSharedIndex(svc);
       };
       role.addEventListener('change', () => {
         const value = role.value;

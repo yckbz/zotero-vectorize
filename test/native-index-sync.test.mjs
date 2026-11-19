@@ -104,6 +104,7 @@ async function setup(t) {
     };
     async function downloadFile(item) {
       if (transport.beforeDownload) await transport.beforeDownload();
+      if (transport.downloadUnavailable) return false;
       if (transport.offline) throw new Error('offline');
       if (item.key === 'ATTACH01') {
         await fs.writeFile(pdfFile, pdfBytes);
@@ -241,6 +242,57 @@ async function setup(t) {
   }
   return { createDevice, transport, jumpToSearchHit };
 }
+
+test('shared coverage follows the accepted version through updates, outages, and role changes', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('subscriber', 100, 'receive');
+  const destination = await receiver.start();
+  const changes = [];
+  destination.indexSync.subscribe(() => changes.push(destination.indexSync.getSharedStats()));
+  await destination.indexSync.syncNow();
+  const first = destination.indexSync.getSharedStats();
+  assert.deepEqual(first, { indexedItems: 1, vectorizedItems: 1, indexedChunks: 2, vectorizedChunks: 2,
+    modelFingerprint: 'local-onnx:Xenova/paraphrase-multilingual-MiniLM-L12-v2:2', publishedAt: first.publishedAt });
+
+  const [manifest, ...records] = String(transport.bytes).trimEnd().split('\n').map(JSON.parse);
+  const [item, pdf, chunk] = records;
+  assert.deepEqual([item[0], pdf[0], chunk[0]], ['item', 'pdf', 'chunk']);
+  item[2] = '0'.repeat(16); // Receiver has a different version of this item's metadata.
+  manifest.generation++;
+  transport.bytes = Buffer.from([manifest, item, pdf, chunk, ['end', 3]].map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const localRows = await destination.store.loadAll();
+  await destination.indexSync.syncNow();
+  const second = { ...first, publishedAt: manifest.generation, vectorizedItems: 0, indexedChunks: 1, vectorizedChunks: 1 };
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.deepEqual(changes.at(-1), second);
+
+  receiver.zotero.Sync.Runner.syncInProgress = true;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'waiting');
+  assert.deepEqual(changes.at(-1), second);
+  receiver.zotero.Sync.Runner.syncInProgress = false;
+
+  transport.downloadUnavailable = true;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'webdav');
+  assert.deepEqual(changes.at(-1), second);
+  assert.deepEqual(await destination.store.loadAll(), localRows);
+
+  await destination.clearIndex();
+  assert.deepEqual(destination.indexSync.getSharedStats(), second);
+  receiver.items.get(101).deleted = true;
+  for (const { notify } of receiver.observers.values()) notify('trash', 'item', [101]);
+  assert.deepEqual(changes.at(-1), { ...second, indexedItems: 0, indexedChunks: 0, vectorizedChunks: 0 });
+  destination.indexSync.setRole('off');
+  assert.equal(destination.indexSync.getStatus().phase, 'off');
+  assert.equal(changes.at(-1), null);
+});
 
 test('Zotero publishes one personal-library attachment and a fresh profile searches it without embedding documents', async (t) => {
   const { createDevice, transport, jumpToSearchHit } = await setup(t);

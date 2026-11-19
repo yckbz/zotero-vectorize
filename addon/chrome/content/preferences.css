@@ -116,6 +116,11 @@
   gap: 12px;
 }
 
+.zv-pref-card[hidden],
+#zv-shared-index-cache:empty {
+  display: none;
+}
+
 .zv-pref-h2 {
   margin: 0;
   font-size: 14px;

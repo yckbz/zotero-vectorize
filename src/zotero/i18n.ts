@@ -81,6 +81,13 @@ export type LocaleStrings = {
   similarPapersLoading: string;
   // Preferences
   prefStatusCardTitle: string;
+  prefSharedIndexTitle: string;
+  prefSharedItems: string;
+  prefSharedChunks: string;
+  prefSharedPublishedAt: string;
+  prefSharedReady: string;
+  prefSharedChecking: string;
+  prefSharedCached: string;
   prefIndexReadError: (detail: string) => string;
   prefEngineSectionTitle: string;
   prefIndexingSectionTitle: string;
@@ -197,7 +204,7 @@ const ZH_CN: LocaleStrings = {
   prefRestoreNativeHint: '恢复将替换插件中的所有模型索引和全文缓存。',
   prefNativeRestored: '已恢复 SQLite 向量库，正在检查文献变更。',
   prefNativeExported: '已导出 SQLite 向量库。',
-  prefClearAllHint: '这会删除全部模型向量和全文缓存。',
+  prefClearAllHint: '这会删除本机索引中的全部模型向量和全文缓存。',
   prefSwitchModelHint: (model) => `是否保留 ${model} 的向量？`,
   prefDeleteModelHint: (model) => `删除 ${model} 的题录和全文向量。共享的题录与 PDF 切片会保留。`,
   prefModelCoverage: (i, ni, c, nc) => `题录 ${i}/${ni} · 全文 ${c}/${nc}`,
@@ -221,7 +228,14 @@ const ZH_CN: LocaleStrings = {
   similarPapersHeader: '语义相似文献',
   similarPapersEmpty: '暂无足够相似度高的文献或尚未完成索引',
   similarPapersLoading: '正在计算语义相似度…',
-  prefStatusCardTitle: '向量索引状态与控制',
+  prefStatusCardTitle: '本机向量索引状态与控制',
+  prefSharedIndexTitle: '共享索引 · 我的文库',
+  prefSharedItems: '文献已向量化 / 已载入',
+  prefSharedChunks: '分块已向量化 / 已载入',
+  prefSharedPublishedAt: '快照发布时间',
+  prefSharedReady: '共享索引已载入。',
+  prefSharedChecking: '正在检查更新，继续使用当前已载入的版本。',
+  prefSharedCached: '正在使用上次同步的版本。',
   prefIndexReadError: (detail) => `无法读取本机向量索引。请确认插件版本与索引匹配。 ${detail}`,
   prefEngineSectionTitle: 'Embedding 向量引擎',
   prefIndexingSectionTitle: '文档切片与自动后台索引',
@@ -348,7 +362,7 @@ const EN_US: LocaleStrings = {
   prefRestoreNativeHint: 'Restoring replaces all model indexes and cached passages in this plugin.',
   prefNativeRestored: 'SQLite index restored. Checking for library changes.',
   prefNativeExported: 'SQLite index exported.',
-  prefClearAllHint: 'This deletes all model vectors and cached passages.',
+  prefClearAllHint: 'This deletes all model vectors and cached passages from this device’s local index.',
   prefSwitchModelHint: (model) => `Keep the saved vectors for ${model}?`,
   prefDeleteModelHint: (model) => `Delete the metadata and full-text vectors for ${model}. Shared metadata and PDF passages will be kept.`,
   prefModelCoverage: (i, ni, c, nc) => `Metadata ${i}/${ni} · Passages ${c}/${nc}`,
@@ -372,7 +386,14 @@ const EN_US: LocaleStrings = {
   similarPapersHeader: 'Semantically Similar Papers',
   similarPapersEmpty: 'No similar papers indexed yet',
   similarPapersLoading: 'Computing semantic neighbors…',
-  prefStatusCardTitle: 'Vector Index Status & Controls',
+  prefStatusCardTitle: 'Local Vector Index & Controls',
+  prefSharedIndexTitle: 'Shared Index · My Library',
+  prefSharedItems: 'Items with vectors / loaded',
+  prefSharedChunks: 'Passages with vectors / loaded',
+  prefSharedPublishedAt: 'Snapshot published',
+  prefSharedReady: 'Shared index loaded.',
+  prefSharedChecking: 'Checking for updates. The loaded version is still in use.',
+  prefSharedCached: 'Using the last synced version.',
   prefIndexReadError: (detail) => `Unable to read the local vector index. Check that the plugin version matches the index. ${detail}`,
   prefEngineSectionTitle: 'Embedding Engine',
   prefIndexingSectionTitle: 'Chunking & Silent Background Indexing',

@@ -491,10 +491,14 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
   let vectorizedChunks = 0;
   let reads = 0;
   let indexError;
+  let sharedStats = null;
+  let phase = 'waiting';
   const coverage = { textContent: '' };
   const feedback = { textContent: '', style: {} };
   const indexNotice = { textContent: '' };
-  const elements = { 'zv-stat-chunks': coverage, 'zv-pref-feedback': feedback, 'zv-index-read-error': indexNotice };
+  const elements = { 'zv-stat-chunks': coverage, 'zv-pref-feedback': feedback, 'zv-index-read-error': indexNotice,
+    'zv-shared-index': { hidden: true }, 'zv-shared-items': {}, 'zv-shared-chunks': {}, 'zv-shared-model': {},
+    'zv-shared-published': {}, 'zv-shared-index-cache': {} };
   globalThis.document = {
     getElementById: (id) => elements[id] ?? null,
   };
@@ -503,6 +507,7 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
     cancelAnimationFrame: () => {},
   };
   const service = {
+    indexSync: { getSharedStats: () => sharedStats, getStatus: () => ({ phase }) },
     store: { subscribeWrites: (listener) => {
       onWrite = listener;
       return () => { onWrite = undefined; };
@@ -560,6 +565,29 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
   indexError = undefined;
   await controller.refreshStatsAndStatus();
   assert.equal(indexNotice.textContent, '');
+
+  controller.updateSharedIndex(service);
+  assert.equal(elements['zv-shared-index'].hidden, true);
+  sharedStats = { indexedItems: 12, vectorizedItems: 10, indexedChunks: 87, vectorizedChunks: 82,
+    modelFingerprint: 'ollama:shared:1024', publishedAt: 1795093851215 };
+  phase = 'ready';
+  controller.updateSharedIndex(service);
+  assert.equal(elements['zv-shared-index'].hidden, false);
+  assert.equal(elements['zv-shared-items'].textContent, '10 / 12');
+  assert.equal(elements['zv-shared-chunks'].textContent, '82 / 87');
+  assert.equal(elements['zv-shared-model'].title, 'ollama:shared:1024');
+  assert.equal(elements['zv-shared-published'].textContent, new Date(sharedStats.publishedAt).toLocaleString('en-US'));
+  assert.equal(coverage.textContent, '43 / 43');
+  assert.equal(elements['zv-shared-index-cache'].textContent, '');
+  phase = 'webdav';
+  controller.updateSharedIndex(service);
+  assert.equal(elements['zv-shared-index-cache'].textContent, 'Using the last synced version.');
+  assert.equal(elements['zv-shared-chunks'].textContent, '82 / 87');
+  sharedStats = null;
+  phase = 'off';
+  controller.updateSharedIndex(service);
+  assert.equal(elements['zv-shared-index'].hidden, true);
+  assert.equal(coverage.textContent, '43 / 43');
 });
 
 test('registerSimilarPapersSection renders .zv-item-pane-box and .zv-similar-card and uses valid FTL attributes', async () => {
