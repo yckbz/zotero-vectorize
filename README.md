@@ -34,6 +34,16 @@ The package declares Zotero 7.0 as its minimum version. Desktop integration has 
 
 Click **Apply Model Settings** to switch models. Choose whether to keep the previous vectors. Returning to a saved model loads its vectors and checks for library changes. **Vector Indexes** lists coverage for each saved model and lets you delete its vectors.
 
+## Sync vector indexes through Zotero
+
+Set up WebDAV attachment sync for My Library on desktop devices signed in to the same Zotero account. In **Zotero Settings → Zotero Vectorize → Sync vector indexes through Zotero**, choose **Publish this device’s index** on one device and **Receive the shared index** on the others. Sync is off by default. Use **Check sync now** to see its status.
+
+The publisher updates one stored attachment in My Library through Zotero. Each publication transfers the current model’s vectors, PDF passages, and index and search settings together. The bundle limit is 512 MiB before WebDAV compression.
+
+ONNX and Ollama models require a matching revision. For OpenAI-compatible models, configure the same Base URL, model, and output dimensions on each device and enter an API key separately on every device. When dimensions are set to `0`, the plugin checks the dimensions actually returned by the service. The attachment contains an endpoint fingerprint for matching. Credentials, paths, and connection settings stay on each device.
+
+Receivers keep the last validated shared index alongside their own local indexes and settings. Existing indexes and manual local indexing remain available when WebDAV is unavailable. A receiver with a usable shared index suspends automatic indexing for My Library. Group libraries continue to use local indexes. Opening a shared passage verifies the PDF version before jumping to its page.
+
 ## Use Zotero Vectorize from an agent
 
 In **Zotero Settings → Zotero Vectorize → Agent access (MCP)**, turn on **Enable local MCP**. Use **Copy Codex configuration** to add the server to your user-level `~/.codex/config.toml`, then restart Codex. The copied configuration contains the access token. Keep Zotero running while using the server.
@@ -58,7 +68,7 @@ When a legacy plugin index is in the same Zotero data directory, the plugin migr
 
 ## Build from source
 
-Install Node.js 22 or later and make Python 3 available as `python3`. From the repository root, run:
+Install Node.js 22 or later and Python 3. Use `python` on Windows and `python3` on macOS and Linux. From the repository root, run:
 
 ```sh
 npm ci

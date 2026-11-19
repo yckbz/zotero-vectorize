@@ -11,7 +11,10 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,6 +27,7 @@ jobs:
       - run: npm ci
       - run: npm run verify
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
           name: zotero-vectorize-plugin
           path: dist/zotero-vectorize.xpi

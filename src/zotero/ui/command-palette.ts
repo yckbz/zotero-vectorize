@@ -62,7 +62,7 @@ export class CommandPalette {
   private lastResponse: SearchResponse | null = null;
   private searchError = '';
   private lastStatus: EngineHealthStatus | null = null;
-  private lastStats: StoreStats | null = null;
+  private lastStats: Pick<StoreStats, 'indexedItems' | 'indexedChunks'> | null = null;
   private lastProgress: IndexProgress | null = null;
   private unsubProgress: (() => void) | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -72,7 +72,7 @@ export class CommandPalette {
   constructor(options: { win: any; service: VectorizeService }) {
     this.win = options.win;
     this.service = options.service;
-    this.currentMode = this.service.getConfig().defaultSearchMode;
+    this.currentMode = this.service.getSearchConfig().defaultSearchMode;
   }
 
   attachShortcut(): void {
@@ -116,7 +116,7 @@ export class CommandPalette {
     this.query = initialQuery;
     this.lastResponse = null;
     this.searchError = '';
-    this.currentMode = this.service.getConfig().defaultSearchMode;
+    this.currentMode = this.service.getSearchConfig().defaultSearchMode;
     this.selectedIndex = 0;
     this.buildDom();
     this.inputEl?.focus();
@@ -132,8 +132,8 @@ export class CommandPalette {
     if (this.query.trim()) void this.runSearch(this.query);
     const input = this.inputEl;
     const [status, stats] = await Promise.all([
-      this.service.getEngineStatus(),
-      this.service.getStats(),
+      this.service.getSearchEngineStatus(),
+      this.service.getSearchCoverage(),
     ]);
     if (this.inputEl !== input) return;
     if (!this.lastResponse) this.lastStatus = status;
@@ -385,7 +385,7 @@ export class CommandPalette {
       const filterIDs = this.scopeCollectionOnly ? await getActiveCollectionItemIDs(this.win) : null;
       if (signal.aborted) return;
       const [status, response] = await Promise.all([
-        this.service.getEngineStatus(),
+        this.service.getSearchEngineStatus(),
         this.service.search(clean, { mode: this.currentMode, filterItemIDs: filterIDs, signal }),
       ]);
       if (signal.aborted || !this.isOpen || this.query.trim() !== clean) return;

@@ -260,13 +260,13 @@ test('LocalOnnxProvider downloads assets with mirror fallback and drives worker 
     modelId: 'Xenova/multilingual-e5-small',
     mirror: 'hf-mirror',
     dataDir: '/tmp/zdata',
-    workerScriptUrl: 'file:///workers/onnx-worker.js',
+    workerScriptUrl: 'resource://zotero-vectorize-workers/onnx-worker.mjs',
     fs: fsMock,
     workerFactory: () => new MockWorker(),
     fetchFn: async (url) => {
       fetchedUrls.push(String(url));
-      // Simulate primary jsdelivr failing so it falls back to npmmirror
-      if (String(url).includes('cdn.jsdelivr.net')) {
+      // Verify model mirror fallback independently of the packaged runtime.
+      if (String(url).includes('hf-mirror.com')) {
         return { ok: false, status: 502, headers: new Headers(), arrayBuffer: async () => new ArrayBuffer(0) };
       }
       return {
@@ -281,12 +281,10 @@ test('LocalOnnxProvider downloads assets with mirror fallback and drives worker 
   const beforeStatus = await provider.getStatus();
   assert.equal(beforeStatus.needsSetup, true);
 
-  await provider.downloadModelAndRuntime();
+  await provider.downloadModel();
   assert.ok(fetchedUrls.some((u) => u.includes('hf-mirror.com')));
-  assert.ok(fetchedUrls.some((u) => u.includes('registry.npmmirror.com')));
-  assert.ok(fetchedUrls.some((u) => u.endsWith('/ort.bundle.min.mjs')));
-  assert.ok(!fetchedUrls.some((u) => u.includes('ort.wasm.bundle.min.mjs')));
-  assert.ok(fetchedUrls.some((u) => u.endsWith('/ort-wasm-simd-threaded.wasm')));
+  assert.ok(fetchedUrls.some((u) => u.includes('huggingface.co')));
+  assert.ok(fetchedUrls.every((u) => u.includes('/resolve/main/')));
 
   const afterStatus = await provider.getStatus();
   assert.equal(afterStatus.ready, true);
@@ -303,7 +301,7 @@ test('Local ONNX passage workers keep input order and report completed batches',
   const provider = new LocalOnnxProvider({
     modelId: 'Xenova/multilingual-e5-small',
     dataDir: '/tmp/zdata',
-    workerScriptUrl: 'file:///workers/onnx-worker.js',
+    workerScriptUrl: 'resource://zotero-vectorize-workers/onnx-worker.mjs',
     fs: {
       join: (...parts) => parts.join('/'),
       exists: async () => true,
@@ -397,8 +395,6 @@ test('LocalOnnxProvider skips model download when customModelDir already has onn
   const memFiles = new Map([
     ['/custom-model/tokenizer.json', new TextEncoder().encode('{}')],
     ['/custom-model/onnx/model_quantized.onnx', new Uint8Array([9, 9])],
-    ['/tmp/zdata/zotero-vectorize/runtime/ort.bundle.min.mjs', new TextEncoder().encode('export default {}')],
-    ['/tmp/zdata/zotero-vectorize/runtime/ort-wasm-simd-threaded.wasm', new Uint8Array([0])],
   ]);
   const fsMock = {
     exists: async (p) => memFiles.has(p),
@@ -430,7 +426,7 @@ test('LocalOnnxProvider skips model download when customModelDir already has onn
     modelId: 'Xenova/multilingual-e5-small',
     customModelDir: '/custom-model',
     dataDir: '/tmp/zdata',
-    workerScriptUrl: 'file:///workers/onnx-worker.js',
+    workerScriptUrl: 'resource://zotero-vectorize-workers/onnx-worker.mjs',
     fs: fsMock,
     workerFactory: () => new MockWorker(),
     fetchFn: async () => {
@@ -440,7 +436,7 @@ test('LocalOnnxProvider skips model download when customModelDir already has onn
   });
 
   assert.equal(await provider.hasInstalledAssets(), true);
-  await provider.downloadModelAndRuntime();
+  await provider.downloadModel();
   assert.equal(fetchCount, 0);
   await provider.dispose();
 });
@@ -456,8 +452,6 @@ test('LocalOnnxProvider and DEFAULT_CONFIG default to Xenova/paraphrase-multilin
     const memFiles = new Map([
       [`/zdata/zotero-vectorize/models/${slug}/model_quantized.onnx`, new Uint8Array([1, 2])],
       [`/zdata/zotero-vectorize/models/${slug}/tokenizer.json`, new TextEncoder().encode('{}')],
-      ['/zdata/zotero-vectorize/runtime/ort.bundle.min.mjs', new TextEncoder().encode('export default {}')],
-      ['/zdata/zotero-vectorize/runtime/ort-wasm-simd-threaded.wasm', new Uint8Array([0])],
     ]);
     const fsMock = {
       exists: async (p) => memFiles.has(p),
@@ -492,7 +486,7 @@ test('LocalOnnxProvider and DEFAULT_CONFIG default to Xenova/paraphrase-multilin
     const provider = new LocalOnnxProvider({
       modelId,
       dataDir: '/zdata',
-      workerScriptUrl: 'file:///workers/onnx-worker.js',
+      workerScriptUrl: 'resource://zotero-vectorize-workers/onnx-worker.mjs',
       fs: fsMock,
       workerFactory: () => new CapturingWorker(),
     });
@@ -507,110 +501,57 @@ test('LocalOnnxProvider and DEFAULT_CONFIG default to Xenova/paraphrase-multilin
   assert.equal(initPayloads[2].poolingMode, 'mean');
 });
 
-test('onnx-worker handleWorkerMessage initializes Blob ORT module, runs mean-pooled inference, and transfers buffers', async () => {
+test('ONNX module worker uses the packaged WASM, pools embeddings, and transfers buffers', async () => {
   const { handleWorkerMessage } = await importTs('src/workers/onnx-worker.ts');
-  const fakeOrtSource = `
-    export const env = { wasm: {} };
-    export class Tensor {
+  const runtime = {
+    env: { wasm: {} },
+    Tensor: class Tensor {
       constructor(type, data, dims) { this.type = type; this.data = data; this.dims = dims; }
-    }
-    export const InferenceSession = {
-      async create() {
+    },
+    InferenceSession: {
+      async create(_model, options) {
+        assert.deepEqual(options.executionProviders, ['wasm']);
         return {
           inputNames: ['input_ids', 'attention_mask'],
           outputNames: ['last_hidden_state'],
           async run(feeds) {
             const [batchSize, seqLen] = feeds.input_ids.dims;
-            const hidden = 2;
-            const out = new Float32Array(batchSize * seqLen * hidden);
-            for (let b = 0; b < batchSize; b++) {
-              for (let t = 0; t < seqLen; t++) {
-                out[(b * seqLen + t) * hidden + 0] = 3;
-                out[(b * seqLen + t) * hidden + 1] = 4;
-              }
-            }
-            return { last_hidden_state: { data: out, dims: [batchSize, seqLen, hidden] } };
+            const values = Float32Array.from({ length: batchSize * seqLen * 2 }, (_, i) => i % 2 ? 4 : 3);
+            return { last_hidden_state: { data: values, dims: [batchSize, seqLen, 2] } };
           },
-          async release() {}
+          async release() {},
         };
-      }
-    };
-  `;
+      },
+    },
+  };
   const tokenizerJson = JSON.stringify({
     model: {
       type: 'WordPiece',
       vocab: { '[PAD]': 0, '[UNK]': 1, '[CLS]': 2, '[SEP]': 3, hello: 4, world: 5 },
     },
   });
+  const { result: init } = await handleWorkerMessage({
+    id: 1, type: 'init', payload: {
+      modelBinary: new Uint8Array([1, 2, 3, 4]).buffer, tokenizerJson, poolingMode: 'mean', maxSeqLength: 16,
+    },
+  }, runtime);
+  assert.equal(init.dimensions, 2);
+  assert.match(runtime.env.wasm.wasmPaths.wasm, /\/ort-wasm-simd-threaded\.wasm$/);
+  assert.equal(runtime.env.wasm.numThreads, 1);
+  assert.equal(runtime.env.wasm.proxy, false);
 
-  // Node ESM loader supports data: URLs rather than blob: URLs; bridge createObjectURL in this unit test
-  const origCreate = URL.createObjectURL;
-  const origRevoke = URL.revokeObjectURL;
-  const origImportScripts = globalThis.importScripts;
-  const blobPayloads = new Map();
-  let lastCreatedWasmUrl = '';
-  URL.createObjectURL = (blob) => {
-    if (blob.type === 'text/javascript') {
-      const patched = fakeOrtSource.replace(
-        'async create() {',
-        'async create() { globalThis.__zvCapturedWasmEnv = { ...env.wasm };'
-      );
-      const dataUrl = `data:text/javascript;base64,${Buffer.from(patched, 'utf8').toString('base64')}`;
-      blobPayloads.set(dataUrl, blob);
-      return dataUrl;
-    }
-    lastCreatedWasmUrl = origCreate(blob);
-    return lastCreatedWasmUrl;
-  };
-  URL.revokeObjectURL = (u) => {
-    if (!blobPayloads.delete(u)) origRevoke(u);
-  };
-
-  try {
-    // In Web Worker context (importScripts defined), wasmPaths.wasm must be used and wasmBinary omitted
-    globalThis.importScripts = () => {};
-    const initRes = await handleWorkerMessage({
-      id: 1,
-      type: 'init',
-      payload: {
-        ortModuleCode: fakeOrtSource,
-        wasmBinary: new Uint8Array([0, 97, 115, 109]).buffer,
-        modelBinary: new Uint8Array([1, 2, 3, 4]).buffer,
-        tokenizerJson,
-        poolingMode: 'mean',
-        maxSeqLength: 16,
-      },
-    });
-    assert.equal(initRes.result.ok, true);
-    assert.equal(initRes.result.dimensions, 2);
-    assert.equal(globalThis.__zvCapturedWasmEnv?.wasmPaths?.wasm, lastCreatedWasmUrl);
-    assert.equal(globalThis.__zvCapturedWasmEnv?.wasmBinary, undefined);
-
-    const embRes = await handleWorkerMessage({
-      id: 2,
-      type: 'embed',
-      payload: { texts: ['hello', 'world'], maxSeqLength: 16 },
-    });
-    assert.equal(embRes.result.vectors.length, 2);
-    assert.equal(embRes.transfer.length, 2);
-    assert.ok(Math.abs(embRes.result.vectors[0][0] - 0.6) < 1e-5);
-    assert.ok(Math.abs(embRes.result.vectors[0][1] - 0.8) < 1e-5);
-
-    const dispRes = await handleWorkerMessage({ id: 3, type: 'dispose' });
-    assert.equal(dispRes.result.ok, true);
-  } finally {
-    delete globalThis.__zvCapturedWasmEnv;
-    if (origImportScripts === undefined) delete globalThis.importScripts;
-    else globalThis.importScripts = origImportScripts;
-    URL.createObjectURL = origCreate;
-    URL.revokeObjectURL = origRevoke;
-  }
+  const { result: result, transfer } = await handleWorkerMessage({
+    id: 2, type: 'embed', payload: { texts: ['hello', 'world'], maxSeqLength: 16 },
+  }, runtime);
+  assert.equal(result.vectors.length, 2);
+  assert.equal(transfer.length, 2);
+  assert.ok(Math.abs(result.vectors[0][0] - 0.6) < 1e-5);
+  assert.ok(Math.abs(result.vectors[0][1] - 0.8) < 1e-5);
+  assert.equal((await handleWorkerMessage({ id: 3, type: 'dispose' }, runtime)).result.ok, true);
 });
 
-test('LocalOnnxProvider default workerFactory loads jar URL containing @ via Zotero.File.getResourceAsync and revokes Blob URL on dispose', async () => {
+test('LocalOnnxProvider launches a packaged module Worker and settles inference when disposed', async () => {
   const memFiles = new Map([
-    ['/zdata/zotero-vectorize/runtime/ort.bundle.min.mjs', new TextEncoder().encode('export default {}')],
-    ['/zdata/zotero-vectorize/runtime/ort-wasm-simd-threaded.wasm', new Uint8Array([0, 97, 115, 109])],
     ['/zdata/zotero-vectorize/models/Xenova--multilingual-e5-small/model_quantized.onnx', new Uint8Array([1, 2])],
     ['/zdata/zotero-vectorize/models/Xenova--multilingual-e5-small/tokenizer.json', new TextEncoder().encode('{}')],
   ]);
@@ -626,33 +567,13 @@ test('LocalOnnxProvider default workerFactory loads jar URL containing @ via Zot
     join: (...parts) => parts.join('/'),
   };
 
-  const workerScriptUrl = 'jar:file:///tmp/extensions/zotero-vectorize@yckbz.org.xpi!/workers/onnx-worker.js';
-  const origZotero = globalThis.Zotero;
+  const workerScriptUrl = 'resource://zotero-vectorize-workers/onnx-worker.mjs';
   const origWorker = globalThis.Worker;
-  const origCreate = URL.createObjectURL;
-  const origRevoke = URL.revokeObjectURL;
-
-  const resourceCalls = [];
-  const createdWorkerUrls = [];
-  const revokedUrls = [];
+  const createdWorkers = [];
   let suspendEmbedding;
-
-  globalThis.Zotero = {
-    File: {
-      getResourceAsync: async (u) => {
-        resourceCalls.push(u);
-        return '/* worker bundle */';
-      },
-      getContentsFromURL: () => {
-        throw new Error('XHR should not be needed when getResourceAsync succeeds');
-      },
-    },
-  };
-  URL.createObjectURL = () => 'blob:zotero-test/worker-1';
-  URL.revokeObjectURL = (u) => { revokedUrls.push(u); };
   globalThis.Worker = class FakeWorker {
-    constructor(url) {
-      createdWorkerUrls.push(url);
+    constructor(url, options) {
+      createdWorkers.push({ url, options });
       this.listeners = new Map();
     }
     addEventListener(t, fn) { this.listeners.set(t, fn); }
@@ -682,20 +603,14 @@ test('LocalOnnxProvider default workerFactory loads jar URL containing @ via Zot
     const res = await provider.testConnection();
     assert.equal(res.ok, true);
     assert.equal(res.dimensions, 3);
-    assert.deepEqual(resourceCalls, [workerScriptUrl]);
-    assert.deepEqual(createdWorkerUrls, ['blob:zotero-test/worker-1']);
+    assert.deepEqual(createdWorkers, [{ url: workerScriptUrl, options: { type: 'module' } }]);
     const started = new Promise((resolve) => { suspendEmbedding = resolve; });
     const interrupted = assert.rejects(provider.embedQuery('in flight'), /provider was closed/);
     await started;
     await provider.dispose();
     await interrupted;
-    assert.deepEqual(revokedUrls, ['blob:zotero-test/worker-1']);
   } finally {
-    if (origZotero === undefined) delete globalThis.Zotero;
-    else globalThis.Zotero = origZotero;
     if (origWorker === undefined) delete globalThis.Worker;
     else globalThis.Worker = origWorker;
-    URL.createObjectURL = origCreate;
-    URL.revokeObjectURL = origRevoke;
   }
 });

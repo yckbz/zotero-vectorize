@@ -131,6 +131,7 @@ export interface IndexedChunkRecord {
   dim: number;
   modelFingerprint: string;
   updatedAt: number;
+  sourceFileHash?: string;
 }
 
 export interface AttachmentStateRecord {
@@ -160,6 +161,7 @@ export interface ChunkHitInfo {
   semanticScore: number;
   lexicalScore: number;
   highlightRanges: Array<[number, number]>;
+  sourceFileHash?: string;
 }
 
 export interface SearchHit {

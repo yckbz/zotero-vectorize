@@ -102,6 +102,10 @@
   color: var(--zv-err-ink);
 }
 
+#zv-index-read-error:empty {
+  display: none;
+}
+
 .zv-pref-card {
   background: var(--zv-card);
   border: 1px solid var(--zv-border);
@@ -110,6 +114,11 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.zv-pref-card[hidden],
+#zv-shared-index-cache:empty {
+  display: none;
 }
 
 .zv-pref-h2 {

@@ -41,7 +41,7 @@ export class TopSearchPopover {
     this.win = options.win;
     this.service = options.service;
     this.onOpenPalette = options.onOpenPalette;
-    this.currentMode = this.service.getConfig().defaultSearchMode;
+    this.currentMode = this.service.getSearchConfig().defaultSearchMode;
   }
 
   attach(): void {
@@ -270,7 +270,7 @@ export class TopSearchPopover {
       const filterIDs = this.scopeCollectionOnly ? await getActiveCollectionItemIDs(this.win) : null;
       if (signal.aborted) return;
       const [status, response] = await Promise.all([
-        this.service.getEngineStatus(),
+        this.service.getSearchEngineStatus(),
         this.service.search(clean, { mode: this.currentMode, filterItemIDs: filterIDs, signal }),
       ]);
       if (signal.aborted || this.getSearchValue().trim() !== clean) return;

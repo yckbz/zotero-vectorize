@@ -2,19 +2,7 @@ import type { EngineHealthStatus, HfMirrorMode } from '../types/vectorize.ts';
 import { buildModelFingerprint } from '../core/hash.ts';
 import { type EmbeddingProvider, findPreset, formatTextForModel } from './provider.ts';
 
-export const ORT_JS_FILENAME = 'ort.bundle.min.mjs';
-export const ORT_JS_CANDIDATES = [
-  'ort.bundle.min.mjs',
-  'ort.all.bundle.min.mjs',
-  'ort.wasm.min.mjs',
-  'ort.min.mjs',
-] as const;
-export const ORT_WASM_FILENAME = 'ort-wasm-simd-threaded.wasm';
-export const ORT_WASM_CANDIDATES = [
-  'ort-wasm-simd-threaded.wasm',
-  'ort-wasm-simd.wasm',
-  'ort-wasm.wasm',
-] as const;
+export const ONNX_WORKER_RESOURCE = 'zotero-vectorize-workers';
 
 export interface LocalFileSystem {
   exists(path: string): Promise<boolean>;
@@ -120,66 +108,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     this.dataDir = options.dataDir;
     this.workerScriptUrl = options.workerScriptUrl;
     this.fs = options.fs ?? createZoteroFileSystem();
-    this.workerFactory =
-      options.workerFactory ??
-      (async (url) => {
-        if (typeof Blob !== 'undefined' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
-          let code = '';
-          try {
-            if (typeof Zotero !== 'undefined' && typeof Zotero.File?.getResourceAsync === 'function') {
-              code = await Zotero.File.getResourceAsync(url);
-            }
-          } catch {
-            code = '';
-          }
-          if (!code) {
-            try {
-              if (typeof Zotero !== 'undefined' && typeof Zotero.File?.getContentsFromURL === 'function') {
-                code = Zotero.File.getContentsFromURL(url);
-              }
-            } catch {
-              code = '';
-            }
-          }
-          if (!code && typeof this.fetchFn === 'function') {
-            try {
-              const res = await this.fetchFn(url);
-              if (res.ok) code = await res.text();
-            } catch {
-              code = '';
-            }
-          }
-          if (code) {
-            const blobUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
-            try {
-              const worker = new Worker(blobUrl);
-              return {
-                postMessage: worker.postMessage.bind(worker),
-                addEventListener: worker.addEventListener.bind(worker),
-                removeEventListener: worker.removeEventListener.bind(worker),
-                terminate() {
-                  try {
-                    worker.terminate();
-                  } finally {
-                    URL.revokeObjectURL(blobUrl);
-                  }
-                },
-              };
-            } catch (error) {
-              URL.revokeObjectURL(blobUrl);
-              throw error;
-            }
-          }
-        }
-        if (typeof ChromeWorker !== 'undefined') {
-          try {
-            return new ChromeWorker(url);
-          } catch {
-            return new Worker(url);
-          }
-        }
-        return new Worker(url);
-      });
+    this.workerFactory = options.workerFactory ?? ((url) => new Worker(url, { type: 'module' }));
     this.fetchFn =
       options.fetchFn ??
       (typeof fetch === 'function'
@@ -211,42 +140,17 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     return revision;
   }
 
-  getRuntimeDir(): string {
-    return this.fs.join(this.dataDir, 'zotero-vectorize', 'runtime');
-  }
-
   getModelDir(): string {
     if (this.customModelDir) return this.customModelDir;
     return this.fs.join(this.dataDir, 'zotero-vectorize', 'models', getModelSlug(this.model));
   }
 
   private async resolveExistingAssets(): Promise<{
-    ortMjsPath: string;
-    wasmPath: string;
     modelPath: string;
     tokenizerPath: string;
     configPath: string | null;
   } | null> {
-    const runtimeDir = this.getRuntimeDir();
     const modelDir = this.getModelDir();
-
-    let ortMjsPath = '';
-    for (const c of ORT_JS_CANDIDATES) {
-      const p = this.fs.join(runtimeDir, c);
-      if (await this.fs.exists(p)) {
-        ortMjsPath = p;
-        break;
-      }
-    }
-
-    let wasmPath = '';
-    for (const c of ORT_WASM_CANDIDATES) {
-      const p = this.fs.join(runtimeDir, c);
-      if (await this.fs.exists(p)) {
-        wasmPath = p;
-        break;
-      }
-    }
 
     const modelCandidates: string[][] = [
       ['model_quantized.onnx'],
@@ -268,14 +172,14 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     const tokenizerPath = this.fs.join(modelDir, 'tokenizer.json');
     const hasTokenizer = await this.fs.exists(tokenizerPath);
 
-    if (!ortMjsPath || !wasmPath || !modelPath || !hasTokenizer) {
+    if (!modelPath || !hasTokenizer) {
       return null;
     }
 
     const configCandidate = this.fs.join(modelDir, 'config.json');
     const configPath = (await this.fs.exists(configCandidate)) ? configCandidate : null;
 
-    return { ortMjsPath, wasmPath, modelPath, tokenizerPath, configPath };
+    return { modelPath, tokenizerPath, configPath };
   }
 
   async hasInstalledAssets(): Promise<boolean> {
@@ -293,9 +197,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
         const assets = await this.resolveExistingAssets();
         if (!assets || generation !== this.generation) return false;
 
-        const [ortModuleCode, wasmBytes, modelBytes, tokenizerJson] = await Promise.all([
-          this.fs.readUTF8(assets.ortMjsPath),
-          this.fs.readBytes(assets.wasmPath),
+        const [modelBytes, tokenizerJson] = await Promise.all([
           this.fs.readBytes(assets.modelPath),
           this.fs.readUTF8(assets.tokenizerPath),
         ]);
@@ -344,21 +246,18 @@ export class LocalOnnxProvider implements EmbeddingProvider {
 
         slot.worker = worker;
 
-        const wasmCopy = wasmBytes.slice().buffer;
         const modelCopy = modelBytes.slice().buffer;
 
         const res = await this.sendToWorker(
           slot,
           'init',
           {
-            ortModuleCode,
-            wasmBinary: wasmCopy,
             modelBinary: modelCopy,
             tokenizerJson,
             poolingMode,
             maxSeqLength: this.maxSeqLength,
           },
-          [wasmCopy, modelCopy]
+          [modelCopy]
         );
 
         if (generation !== this.generation) return false;
@@ -486,18 +385,11 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     throw lastErr ?? new Error(`Failed to download ${label}`);
   }
 
-  async downloadModelAndRuntime(onProgress?: (p: DownloadProgressInfo) => void): Promise<void> {
+  async downloadModel(onProgress?: (p: DownloadProgressInfo) => void): Promise<void> {
     if (this.disposed) throw new Error('ONNX provider was closed');
-    const runtimeDir = this.getRuntimeDir();
     const modelDir = this.getModelDir();
-    await this.fs.makeDir(runtimeDir);
     await this.fs.makeDir(modelDir);
 
-    const ortBases = [
-      'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist',
-      'https://registry.npmmirror.com/onnxruntime-web/1.20.1/files/dist',
-      'https://unpkg.com/onnxruntime-web@1.20.1/dist',
-    ];
     const hfRoot = this.mirror === 'hf-mirror' ? 'https://hf-mirror.com' : 'https://huggingface.co';
     const hfFallback = this.mirror === 'hf-mirror' ? 'https://huggingface.co' : 'https://hf-mirror.com';
 
@@ -505,38 +397,6 @@ export class LocalOnnxProvider implements EmbeddingProvider {
     const onnxRelPath = preset?.onnxFile || 'onnx/model_quantized.onnx';
 
     const tasks: Array<{ dest: string; label: string; urls: string[]; optional?: boolean }> = [];
-
-    let hasOrtJs = false;
-    for (const c of ORT_JS_CANDIDATES) {
-      if (await this.fs.exists(this.fs.join(runtimeDir, c))) {
-        hasOrtJs = true;
-        break;
-      }
-    }
-    const ortJsDest = this.fs.join(runtimeDir, ORT_JS_FILENAME);
-    if (!hasOrtJs) {
-      tasks.push({
-        dest: ortJsDest,
-        label: 'ONNX Runtime JS',
-        urls: ortBases.map((b) => `${b}/${ORT_JS_FILENAME}`),
-      });
-    }
-
-    let hasOrtWasm = false;
-    for (const c of ORT_WASM_CANDIDATES) {
-      if (await this.fs.exists(this.fs.join(runtimeDir, c))) {
-        hasOrtWasm = true;
-        break;
-      }
-    }
-    const ortWasmDest = this.fs.join(runtimeDir, ORT_WASM_FILENAME);
-    if (!hasOrtWasm) {
-      tasks.push({
-        dest: ortWasmDest,
-        label: 'ONNX Runtime WASM',
-        urls: ortBases.map((b) => `${b}/${ORT_WASM_FILENAME}`),
-      });
-    }
 
     const tokenizerDest = this.fs.join(modelDir, 'tokenizer.json');
     const hasTokenizer = await this.fs.exists(tokenizerDest);

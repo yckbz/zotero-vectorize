@@ -65,16 +65,25 @@ async function main() {
 
   await esbuild.build({
     entryPoints: [path.join(ROOT, 'src/workers/onnx-worker.ts')],
-    outfile: path.join(BUILD_DIR, 'workers/onnx-worker.js'),
+    outfile: path.join(BUILD_DIR, 'workers/onnx-worker.mjs'),
     bundle: true,
-    format: 'iife',
+    format: 'esm',
     platform: 'browser',
     target: 'firefox115',
+    plugins: [{
+      name: 'packaged-onnx-runtime',
+      setup(build) {
+        build.onResolve({ filter: /^onnxruntime-web$/ }, () => ({ path: './ort.bundle.min.mjs', external: true }));
+      },
+    }],
     charset: 'utf8',
     sourcemap: false,
     minify: false,
     logLevel: 'info',
   });
+  for (const file of ['ort.bundle.min.mjs', 'ort-wasm-simd-threaded.wasm']) {
+    await fs.copyFile(path.join(ROOT, 'node_modules', 'onnxruntime-web', 'dist', file), path.join(BUILD_DIR, 'workers', file));
+  }
 
   await esbuild.build({
     entryPoints: [path.join(ROOT, 'src/zotero/mcp/listener.ts')],
@@ -111,7 +120,7 @@ with zipfile.ZipFile(out_xpi, 'w', compression=zipfile.ZIP_DEFLATED, compresslev
             rel = os.path.relpath(full, build_dir).replace(os.sep, '/')
             zf.write(full, rel)
 `;
-    execFileSync('python3', ['-c', pyScript, BUILD_DIR, XPI_PATH], { stdio: 'inherit' });
+    execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', pyScript, BUILD_DIR, XPI_PATH], { stdio: 'inherit' });
     const stat = await fs.stat(XPI_PATH);
     console.log(`Packaged ${XPI_PATH} (${(stat.size / 1024).toFixed(1)} KB)`);
   }

@@ -95,11 +95,29 @@ export async function jumpToSearchHit(
   const targetChunk = chunk ?? hit.bestChunk ?? null;
 
   if (targetChunk) {
-    const attID = await resolveBestPdfAttachmentId(
-      hit.itemID,
-      targetChunk.attachmentID,
-      targetChunk.attachmentKey
-    );
+    let attID: number | null;
+    if (targetChunk.sourceFileHash) {
+      attID = null;
+      try {
+        const attachment = await Zotero.Items.getByLibraryAndKeyAsync(hit.libraryID, targetChunk.attachmentKey);
+        if (attachment && !attachment.deleted && attachment.isPDFAttachment() && attachment.parentItemID === hit.itemID) {
+          const runner = Zotero.Sync?.Runner;
+          if (!await attachment.getFilePathAsync() && attachment.isStoredFileAttachment?.() && !runner?.syncInProgress) {
+            await runner?.downloadFile(attachment);
+          }
+          if (await attachment.attachmentHash === targetChunk.sourceFileHash && !attachment.deleted &&
+              attachment.parentItemID === hit.itemID) attID = attachment.id;
+        }
+      } catch {
+        // The library entry remains available when the synced file cannot be opened safely.
+      }
+      if (attID === null) {
+        await selectItemInLibrary(hit.itemID, false);
+        return;
+      }
+    } else {
+      attID = await resolveBestPdfAttachmentId(hit.itemID, targetChunk.attachmentID, targetChunk.attachmentKey);
+    }
     if (attID) {
       // Keep library selection synced silently before opening reader (noTabSwitch prevents focus/tab stealing)
       await selectItemInLibrary(hit.itemID, false);

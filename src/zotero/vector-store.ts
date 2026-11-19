@@ -187,6 +187,7 @@ export class VectorStore {
         }
         await this.createEmbeddingTables(conn);
         await this.migrateVectors(conn);
+        await this.requireIndexColumns(conn, 'main');
         await conn.queryAsync(`PRAGMA application_id = ${APPLICATION_ID}`);
         await conn.queryAsync(
           `INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)`,
@@ -289,7 +290,10 @@ export class VectorStore {
       ['fulltext_chunks', 'passage_embeddings', 'chunk_id'],
     ]) {
       const columns = await conn.queryAsync<{ name: string }>(`PRAGMA table_info(${source})`);
-      if (!columns.some((column) => column.name === 'vector')) continue;
+      const legacyColumns = ['vector', 'dim', 'model_fingerprint'];
+      const legacyCount = legacyColumns.filter((name) => columns.some((column) => column.name === name)).length;
+      if (legacyCount === 0) continue;
+      if (legacyCount !== legacyColumns.length) throw new Error(`Incomplete legacy vector columns in ${source}`);
       const groups = await conn.queryAsync<{ model_fingerprint: string; dim: number }>(
         `SELECT DISTINCT model_fingerprint, dim FROM ${source}
          WHERE vector IS NOT NULL AND dim > 0 AND length(vector) = dim * 4`
@@ -306,7 +310,7 @@ export class VectorStore {
           [profile.id, fingerprint, group.dim]
         );
       }
-      for (const column of ['vector', 'dim', 'model_fingerprint']) {
+      for (const column of legacyColumns) {
         await conn.queryAsync(`ALTER TABLE ${source} DROP COLUMN ${column}`);
       }
     }
@@ -314,6 +318,14 @@ export class VectorStore {
     if (attachmentColumns.some((column) => column.name === 'model_fingerprint')) {
       await conn.queryAsync("UPDATE attachment_state SET status = 'indexed', error_message = '' WHERE chunk_count > 0 AND status IN ('pending', 'error')");
       await conn.queryAsync('ALTER TABLE attachment_state DROP COLUMN model_fingerprint');
+    }
+  }
+
+  private async requireIndexColumns(conn: ZoteroDBConnectionInstance, schema: 'main' | 'snapshot'): Promise<void> {
+    for (const [table, required] of Object.entries(SNAPSHOT_COLUMNS)) {
+      const columns = await conn.queryAsync<{ name: string }>(`PRAGMA ${schema}.table_info(${table})`);
+      const missing = required.filter((name) => !columns.some((column) => column.name === name));
+      if (missing.length) throw new Error(`Invalid Zotero Vectorize index schema. ${table} is missing ${missing.join(', ')}.`);
     }
   }
 
@@ -448,13 +460,14 @@ export class VectorStore {
     }
   }
 
-  async loadAll(profileId = this.profile?.id ?? ''): Promise<{ items: IndexedItemRecord[]; chunks: IndexedChunkRecord[] }> {
+  async loadAll(profileId = this.profile?.id ?? '', libraryID?: number): Promise<{ items: IndexedItemRecord[]; chunks: IndexedChunkRecord[] }> {
     const conn = await this.ensureConn();
     const itemRows = await conn.queryAsync<Record<string, any>>(
       `SELECT i.*, e.vector, p.dim, p.engine, p.model FROM item_vectors i
        LEFT JOIN metadata_embeddings e ON e.item_id = i.item_id AND e.profile_id = ?
-       LEFT JOIN embedding_profiles p ON p.id = e.profile_id`,
-      [profileId]
+       LEFT JOIN embedding_profiles p ON p.id = e.profile_id
+       ${libraryID === undefined ? '' : 'WHERE i.library_id = ?'}`,
+      libraryID === undefined ? [profileId] : [profileId, libraryID]
     );
 
     const items: IndexedItemRecord[] = [];
@@ -489,17 +502,18 @@ export class VectorStore {
       });
     }
 
-    return { items, chunks: await this.readChunks(conn, profileId) };
+    return { items, chunks: await this.readChunks(conn, profileId, undefined, libraryID) };
   }
 
-  private async readChunks(conn: ZoteroDBConnectionInstance, profileId: string, itemID?: number): Promise<IndexedChunkRecord[]> {
+  private async readChunks(conn: ZoteroDBConnectionInstance, profileId: string, itemID?: number, libraryID?: number): Promise<IndexedChunkRecord[]> {
     const chunkRows = await conn.queryAsync<Record<string, any>>(
       `SELECT c.*, e.vector, p.dim, p.engine, p.model FROM fulltext_chunks c
        LEFT JOIN passage_embeddings e ON e.chunk_id = c.chunk_id AND e.profile_id = ?
        LEFT JOIN embedding_profiles p ON p.id = e.profile_id
-       ${itemID === undefined ? '' : 'WHERE c.item_id = ?'}
+       ${itemID !== undefined ? 'WHERE c.item_id = ?' : libraryID !== undefined
+         ? 'WHERE c.item_id IN (SELECT item_id FROM item_vectors WHERE library_id = ?)' : ''}
        ORDER BY c.attachment_id, c.chunk_index`,
-      itemID === undefined ? [profileId] : [profileId, itemID]
+      itemID === undefined && libraryID === undefined ? [profileId] : [profileId, itemID ?? libraryID]
     );
     const chunks: IndexedChunkRecord[] = [];
     for (const row of chunkRows) {
@@ -694,6 +708,18 @@ export class VectorStore {
     return rows.map((row) => Number(row.attachment_id));
   }
 
+  async getShareableAttachments(libraryID: number, chunkingKey: string): Promise<Array<{
+    attachmentID: number; attachmentKey: string; parentItemID: number; fileHash: string;
+  }>> {
+    const conn = await this.ensureConn();
+    const rows = await conn.queryAsync(`SELECT a.attachment_id, a.attachment_key, a.parent_item_id, a.file_hash
+      FROM attachment_state a JOIN item_vectors i ON i.item_id = a.parent_item_id
+      WHERE i.library_id = ? AND a.chunking_key = ? AND a.status = 'indexed' AND a.chunk_count > 0`,
+    [libraryID, chunkingKey]);
+    return rows.map((row) => ({ attachmentID: Number(row.attachment_id), attachmentKey: String(row.attachment_key),
+      parentItemID: Number(row.parent_item_id), fileHash: String(row.file_hash) }));
+  }
+
   async removeAttachment(attachmentID: number): Promise<number | null> {
     return this.enqueueWrite(async () => {
       const conn = await this.ensureConn();
@@ -836,6 +862,7 @@ export class VectorStore {
               schema.some(({ name, type }) => type !== 'table' || !Object.hasOwn(SNAPSHOT_COLUMNS, name))) {
             throw new Error('Unexpected snapshot tables');
           }
+          await this.requireIndexColumns(conn, 'snapshot');
           validateSources(
             await conn.queryAsync('SELECT item_id, item_key, library_id FROM snapshot.item_vectors'),
             await conn.queryAsync(`SELECT attachment_id, attachment_key, parent_item_id FROM snapshot.attachment_state

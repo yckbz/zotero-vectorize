@@ -81,6 +81,14 @@ export type LocaleStrings = {
   similarPapersLoading: string;
   // Preferences
   prefStatusCardTitle: string;
+  prefSharedIndexTitle: string;
+  prefSharedItems: string;
+  prefSharedChunks: string;
+  prefSharedPublishedAt: string;
+  prefSharedReady: string;
+  prefSharedChecking: string;
+  prefSharedCached: string;
+  prefIndexReadError: (detail: string) => string;
   prefEngineSectionTitle: string;
   prefIndexingSectionTitle: string;
   prefUiSectionTitle: string;
@@ -91,6 +99,11 @@ export type LocaleStrings = {
   prefMcpCopied: string;
   prefMcpStartError: string;
   prefMcpCopyError: string;
+  prefIndexSyncTitle: string;
+  prefIndexSyncHint: string;
+  prefIndexSyncRole: { off: string; publish: string; receive: string };
+  prefIndexSyncState: Record<'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' | 'error', string>;
+  prefIndexSyncNow: string;
   prefItemsIndexed: string;
   prefChunksIndexed: string;
   prefItemVectorRatio: string;
@@ -191,7 +204,7 @@ const ZH_CN: LocaleStrings = {
   prefRestoreNativeHint: '恢复将替换插件中的所有模型索引和全文缓存。',
   prefNativeRestored: '已恢复 SQLite 向量库，正在检查文献变更。',
   prefNativeExported: '已导出 SQLite 向量库。',
-  prefClearAllHint: '这会删除全部模型向量和全文缓存。',
+  prefClearAllHint: '这会删除本机索引中的全部模型向量和全文缓存。',
   prefSwitchModelHint: (model) => `是否保留 ${model} 的向量？`,
   prefDeleteModelHint: (model) => `删除 ${model} 的题录和全文向量。共享的题录与 PDF 切片会保留。`,
   prefModelCoverage: (i, ni, c, nc) => `题录 ${i}/${ni} · 全文 ${c}/${nc}`,
@@ -215,7 +228,15 @@ const ZH_CN: LocaleStrings = {
   similarPapersHeader: '语义相似文献',
   similarPapersEmpty: '暂无足够相似度高的文献或尚未完成索引',
   similarPapersLoading: '正在计算语义相似度…',
-  prefStatusCardTitle: '向量索引状态与控制',
+  prefStatusCardTitle: '本机向量索引状态与控制',
+  prefSharedIndexTitle: '共享索引 · 我的文库',
+  prefSharedItems: '文献已向量化 / 已载入',
+  prefSharedChunks: '分块已向量化 / 已载入',
+  prefSharedPublishedAt: '快照发布时间',
+  prefSharedReady: '共享索引已载入。',
+  prefSharedChecking: '正在检查更新，继续使用当前已载入的版本。',
+  prefSharedCached: '正在使用上次同步的版本。',
+  prefIndexReadError: (detail) => `无法读取本机向量索引。请确认插件版本与索引匹配。 ${detail}`,
   prefEngineSectionTitle: 'Embedding 向量引擎',
   prefIndexingSectionTitle: '文档切片与自动后台索引',
   prefUiSectionTitle: '检索交互与外观',
@@ -226,6 +247,21 @@ const ZH_CN: LocaleStrings = {
   prefMcpCopied: '已复制 Codex 配置。',
   prefMcpStartError: '无法启动 MCP。请检查 Zotero 版本和本机端口占用。',
   prefMcpCopyError: '无法复制 Codex 配置。',
+  prefIndexSyncTitle: '通过 Zotero 同步向量索引',
+  prefIndexSyncHint: '使用「我的文库」已有的 WebDAV。只在一台设备选发布，其它设备选接收。索引附件含提取的 PDF 正文与模型参数，凭据保存在本机。',
+  prefIndexSyncRole: { off: '关闭', publish: '发布本机索引', receive: '接收共享索引' },
+  prefIndexSyncState: {
+    off: '使用本地索引。',
+    waiting: '等待 Zotero 同步或主设备完成向量化。',
+    working: '正在检查共享索引。',
+    ready: '索引已同步。',
+    webdav: 'Zotero WebDAV 当前不可用。仍可使用本机已有索引。',
+    model: '需要已校验的同版本 ONNX 或 Ollama 模型。',
+    cloud: '请核对两端的 Base URL、模型和输出维度，并在本机填写有效的 API Key。',
+    conflict: '检测到多个发布者或附件冲突。请先在 Zotero 中检查共享索引附件。',
+    error: '共享索引更新失败。仍可使用本机已有索引。',
+  },
+  prefIndexSyncNow: '立即检查同步',
   prefItemsIndexed: '已索引文献',
   prefItemVectorRatio: '文献已向量化 / 已收录',
   prefChunkVectorRatio: '分块已向量化 / 已提取',
@@ -261,7 +297,7 @@ const ZH_CN: LocaleStrings = {
   prefNormalizeNotation: '允许普通数字匹配上下标数字',
   prefClearOnJump: '点击候选跳转到 PDF 后自动清空顶部检索框',
   prefLanguage: '界面语言',
-  prefPrivacyBadge: '独立存储：vectorize.sqlite · 原库零写入风险',
+  prefPrivacyBadge: '本地索引保存在独立的 vectorize.sqlite 中',
   prefMsgCleared: '向量索引已清空。',
   prefMsgModelReady: (m) => `本地 ONNX 模型已就绪：${m}`,
   prefMsgExported: (i, c, dir) => `已导出 ${i} 篇文献与 ${c} 个全文段落至 ${dir}`,
@@ -326,7 +362,7 @@ const EN_US: LocaleStrings = {
   prefRestoreNativeHint: 'Restoring replaces all model indexes and cached passages in this plugin.',
   prefNativeRestored: 'SQLite index restored. Checking for library changes.',
   prefNativeExported: 'SQLite index exported.',
-  prefClearAllHint: 'This deletes all model vectors and cached passages.',
+  prefClearAllHint: 'This deletes all model vectors and cached passages from this device’s local index.',
   prefSwitchModelHint: (model) => `Keep the saved vectors for ${model}?`,
   prefDeleteModelHint: (model) => `Delete the metadata and full-text vectors for ${model}. Shared metadata and PDF passages will be kept.`,
   prefModelCoverage: (i, ni, c, nc) => `Metadata ${i}/${ni} · Passages ${c}/${nc}`,
@@ -350,7 +386,15 @@ const EN_US: LocaleStrings = {
   similarPapersHeader: 'Semantically Similar Papers',
   similarPapersEmpty: 'No similar papers indexed yet',
   similarPapersLoading: 'Computing semantic neighbors…',
-  prefStatusCardTitle: 'Vector Index Status & Controls',
+  prefStatusCardTitle: 'Local Vector Index & Controls',
+  prefSharedIndexTitle: 'Shared Index · My Library',
+  prefSharedItems: 'Items with vectors / loaded',
+  prefSharedChunks: 'Passages with vectors / loaded',
+  prefSharedPublishedAt: 'Snapshot published',
+  prefSharedReady: 'Shared index loaded.',
+  prefSharedChecking: 'Checking for updates. The loaded version is still in use.',
+  prefSharedCached: 'Using the last synced version.',
+  prefIndexReadError: (detail) => `Unable to read the local vector index. Check that the plugin version matches the index. ${detail}`,
   prefEngineSectionTitle: 'Embedding Engine',
   prefIndexingSectionTitle: 'Chunking & Silent Background Indexing',
   prefUiSectionTitle: 'Search UX & Appearance',
@@ -361,6 +405,21 @@ const EN_US: LocaleStrings = {
   prefMcpCopied: 'Codex configuration copied.',
   prefMcpStartError: 'MCP could not start. Check the Zotero version and whether the local port is in use.',
   prefMcpCopyError: 'Could not copy the Codex configuration.',
+  prefIndexSyncTitle: 'Sync vector indexes through Zotero',
+  prefIndexSyncHint: 'Uses the existing WebDAV setup for My Library. Choose one publisher and set other devices to receive. The index attachment contains extracted PDF text and model settings. Credentials stay on this device.',
+  prefIndexSyncRole: { off: 'Off', publish: 'Publish this device’s index', receive: 'Receive the shared index' },
+  prefIndexSyncState: {
+    off: 'Using the local index.',
+    waiting: 'Waiting for Zotero sync or for the publisher to finish indexing.',
+    working: 'Checking the shared index.',
+    ready: 'Index synced.',
+    webdav: 'Zotero WebDAV is unavailable. Existing indexes are still searchable.',
+    model: 'A matching, verified ONNX or Ollama model is required.',
+    cloud: 'Match the Base URL, model, and output dimensions across devices and enter a valid API key on this device.',
+    conflict: 'Multiple publishers or an attachment conflict were detected. Check the shared index attachment in Zotero.',
+    error: 'The shared index could not be updated. Existing indexes are still searchable.',
+  },
+  prefIndexSyncNow: 'Check sync now',
   prefItemsIndexed: 'Indexed Items',
   prefItemVectorRatio: 'Items with vectors / indexed',
   prefChunkVectorRatio: 'Passages with vectors / extracted',
@@ -396,7 +455,7 @@ const EN_US: LocaleStrings = {
   prefNormalizeNotation: 'Match plain digits to superscript and subscript digits',
   prefClearOnJump: 'Clear top search bar after jumping to a PDF page',
   prefLanguage: 'UI Language',
-  prefPrivacyBadge: 'Isolated store: vectorize.sqlite · Zero risk to zotero.sqlite',
+  prefPrivacyBadge: 'Local indexes are stored in a separate vectorize.sqlite file',
   prefMsgCleared: 'Vector index cleared.',
   prefMsgModelReady: (m) => `Local ONNX model ready: ${m}`,
   prefMsgExported: (i, c, dir) => `Exported ${i} items and ${c} chunks to ${dir}`,

@@ -1,5 +1,6 @@
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import { PLUGIN_ID } from './config.ts';
+import { ONNX_WORKER_RESOURCE } from '../engines/local-onnx.ts';
 import { VectorizeService } from './service.ts';
 import { McpController } from './mcp/controller.ts';
 import { injectWindowStyles, removeWindowStyles } from './ui/styles.ts';
@@ -18,6 +19,7 @@ let service: VectorizeService | null = null;
 let pluginRootURI = '';
 let registeredPrefPaneId: string | null = null;
 let unregisterItemSection: (() => void) | null = null;
+let unregisterWorkerResources: (() => void) | null = null;
 const registeredMenuIds: string[] = [];
 const windowHandles = new Map<any, WindowUiHandles>();
 
@@ -200,6 +202,10 @@ async function uninstall(_data: any, _reason: number): Promise<void> {
 
 async function startup(data: { id: string; version: string; rootURI: string }, _reason: number): Promise<void> {
   pluginRootURI = data.rootURI;
+  const resources = Components.classes['@mozilla.org/network/protocol;1?name=resource']
+    .getService(Components.interfaces.nsIResProtocolHandler);
+  resources.setSubstitution(ONNX_WORKER_RESOURCE, Services.io.newURI(pluginRootURI + 'workers/'));
+  unregisterWorkerResources = () => resources.setSubstitution(ONNX_WORKER_RESOURCE, null);
   const dataDir = Zotero.DataDirectory.dir;
 
   service = new VectorizeService({
@@ -282,6 +288,8 @@ async function shutdown(_data: any, _reason: number): Promise<void> {
     await service.shutdown();
     service = null;
   }
+  unregisterWorkerResources?.();
+  unregisterWorkerResources = null;
   if ((Zotero as any).Vectorize) {
     delete (Zotero as any).Vectorize;
   }
