@@ -281,3 +281,18 @@ test('Opening an unpacked index and restoring a bloated snapshot reclaim pages w
     await imported.close();
   }
 });
+
+test('An invalid vector schema is diagnosed before replacing the local index', async (t) => {
+  const { svc, root } = await setup(t, 'openai');
+  await svc.startIndexing();
+  const pathToBrokenSnapshot = path.join(root, 'incomplete-snapshot.sqlite');
+  await svc.exportNativeIndex(pathToBrokenSnapshot);
+  const snapshot = new DatabaseSync(pathToBrokenSnapshot);
+  snapshot.exec('ALTER TABLE passage_embeddings RENAME COLUMN vector TO incomplete_vector');
+  snapshot.close();
+
+  await assert.rejects(svc.restoreNativeIndex(pathToBrokenSnapshot), /passage_embeddings is missing vector/);
+  const stats = await svc.getStats();
+  assert.equal(stats.vectorizedChunks, 18);
+  assert.equal(stats.vectorizedItems, 2);
+});

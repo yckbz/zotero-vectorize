@@ -212,7 +212,11 @@ class VectorizePreferencesController {
       stats = await svc.getStats(status);
       if (document.getElementById('zv-model-indexes')) profiles = await svc.listEmbeddingProfiles();
     } catch (error) {
-      if (seq === this.statsSeq) this.setFeedback(String(error), 'err');
+      const notice = document.getElementById('zv-index-read-error');
+      if (seq === this.statsSeq && notice) {
+        const detail = error instanceof Error ? error.message : String(error);
+        notice.textContent = getStrings(svc.getConfig()).prefIndexReadError(detail);
+      }
       return;
     }
     if (seq !== this.statsSeq) return;
@@ -220,6 +224,7 @@ class VectorizePreferencesController {
       const node = document.getElementById(id);
       if (node) node.textContent = val;
     };
+    setTxt('zv-index-read-error', '');
     setTxt('zv-stat-items', `${stats.vectorizedItems} / ${stats.indexedItems}`);
     setTxt('zv-stat-chunks', `${stats.vectorizedChunks} / ${stats.indexedChunks}`);
     setTxt('zv-stat-db', formatBytes(stats.dbSizeBytes));
@@ -335,6 +340,7 @@ class VectorizePreferencesController {
     this.container.appendChild(
       el(doc, 'div', { className: 'zv-pref-card' }, [
         el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefStatusCardTitle]),
+        el(doc, 'div', { id: 'zv-index-read-error', className: 'zv-pref-feedback is-err', role: 'status' }),
         el(doc, 'div', { className: 'zv-stat-grid' }, [
           statCard(s.prefItemVectorRatio, 'zv-stat-items', '—'),
           statCard(s.prefChunkVectorRatio, 'zv-stat-chunks', '—'),

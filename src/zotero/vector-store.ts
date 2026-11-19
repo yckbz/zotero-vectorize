@@ -187,6 +187,7 @@ export class VectorStore {
         }
         await this.createEmbeddingTables(conn);
         await this.migrateVectors(conn);
+        await this.requireIndexColumns(conn, 'main');
         await conn.queryAsync(`PRAGMA application_id = ${APPLICATION_ID}`);
         await conn.queryAsync(
           `INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)`,
@@ -289,7 +290,10 @@ export class VectorStore {
       ['fulltext_chunks', 'passage_embeddings', 'chunk_id'],
     ]) {
       const columns = await conn.queryAsync<{ name: string }>(`PRAGMA table_info(${source})`);
-      if (!columns.some((column) => column.name === 'vector')) continue;
+      const legacyColumns = ['vector', 'dim', 'model_fingerprint'];
+      const legacyCount = legacyColumns.filter((name) => columns.some((column) => column.name === name)).length;
+      if (legacyCount === 0) continue;
+      if (legacyCount !== legacyColumns.length) throw new Error(`Incomplete legacy vector columns in ${source}`);
       const groups = await conn.queryAsync<{ model_fingerprint: string; dim: number }>(
         `SELECT DISTINCT model_fingerprint, dim FROM ${source}
          WHERE vector IS NOT NULL AND dim > 0 AND length(vector) = dim * 4`
@@ -306,7 +310,7 @@ export class VectorStore {
           [profile.id, fingerprint, group.dim]
         );
       }
-      for (const column of ['vector', 'dim', 'model_fingerprint']) {
+      for (const column of legacyColumns) {
         await conn.queryAsync(`ALTER TABLE ${source} DROP COLUMN ${column}`);
       }
     }
@@ -314,6 +318,14 @@ export class VectorStore {
     if (attachmentColumns.some((column) => column.name === 'model_fingerprint')) {
       await conn.queryAsync("UPDATE attachment_state SET status = 'indexed', error_message = '' WHERE chunk_count > 0 AND status IN ('pending', 'error')");
       await conn.queryAsync('ALTER TABLE attachment_state DROP COLUMN model_fingerprint');
+    }
+  }
+
+  private async requireIndexColumns(conn: ZoteroDBConnectionInstance, schema: 'main' | 'snapshot'): Promise<void> {
+    for (const [table, required] of Object.entries(SNAPSHOT_COLUMNS)) {
+      const columns = await conn.queryAsync<{ name: string }>(`PRAGMA ${schema}.table_info(${table})`);
+      const missing = required.filter((name) => !columns.some((column) => column.name === name));
+      if (missing.length) throw new Error(`Invalid Zotero Vectorize index schema. ${table} is missing ${missing.join(', ')}.`);
     }
   }
 
@@ -850,6 +862,7 @@ export class VectorStore {
               schema.some(({ name, type }) => type !== 'table' || !Object.hasOwn(SNAPSHOT_COLUMNS, name))) {
             throw new Error('Unexpected snapshot tables');
           }
+          await this.requireIndexColumns(conn, 'snapshot');
           validateSources(
             await conn.queryAsync('SELECT item_id, item_key, library_id FROM snapshot.item_vectors'),
             await conn.queryAsync(`SELECT attachment_id, attachment_key, parent_item_id FROM snapshot.attachment_state

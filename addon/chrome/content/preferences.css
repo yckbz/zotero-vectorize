@@ -102,6 +102,10 @@
   color: var(--zv-err-ink);
 }
 
+#zv-index-read-error:empty {
+  display: none;
+}
+
 .zv-pref-card {
   background: var(--zv-card);
   border: 1px solid var(--zv-border);

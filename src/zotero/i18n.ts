@@ -81,6 +81,7 @@ export type LocaleStrings = {
   similarPapersLoading: string;
   // Preferences
   prefStatusCardTitle: string;
+  prefIndexReadError: (detail: string) => string;
   prefEngineSectionTitle: string;
   prefIndexingSectionTitle: string;
   prefUiSectionTitle: string;
@@ -221,6 +222,7 @@ const ZH_CN: LocaleStrings = {
   similarPapersEmpty: '暂无足够相似度高的文献或尚未完成索引',
   similarPapersLoading: '正在计算语义相似度…',
   prefStatusCardTitle: '向量索引状态与控制',
+  prefIndexReadError: (detail) => `无法读取本机向量索引。请确认插件版本与索引匹配。 ${detail}`,
   prefEngineSectionTitle: 'Embedding 向量引擎',
   prefIndexingSectionTitle: '文档切片与自动后台索引',
   prefUiSectionTitle: '检索交互与外观',
@@ -371,6 +373,7 @@ const EN_US: LocaleStrings = {
   similarPapersEmpty: 'No similar papers indexed yet',
   similarPapersLoading: 'Computing semantic neighbors…',
   prefStatusCardTitle: 'Vector Index Status & Controls',
+  prefIndexReadError: (detail) => `Unable to read the local vector index. Check that the plugin version matches the index. ${detail}`,
   prefEngineSectionTitle: 'Embedding Engine',
   prefIndexingSectionTitle: 'Chunking & Silent Background Indexing',
   prefUiSectionTitle: 'Search UX & Appearance',

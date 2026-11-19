@@ -490,9 +490,13 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
   let onProgress;
   let vectorizedChunks = 0;
   let reads = 0;
+  let indexError;
   const coverage = { textContent: '' };
+  const feedback = { textContent: '', style: {} };
+  const indexNotice = { textContent: '' };
+  const elements = { 'zv-stat-chunks': coverage, 'zv-pref-feedback': feedback, 'zv-index-read-error': indexNotice };
   globalThis.document = {
-    getElementById: (id) => id === 'zv-stat-chunks' ? coverage : null,
+    getElementById: (id) => elements[id] ?? null,
   };
   globalThis.window = {
     requestAnimationFrame: () => 1,
@@ -510,6 +514,7 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
     getConfig: () => ({ uiLanguage: 'en-US' }),
     getEngineStatus: async () => ({ modelFingerprint: 'test:model:2' }),
     getStats: async () => {
+      if (indexError) throw indexError;
       reads++;
       return { vectorizedChunks, indexedChunks: 43 };
     },
@@ -546,6 +551,15 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
   assert.equal(coverage.textContent, '43 / 43');
   t.mock.timers.tick(1000);
   assert.equal(reads, 2);
+
+  controller.setFeedback('Local ONNX ready (384d)', 'ok');
+  indexError = new Error('no such column: vector');
+  await controller.refreshStatsAndStatus();
+  assert.equal(feedback.textContent, 'Local ONNX ready (384d)');
+  assert.match(indexNotice.textContent, /local vector index.*no such column: vector/);
+  indexError = undefined;
+  await controller.refreshStatsAndStatus();
+  assert.equal(indexNotice.textContent, '');
 });
 
 test('registerSimilarPapersSection renders .zv-item-pane-box and .zv-similar-card and uses valid FTL attributes', async () => {

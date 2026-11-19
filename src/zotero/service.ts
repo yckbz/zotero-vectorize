@@ -206,7 +206,6 @@ export class VectorizeService {
   }
 
   async downloadLocalModel(onProgress?: (p: DownloadProgressInfo) => void, draft?: PluginConfig): Promise<void> {
-    await this.init();
     const target = draft ?? this.config;
     if (draft && embeddingSettings(draft) !== embeddingSettings(this.config)) {
       const provider = this.providerManager.createProvider(draft);
@@ -218,6 +217,8 @@ export class VectorizeService {
       }
       return;
     }
+
+    await this.init();
 
     await this.withIndexMaintenance(async () => {
       const provider = await this.getProvider();
