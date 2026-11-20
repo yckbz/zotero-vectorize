@@ -166,8 +166,9 @@ export class VectorStore {
         `);
         await conn.queryAsync(`CREATE INDEX IF NOT EXISTS idx_chunks_item ON fulltext_chunks(item_id)
         `);
-        await conn.queryAsync(`CREATE INDEX IF NOT EXISTS idx_chunks_attachment ON fulltext_chunks(attachment_id)
-        `);
+        await conn.queryAsync(`CREATE INDEX IF NOT EXISTS idx_chunks_attachment_order
+          ON fulltext_chunks(attachment_id, chunk_index, chunk_id)`);
+        await conn.queryAsync('DROP INDEX IF EXISTS idx_chunks_attachment');
         await conn.queryAsync(`CREATE TABLE IF NOT EXISTS attachment_state (
             attachment_id INTEGER PRIMARY KEY,
             attachment_key TEXT NOT NULL,
@@ -718,6 +719,58 @@ export class VectorStore {
     [libraryID, chunkingKey]);
     return rows.map((row) => ({ attachmentID: Number(row.attachment_id), attachmentKey: String(row.attachment_key),
       parentItemID: Number(row.parent_item_id), fileHash: String(row.file_hash) }));
+  }
+
+  async sharedDimensions(profileId: string): Promise<number> {
+    const conn = await this.ensureConn();
+    return Number(await conn.valueQueryAsync('SELECT dim FROM embedding_profiles WHERE id = ?', [profileId])) || 0;
+  }
+
+  async *sharedItems(profileId: string, libraryID: number, dimensions: number) {
+    const conn = await this.ensureConn();
+    let key = '';
+    let id = 0;
+    for (;;) {
+      const rows = await conn.queryAsync<{
+        item_key: string; item_id: number; metadata_hash: string; vector: unknown;
+      }>(`SELECT i.item_key, i.item_id, i.metadata_hash, e.vector FROM item_vectors i
+        LEFT JOIN metadata_embeddings e ON e.item_id = i.item_id AND e.profile_id = ?
+        WHERE i.library_id = ? AND (i.item_key, i.item_id) > (?, ?)
+        ORDER BY i.item_key, i.item_id LIMIT 128`, [profileId, libraryID, key, id]);
+      for (const row of rows) {
+        key = row.item_key;
+        id = row.item_id;
+        yield { id, key, metadataHash: row.metadata_hash, vector: this.decodeVectorBlob(row.vector, dimensions) };
+      }
+      if (rows.length < 128) return;
+    }
+  }
+
+  async *sharedPassages(profileId: string, dimensions: number, attachment: {
+    attachmentID: number; attachmentKey: string; parentItemID: number;
+  }, maxPdfPages: number) {
+    const conn = await this.ensureConn();
+    let index = -1;
+    let id = '';
+    for (;;) {
+      const rows = await conn.queryAsync<{
+        chunk_id: string; chunk_index: number; page_index: number; page_label: string;
+        char_start: number; char_end: number; text: string; vector: unknown;
+      }>(`SELECT c.chunk_id, c.chunk_index, c.page_index, c.page_label, c.char_start, c.char_end, c.text, e.vector
+        FROM fulltext_chunks c LEFT JOIN passage_embeddings e ON e.chunk_id = c.chunk_id AND e.profile_id = ?
+        WHERE c.attachment_id = ? AND c.attachment_key = ? AND c.item_id = ?
+          AND (c.chunk_index, c.chunk_id) > (?, ?) AND (? = 0 OR c.page_index < ?)
+        ORDER BY c.chunk_index, c.chunk_id LIMIT 128`,
+      [profileId, attachment.attachmentID, attachment.attachmentKey, attachment.parentItemID, index, id, maxPdfPages, maxPdfPages]);
+      for (const row of rows) {
+        index = row.chunk_index;
+        id = row.chunk_id;
+        yield { index, pageIndex: row.page_index, pageLabel: row.page_label || String(row.page_index + 1),
+          charStart: row.char_start, charEnd: row.char_end, text: row.text,
+          vector: this.decodeVectorBlob(row.vector, dimensions) };
+      }
+      if (rows.length < 128) return;
+    }
   }
 
   async removeAttachment(attachmentID: number): Promise<number | null> {
