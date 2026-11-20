@@ -1,8 +1,8 @@
 import * as z from 'zod/mini';
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import {
-  LEGACY_MAX_BYTES, MAX_PART_BYTES, MAX_PARTS, MAX_SNAPSHOT_BYTES, md5Digest, readFirstSyncRecord,
-  snapshotSize, syncHeader, zoteroKey, type SyncHeader, type SyncPart,
+  contentDigest, LEGACY_MAX_BYTES, MAX_PART_BYTES, MAX_PARTS, MAX_SNAPSHOT_BYTES, md5Digest, rangeKey, readFirstSyncRecord, sha256,
+  snapshotSize, syncHeader, zoteroKey, type SyncPart,
 } from './sync-snapshot.ts';
 
 export const MAX_MANIFEST_BYTES = 256 * 1024;
@@ -10,21 +10,31 @@ const partFields = {
   bytes: z.number().check(z.int(), z.gte(1), z.lte(MAX_PART_BYTES)),
   digest: md5Digest,
 };
-const parts = <T extends z.ZodMiniType>(schema: T) => z.array(schema).check(z.minLength(1), z.maxLength(MAX_PARTS));
-const manifestSchema = z.strictObject({
+const parts = <T extends z.ZodMiniType>(schema: T) => z.array(schema).check(z.maxLength(MAX_PARTS));
+const legacyManifestSchema = z.strictObject({
   type: z.literal('zotero-vectorize-index-manifest'),
   version: z.literal(2),
   snapshot: syncHeader,
   parts: parts(z.strictObject({ ...partFields, key: zoteroKey })),
 });
-const draftSchema = z.strictObject({
+const rangeFields = { ...partFields, end: z.nullable(rangeKey), content: contentDigest };
+const maximum = z.number().check(z.int(), z.gte(1), z.lte(MAX_PART_BYTES));
+const manifestSchema = z.strictObject({
+  type: z.literal('zotero-vectorize-index-manifest'),
+  version: z.literal(3),
   snapshot: syncHeader,
-  stamp: z.string().check(z.regex(/^[a-f0-9]{16}$/)),
-  parts: parts(z.strictObject(partFields)),
+  partBytes: maximum,
+  parts: parts(z.strictObject({ ...rangeFields, key: zoteroKey })),
+});
+const draftSchema = z.strictObject({
+  version: z.literal(3),
+  snapshot: syncHeader,
+  partBytes: maximum,
+  parts: parts(z.strictObject({ ...rangeFields, key: z.optional(zoteroKey) })),
   previous: z.nullable(z.strictObject({
     generation: z.number().check(z.int(), z.gte(1)),
     digest: md5Digest,
-    keys: z.array(zoteroKey).check(z.maxLength(MAX_PARTS)),
+    parts: parts(z.strictObject({ key: zoteroKey, content: z.optional(contentDigest) })),
   })),
 });
 
@@ -39,9 +49,24 @@ export const acceptedPublication = z.strictObject({
 
 export type AcceptedPublication = z.infer<typeof acceptedPublication>;
 
-function validateTotal(parts: readonly SyncPart[]): void {
+function validateParts(parts: readonly (SyncPart & { key?: string; end?: string | null; content?: string })[], max: number): void {
   if (parts.reduce((size, part) => size + part.bytes, 0) > MAX_SNAPSHOT_BYTES) {
     throw new Error('Shared index exceeds the file size limit');
+  }
+  let last = '';
+  const keys = new Set<string>();
+  const contents = new Set<string>();
+  for (const [i, part] of parts.entries()) {
+    if (part.key && keys.has(part.key)) throw new Error('Duplicate shared index attachment');
+    if (part.key) keys.add(part.key);
+    if (part.bytes > max) throw new Error('Shared index part exceeds the configured limit');
+    if (part.end === undefined) continue;
+    if ((part.end === null) !== (i === parts.length - 1) || (part.end !== null && part.end <= last)) {
+      throw new Error('Invalid shared index range boundaries');
+    }
+    last = part.end ?? last;
+    if (contents.has(part.content!)) throw new Error('Duplicate shared index content');
+    contents.add(part.content!);
   }
 }
 
@@ -54,36 +79,55 @@ async function readManifestJSON(path: string): Promise<unknown> {
 
 export async function readSyncManifest(path: string): Promise<SyncManifest> {
   const manifest = manifestSchema.parse(await readManifestJSON(path));
-  validateTotal(manifest.parts);
-  if (new Set(manifest.parts.map((part) => part.key)).size !== manifest.parts.length) {
-    throw new Error('Duplicate shared index part');
-  }
+  validateParts(manifest.parts, manifest.partBytes);
   return manifest;
 }
 
+export async function readCachedManifest(path: string) {
+  const value = await readManifestJSON(path);
+  const latest = manifestSchema.safeParse(value);
+  if (latest.success) {
+    validateParts(latest.data.parts, latest.data.partBytes);
+    return latest.data;
+  }
+  const legacy = legacyManifestSchema.parse(value);
+  if (!legacy.parts.length) throw new Error('Empty legacy shared index');
+  validateParts(legacy.parts, MAX_PART_BYTES);
+  return legacy;
+}
+
 export async function readSyncDraft(path: string): Promise<SyncDraft> {
-  const draft = draftSchema.parse(await readManifestJSON(path));
-  validateTotal(draft.parts);
+  const value = await readManifestJSON(path);
+  if (typeof value === 'object' && value !== null && !('version' in value)) {
+    throw new Error('Finish the pending shared index publication using the previous plugin version before upgrading.');
+  }
+  const draft = draftSchema.parse(value);
+  validateParts(draft.parts, draft.partBytes);
   if (draft.previous && draft.previous.generation >= draft.snapshot.generation) {
     throw new Error('Invalid pending shared index generation');
+  }
+  const base = new Map(draft.previous?.parts.map((part) => [part.key, part.content]));
+  if (draft.parts.some((part) => part.key && base.get(part.key) !== part.content)) {
+    throw new Error('Invalid reused shared index part');
   }
   return draft;
 }
 
 export async function readPublishedHead(
   path: string,
-): Promise<{ snapshot: SyncHeader; parts: SyncManifest['parts']; digest: string }> {
+) {
   await snapshotSize(path, LEGACY_MAX_BYTES);
   const digest = await fileDigest(path);
   // The beta used the same attachment for the entire snapshot. Its first record preserves ownership on upgrade.
   const legacy = syncHeader.safeParse(await readFirstSyncRecord(path, MAX_MANIFEST_BYTES));
-  const head = legacy.success ? { snapshot: legacy.data, parts: [] } : await readSyncManifest(path);
+  const head = legacy.success ? { version: 1 as const, snapshot: legacy.data, parts: [] as const } : await readCachedManifest(path);
   if (await fileDigest(path) !== digest) throw new Error('Shared index changed while reading its publication');
   return { ...head, digest };
 }
 
 export async function writeManifestFile(path: string, data: SyncManifest | SyncDraft): Promise<void> {
   const canonical = 'type' in data ? manifestSchema.parse(data) : draftSchema.parse(data);
+  validateParts(canonical.parts, canonical.partBytes);
   const bytes = new TextEncoder().encode(JSON.stringify(canonical) + '\n');
   if (bytes.length > MAX_MANIFEST_BYTES) throw new Error('Shared index manifest is too large');
   const pending = path + '.pending';
@@ -95,9 +139,15 @@ export async function fileDigest(path: string): Promise<string> {
   return md5Digest.parse(await Zotero.Utilities.Internal.md5Async(path));
 }
 
-export async function verifyPart(path: string, expected: SyncPart): Promise<void> {
-  if (await snapshotSize(path, expected.bytes) !== expected.bytes || await fileDigest(path) !== expected.digest) {
-    throw new Error('Shared index part checksum changed');
+export async function verifyPart(path: string, expected: SyncPart & { content?: string }): Promise<void> {
+  if (await snapshotSize(path, expected.bytes) !== expected.bytes) throw new Error('Shared index part size changed');
+  if (!expected.content) {
+    if (await fileDigest(path) !== expected.digest) throw new Error('Shared index part checksum changed');
+    return;
+  }
+  const bytes = await IOUtils.read(path, { maxBytes: expected.bytes + 1 });
+  if (bytes.length !== expected.bytes || await sha256(bytes) !== expected.content) {
+    throw new Error('Shared index part content changed');
   }
 }
 

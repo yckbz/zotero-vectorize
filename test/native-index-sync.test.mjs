@@ -34,15 +34,24 @@ async function setup(t) {
       remote.set('INDEX001', { title: TITLE, filename: SHARED_FILE, bytes: Buffer.from(JSON.stringify(data) + '\n') });
     },
     get bytes() {
-      return this.manifest ? Buffer.concat(this.manifest.parts.map(({ key }) => remote.get(key).bytes)) : null;
+      const manifest = this.manifest;
+      if (!manifest) return null;
+      const parts = Buffer.concat(manifest.parts.map(({ key }) => remote.get(key).bytes));
+      const count = String(parts).split('\n').length - 1;
+      return Buffer.concat([Buffer.from(JSON.stringify(manifest.snapshot) + '\n'), parts,
+        Buffer.from(JSON.stringify(['end', count]) + '\n')]);
     },
     set bytes(bytes) {
-      const snapshot = JSON.parse(String(bytes).split('\n')[0]);
+      const [header, ...lines] = String(bytes).trimEnd().split('\n');
+      const snapshot = JSON.parse(header);
+      if (JSON.parse(lines.at(-1))[0] === 'end') lines.pop();
+      const payload = Buffer.from(lines.join('\n') + '\n');
+      const content = createHash('sha256').update(payload).digest('hex');
       const key = allocateKey();
-      remote.set(key, { title: `${TITLE} Part ${snapshot.publisher} ${snapshot.generation} 1`,
-        filename: 'zotero-vectorize-part-1.zvpart', bytes });
-      this.manifest = { type: 'zotero-vectorize-index-manifest', version: 2, snapshot,
-        parts: [{ key, bytes: bytes.length, digest: digest(bytes) }] };
+      remote.set(key, { title: `${TITLE} Part ${snapshot.publisher} ${content}`,
+        filename: 'zotero-vectorize-shard.zvpart', bytes: payload });
+      this.manifest = { type: 'zotero-vectorize-index-manifest', version: 3, snapshot, partBytes: 32 * 1024 * 1024,
+        parts: [{ key, bytes: payload.length, digest: digest(payload), content, end: null }] };
     },
   };
   const live = new Set();
@@ -51,9 +60,17 @@ async function setup(t) {
     delete globalThis.Zotero;
     delete globalThis.IOUtils;
     delete globalThis.PathUtils;
+    delete globalThis.ChromeUtils;
     await fs.rm(root, { recursive: true, force: true });
   });
   globalThis.PathUtils = { join: path.join, parent: path.dirname, filename: path.basename };
+  globalThis.ChromeUtils = {
+    base64URLEncode: (bytes) => Buffer.from(bytes).toString('base64').replaceAll('+', '-').replaceAll('/', '_'),
+    base64URLDecode: (text) => {
+      if (!/^(?:[\w-]{4})*(?:[\w-]{2}==|[\w-]{3}=)?$/.test(text)) throw new Error('Invalid Base64URL');
+      return new Uint8Array(Buffer.from(text, 'base64url')).buffer;
+    },
+  };
   globalThis.IOUtils = {
     makeDirectory: (file) => fs.mkdir(file, { recursive: true }),
     stat: async (file) => {
@@ -336,7 +353,7 @@ async function setup(t) {
       await service.shutdown();
       live.delete(service);
     };
-    return { dir, start, shutdown, prefs, zotero, items, events, flags, pdfFile, carrier, observers };
+    return { dir, start, shutdown, prefs, zotero, items, events, flags, pdfFile, carrier, observers, makePaper };
   }
   return { createDevice, transport, jumpToSearchHit };
 }
@@ -413,6 +430,8 @@ test('Zotero publishes a manifest and private-library indexes stay local while a
   };
   await source.indexSync.syncNow();
   assert.equal(transport.uploads, 2);
+  assert.deepEqual(transport.partUploads, transport.manifest.parts.map((part) => part.key));
+  assert.deepEqual(transport.erased, []);
   assert.equal(publisher.items.get(4), publisher.carrier);
   await publisher.shutdown(source);
 
@@ -590,7 +609,10 @@ test('offline sync, corrupted publications, account changes and model drift pres
   const header = JSON.parse(corrupted[0]);
   header.generation++;
   corrupted[0] = JSON.stringify(header);
-  transport.bytes = Buffer.from(corrupted.slice(0, -1).join('\n') + '\n');
+  const invalid = JSON.parse(corrupted[1]);
+  invalid[3] = 'AAAAAAAA'; // Invalid vector length with otherwise correct file checksums.
+  corrupted[1] = JSON.stringify(invalid);
+  transport.bytes = Buffer.from(corrupted.join('\n') + '\n');
   await service.indexSync.syncNow();
   assert.equal(service.indexSync.getStatus().phase, 'error');
   assert.equal(service.indexSync.active.manifest.generation, generation);
@@ -744,15 +766,17 @@ test('a part size change publishes a new generation and the preference persists 
   const publisher = await createDevice('publisher', 0, 'off');
   let source = await publisher.start();
   await source.startIndexing();
-  assert.equal(source.indexSync.getPartSizeMiB(), 256);
+  assert.equal(source.indexSync.getPartSizeMiB(), 32);
   source.indexSync.setPartSizeMiB(64);
-  assert.equal(source.indexSync.getPartSizeMiB(), 256);
+  assert.equal(source.indexSync.getPartSizeMiB(), 32);
   source.indexSync.setRole('publish');
   source.indexSync.setPartSizeMiB(512);
-  assert.equal(source.indexSync.getPartSizeMiB(), 256);
+  assert.equal(source.indexSync.getPartSizeMiB(), 32);
   await source.indexSync.syncNow();
   const first = transport.manifest;
-  source.indexSync.setPartSizeMiB(64);
+  source.indexSync.setPartSizeMiB(8);
+  publisher.flags.partBytes = 256;
+  source.indexSync.partBytes = () => publisher.flags.partBytes;
   transport.beforeErase = () => { throw new Error('Interrupted remote retirement'); };
   await source.indexSync.syncNow();
   assert.ok(transport.manifest.snapshot.generation > first.snapshot.generation);
@@ -763,17 +787,149 @@ test('a part size change publishes a new generation and the preference persists 
 
   source = await publisher.start();
   transport.beforeErase = undefined;
-  assert.equal(source.indexSync.getPartSizeMiB(), 64);
+  assert.equal(source.indexSync.getPartSizeMiB(), 8);
   await source.indexSync.syncNow();
   assert.equal(source.indexSync.getStatus().phase, 'ready');
   assert.deepEqual(transport.erased, first.parts.map((part) => part.key));
   assert.equal(transport.uploads, 2);
 });
 
+test('single-document changes transfer only changed shards and an offline receiver can skip generations', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 512;
+  publisher.zotero.PDFWorker.getFullText = async () => {
+    const pages = Array.from({ length: 7 }, (_, page) => 'Hydrogen diffusion on page ' + page + ' ' + '纳米管'.repeat(24));
+    return { text: pages.join('\f'), extractedPages: pages.length, totalPages: pages.length };
+  };
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const first = transport.manifest;
+  assert.ok(first.parts.length >= 4);
+  const sharedItems = source.store.sharedItems.bind(source.store);
+  let scans = 0;
+  source.store.sharedItems = (...args) => {
+    scans++;
+    return sharedItems(...args);
+  };
+  await source.indexSync.run(false);
+  assert.equal(scans, 0, 'An automatic check of an identical source should avoid scanning vector rows');
+  await source.indexItems([3]);
+  await source.indexSync.run(false);
+  assert.equal(scans, 1, 'A committed write should invalidate the local scan result');
+  assert.deepEqual(transport.manifest, first, 'A private group write must leave the shared head unchanged');
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  let destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  const originalCoverage = destination.indexSync.getSharedStats();
+  await receiver.shutdown(destination);
+
+  source = await publisher.start();
+  publisher.items.set(700, publisher.makePaper(700, 'ZZZNEW01', 1, 'New metadata-only paper'));
+  await source.indexItems([700]);
+  transport.partUploads.length = 0;
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const second = transport.manifest;
+  const unchanged = second.parts.filter((part) => first.parts.some((old) => old.key === part.key));
+  assert.ok(unchanged.length >= first.parts.length - 1);
+  const added = second.parts.filter((part) => !unchanged.includes(part));
+  assert.equal(added.length, 1);
+  assert.deepEqual(transport.partUploads, added.map((part) => part.key));
+  assert.ok(unchanged.every(({ key }) => transport.remote.has(key) && !transport.erased.includes(key)));
+  source.updateConfig({ hybridSemanticWeight: 0.35 });
+  await source.indexSync.syncNow();
+  const third = transport.manifest;
+  assert.ok(third.snapshot.generation > second.snapshot.generation);
+  assert.deepEqual(third.parts, second.parts);
+  assert.deepEqual(transport.partUploads, added.map((part) => part.key));
+  await publisher.shutdown(source);
+
+  receiver.items.set(800, receiver.makePaper(800, 'ZZZNEW01', 1, 'New metadata-only paper'));
+  transport.partDownloads.length = 0;
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.active.manifest.generation, third.snapshot.generation);
+  assert.deepEqual(transport.partDownloads, added.map((part) => part.key));
+  assert.equal(destination.indexSync.active.index.getItemById(800).itemKey, 'ZZZNEW01');
+  assert.equal(destination.indexSync.getSharedStats().vectorizedChunks, originalCoverage.vectorizedChunks);
+  await receiver.shutdown(destination);
+
+  source = await publisher.start();
+  publisher.items.get(700).deleted = true;
+  publisher.items.get(1).deleted = true;
+  await source.indexSync.syncNow();
+  const empty = transport.manifest;
+  assert.deepEqual(empty.parts, []);
+  assert.ok(third.parts.every(({ key }) => transport.erased.includes(key) && !transport.remote.has(key)));
+  await publisher.shutdown(source);
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active.manifest.generation, empty.snapshot.generation);
+  assert.equal(destination.indexSync.getSharedStats().indexedItems, 0);
+  assert.deepEqual(transport.partDownloads, added.map((part) => part.key));
+});
+
+test('receiver follows a newer manifest when an in-flight generation loses a retired shard', { timeout: 4000 }, async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const first = transport.manifest;
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  let destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  await receiver.shutdown(destination);
+
+  source = await publisher.start();
+  let middle;
+  for (const [id, key] of [[700, 'ZZZNEW01'], [701, 'ZZZNEW02']]) {
+    publisher.items.set(id, publisher.makePaper(id, key, 1, 'New paper ' + key));
+    await source.indexItems([id]);
+    await source.indexSync.syncNow();
+    if (id === 700) middle = transport.manifest;
+  }
+  const newest = transport.manifest;
+  await publisher.shutdown(source);
+  const [{ key: retired }] = middle.parts;
+  assert.ok(!transport.remote.has(retired));
+  transport.manifest = middle;
+  receiver.items.set(800, receiver.makePaper(800, 'ZZZNEW01', 1, 'New paper ZZZNEW01'));
+  receiver.items.set(801, receiver.makePaper(801, 'ZZZNEW02', 1, 'New paper ZZZNEW02'));
+  destination = await receiver.start();
+  let headChecks = 0;
+  transport.beforeDownload = (item) => {
+    if (item === receiver.carrier && ++headChecks === 2) transport.manifest = newest;
+  };
+  const finished = new Promise((resolve) => {
+    const unsubscribe = destination.indexSync.subscribe(() => {
+      if (destination.indexSync.getStatus().phase === 'ready' &&
+          destination.indexSync.active?.manifest.generation === newest.snapshot.generation) {
+        unsubscribe();
+        resolve();
+      }
+    });
+  });
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'waiting');
+  assert.equal(destination.indexSync.active.manifest.generation, first.snapshot.generation);
+  await finished;
+  assert.ok(!transport.partDownloads.includes(retired));
+  assert.equal(destination.indexSync.active.index.getItemById(801).itemKey, 'ZZZNEW02');
+});
+
 test('publishing resumes the same generation after interrupted import, part upload, and manifest upload', async (t) => {
   const { createDevice, transport } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'off');
-  publisher.flags.partBytes = 512;
+  publisher.flags.partBytes = 256;
   let source = await publisher.start();
   await source.startIndexing();
   source.indexSync.setRole('publish');
@@ -965,22 +1121,22 @@ test('a beta publisher upgrades its bound attachment while a beta receiver can s
   original.parts.forEach(({ key }) => transport.remote.delete(key));
   await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), legacy);
   publisher.carrier.attachmentSyncedHash = digest(legacy);
-  publisher.prefs.set(PREFIX + 'syncPublishedStamp', '0'.repeat(16));
 
   const receiver = await createDevice('receiver', 100, 'receive');
   transport.offline = true;
-  let destination = await receiver.start();
-  const cache = path.join(destination.store.getStoreDir(), 'shared-index-101.zvindex');
-  destination.indexSync.setPartSizeMiB(64);
-  assert.equal(destination.indexSync.getPartSizeMiB(), 256);
+  const cache = path.join(receiver.dir, 'zotero-vectorize', 'shared-index-101.zvindex');
+  await fs.mkdir(path.dirname(cache), { recursive: true });
   await fs.writeFile(cache, legacy);
+  let destination = await receiver.start();
+  destination.indexSync.setPartSizeMiB(64);
+  assert.equal(destination.indexSync.getPartSizeMiB(), 32);
   await destination.indexSync.syncNow();
   assert.equal(destination.indexSync.active?.manifest.generation, original.snapshot.generation);
   assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
   await receiver.shutdown(destination);
 
   transport.offline = false;
-  publisher.flags.partBytes = 512;
+  publisher.flags.partBytes = 256;
   source = await publisher.start();
   transport.beforeUpload = (item) => {
     if (item !== publisher.carrier) assert.deepEqual(transport.remote.get('INDEX001').bytes, legacy);
@@ -989,7 +1145,7 @@ test('a beta publisher upgrades its bound attachment while a beta receiver can s
   transport.beforeUpload = undefined;
   assert.equal(source.indexSync.getStatus().phase, 'ready');
   assert.equal(publisher.items.get(4), publisher.carrier);
-  assert.equal(transport.manifest.parts.length, 2);
+  assert.ok(transport.manifest.parts.length > 1);
   assert.ok(transport.manifest.snapshot.generation > original.snapshot.generation);
   await publisher.shutdown(source);
 
@@ -1000,10 +1156,64 @@ test('a beta publisher upgrades its bound attachment while a beta receiver can s
   await assert.rejects(fs.stat(cache), { code: 'ENOENT' });
 });
 
+test('v2 ownership and offline cache survive a coordinated cutover and the old part retires after commit', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const { snapshot, parts: [{ key }] } = transport.manifest;
+  const legacyBytes = transport.bytes;
+  const filename = 'zotero-vectorize-part-1.zvpart';
+  const title = `${TITLE} Part ${snapshot.publisher} ${snapshot.generation} 1`;
+  transport.remote.set(key, { title, filename, bytes: legacyBytes });
+  const attachment = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, key);
+  attachment.attachmentFilename = filename;
+  attachment.getField = (field) => field === 'title' ? title : '';
+  await fs.writeFile(path.join(publisher.dir, 'storage', key, filename), legacyBytes);
+  transport.manifest = {
+    type: 'zotero-vectorize-index-manifest', version: 2, snapshot,
+    parts: [{ key, bytes: legacyBytes.length, digest: digest(legacyBytes) }],
+  };
+  const head = transport.remote.get('INDEX001').bytes;
+  publisher.carrier.attachmentSyncedHash = digest(head);
+  await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), head);
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const cache = path.join(receiver.dir, 'zotero-vectorize', 'shared-index-101');
+  const cachedParts = path.join(cache, 'parts-' + digest(head));
+  await fs.mkdir(cachedParts, { recursive: true });
+  await fs.writeFile(path.join(cache, 'current.zvmanifest'), head);
+  await fs.writeFile(path.join(cachedParts, filename), legacyBytes);
+  transport.offline = true;
+  let destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, snapshot.generation);
+  assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+  await receiver.shutdown(destination);
+
+  transport.offline = false;
+  source = await publisher.start();
+  transport.beforeErase = () => assert.equal(transport.manifest.version, 3);
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(transport.manifest.version, 3);
+  assert.deepEqual(transport.erased, [key]);
+  assert.equal(publisher.items.get(4), publisher.carrier);
+  await publisher.shutdown(source);
+
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.active.manifest.generation, transport.manifest.snapshot.generation);
+  await assert.rejects(fs.stat(cachedParts), { code: 'ENOENT' });
+});
+
 test('a published generation repairs a missing ZIP and a fully missing part with the same keys', async (t) => {
   const { createDevice, transport } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'publish');
-  publisher.flags.partBytes = 512;
+  publisher.flags.partBytes = 256;
   const source = await publisher.start();
   await source.startIndexing();
   await source.indexSync.syncNow();
@@ -1041,7 +1251,7 @@ test('a published generation repairs a missing ZIP and a fully missing part with
 test('an inconclusive remote check, conflicting hashes and modified local parts prohibit repair', async (t) => {
   const { createDevice, transport } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'publish');
-  publisher.flags.partBytes = 512;
+  publisher.flags.partBytes = 256;
   const source = await publisher.start();
   await source.startIndexing();
   await source.indexSync.syncNow();
@@ -1093,22 +1303,22 @@ test('if a missing part reappears during local verification, its remote digest i
   await source.indexSync.syncNow();
   assert.equal(source.indexSync.getStatus().phase, 'ready');
   const [part] = transport.manifest.parts;
-  const md5Async = publisher.zotero.Utilities.Internal.md5Async;
+  const read = IOUtils.read;
   const partPath = path.join(publisher.dir, 'storage', part.key, transport.remote.get(part.key).filename);
   for (const replacement of [part.digest, '0'.repeat(32)]) {
     transport.missingFiles.add(part.key);
-    publisher.zotero.Utilities.Internal.md5Async = async (file) => {
+    IOUtils.read = async (file, options) => {
       if (file === partPath) {
         transport.missingFiles.delete(part.key);
         transport.remoteHashes.set(part.key, replacement);
       }
-      return md5Async(file);
+      return read(file, options);
     };
     await source.indexSync.syncNow();
     assert.equal(source.indexSync.getStatus().phase, replacement === part.digest ? 'ready' : 'conflict');
     assert.deepEqual(transport.forcedUploads, []);
   }
-  publisher.zotero.Utilities.Internal.md5Async = md5Async;
+  IOUtils.read = read;
 });
 
 test('a concurrent carrier update cannot be overwritten by a prepared generation', async (t) => {
@@ -1120,15 +1330,15 @@ test('a concurrent carrier update cannot be overwritten by a prepared generation
   assert.equal(source.indexSync.getStatus().phase, 'ready');
   const originalPartCount = transport.partUploads.length;
   const current = transport.manifest;
-  const loadAll = source.store.loadAll.bind(source.store);
+  const sharedDimensions = source.store.sharedDimensions.bind(source.store);
   const changedHead = { ...current, snapshot: { ...current.snapshot, generation: current.snapshot.generation + 1 } };
-  source.store.loadAll = async (...args) => {
-    const records = await loadAll(...args);
+  source.store.sharedDimensions = async (...args) => {
+    const dimensions = await sharedDimensions(...args);
     transport.manifest = changedHead;
     const bytes = transport.remote.get(publisher.carrier.key).bytes;
     await fs.writeFile(path.join(publisher.dir, 'storage', publisher.carrier.key, SHARED_FILE), bytes);
     publisher.carrier.attachmentSyncedHash = digest(bytes);
-    return records;
+    return dimensions;
   };
   source.updateConfig({ hybridSemanticWeight: 0.35 });
   await source.indexSync.syncNow();
@@ -1158,10 +1368,32 @@ test('a conflicting remote carrier blocks a new publication before any parts are
   assert.deepEqual(transport.erased, []);
 });
 
+test('a second publisher discovers the existing head before importing or uploading new parts', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const current = transport.manifest;
+  const uploads = [...transport.partUploads];
+  await publisher.shutdown(source);
+
+  const second = await createDevice('second-publisher', 100, 'off');
+  const contender = await second.start();
+  await contender.startIndexing();
+  contender.indexSync.setRole('publish');
+  await contender.indexSync.syncNow();
+  assert.equal(contender.indexSync.getStatus().phase, 'conflict');
+  assert.deepEqual(transport.manifest, current);
+  assert.deepEqual(transport.partUploads, uploads);
+  assert.deepEqual(transport.erased, []);
+  assert.equal(second.prefs.get(PREFIX + 'syncAttachment'), undefined);
+});
+
 test('resuming a draft repairs a lost ZIP before exposing the manifest', async (t) => {
   const { createDevice, transport } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'publish');
-  publisher.flags.partBytes = 512;
+  publisher.flags.partBytes = 256;
   let source = await publisher.start();
   await source.startIndexing();
   transport.beforeUpload = (item) => {
@@ -1211,7 +1443,8 @@ test('committed generation identity survives missing cache data and rejects stal
     publisher: latest.snapshot.publisher, generation: latest.snapshot.generation, digest: hash,
   });
   receiver.prefs.delete(accepted); // An existing cache from before the independent identity was recorded.
-  await fs.unlink(path.join(dir, 'parts-' + hash, 'zotero-vectorize-part-1.zvpart'));
+  const [{ key, content }] = latest.parts;
+  await fs.unlink(path.join(dir, 'shards', key + '-' + content + '.zvpart'));
   transport.bytes = older;
   destination = await receiver.start();
   await destination.indexSync.syncNow();
@@ -1275,7 +1508,8 @@ test('one check resumes an acknowledged draft and publishes the newly selected p
   assert.equal(source.indexSync.getPartSizeMiB(), 64);
   assert.equal(transport.uploads, 2);
   assert.ok(transport.manifest.snapshot.generation > first.snapshot.generation);
-  assert.deepEqual(transport.erased, first.parts.map((part) => part.key));
+  assert.deepEqual(transport.erased, []);
+  assert.deepEqual(transport.manifest.parts, first.parts);
   await source.indexSync.syncNow();
   assert.equal(transport.uploads, 2);
 });

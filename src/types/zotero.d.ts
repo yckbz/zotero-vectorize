@@ -31,6 +31,8 @@ export interface LocalizationInstance {
 
 export interface ChromeUtilsNamespace {
   importESModule<T = Record<string, any>>(uri: string): T;
+  base64URLEncode(source: BufferSource, options: { pad: boolean }): string;
+  base64URLDecode(value: string, options: { padding: 'require' }): ArrayBuffer;
 }
 
 export interface ComponentsNamespace {
@@ -64,7 +66,7 @@ export interface ServicesNamespace {
 }
 
 export interface IOUtilsNamespace {
-  read(path: string, options?: { offset?: number; maxBytes?: number }): Promise<Uint8Array>;
+  read(path: string, options?: { offset?: number; maxBytes?: number }): Promise<Uint8Array<ArrayBuffer>>;
   readUTF8(path: string): Promise<string>;
   readJSON(path: string): Promise<any>;
   write(path: string, data: Uint8Array, options?: Record<string, any>): Promise<number>;
