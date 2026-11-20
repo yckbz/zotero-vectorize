@@ -31,6 +31,8 @@ export interface LocalizationInstance {
 
 export interface ChromeUtilsNamespace {
   importESModule<T = Record<string, any>>(uri: string): T;
+  base64URLEncode(source: BufferSource, options: { pad: boolean }): string;
+  base64URLDecode(value: string, options: { padding: 'require' }): ArrayBuffer;
 }
 
 export interface ComponentsNamespace {
@@ -64,7 +66,7 @@ export interface ServicesNamespace {
 }
 
 export interface IOUtilsNamespace {
-  read(path: string, options?: { offset?: number; maxBytes?: number }): Promise<Uint8Array>;
+  read(path: string, options?: { offset?: number; maxBytes?: number }): Promise<Uint8Array<ArrayBuffer>>;
   readUTF8(path: string): Promise<string>;
   readJSON(path: string): Promise<any>;
   write(path: string, data: Uint8Array, options?: Record<string, any>): Promise<number>;
@@ -75,6 +77,7 @@ export interface IOUtilsNamespace {
   move(source: string, dest: string, options?: { noOverwrite?: boolean }): Promise<void>;
   copy(source: string, dest: string, options?: { noOverwrite?: boolean }): Promise<void>;
   stat(path: string): Promise<{ size: number; lastModified: number; type: string }>;
+  setModificationTime(path: string, modificationTime: number): Promise<number>;
   getChildren(path: string): Promise<string[]>;
 }
 
@@ -310,6 +313,7 @@ export interface ZoteroNamespace {
     ): Promise<{ status: number; responseText: string; response: any; getResponseHeader(name: string): string | null }>;
   };
   File: {
+    pathToFile(path: string): object;
     createDirectoryIfMissingAsync(path: string): Promise<void>;
     getContentsAsync(path: string): Promise<string>;
     getContentsFromURL?(url: string): string;

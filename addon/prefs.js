@@ -27,4 +27,3 @@ pref("extensions.zotero-vectorize.uiLanguage", "auto");
 pref("extensions.zotero-vectorize.mcpEnabled", false);
 pref("extensions.zotero-vectorize.mcpToken", "");
 pref("extensions.zotero-vectorize.syncRole", "off");
-pref("extensions.zotero-vectorize.syncPartSizeMiB", 256);

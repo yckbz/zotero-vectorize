@@ -1,5 +1,6 @@
 import type { PluginConfig } from '../types/vectorize.ts';
 import { resolveUiLocale } from './config.ts';
+import type { SyncPhase } from './index-sync.ts';
 
 export type LocaleStrings = {
   brandTitle: string;
@@ -104,7 +105,7 @@ export type LocaleStrings = {
   prefIndexSyncRole: { off: string; publish: string; receive: string };
   prefIndexSyncAdvanced: string;
   prefIndexSyncPartSize: string;
-  prefIndexSyncState: Record<'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' | 'error', string>;
+  prefIndexSyncState: Record<SyncPhase, string>;
   prefIndexSyncNow: string;
   prefItemsIndexed: string;
   prefChunksIndexed: string;
@@ -263,6 +264,8 @@ const ZH_CN: LocaleStrings = {
     model: '需要已校验的同版本 ONNX 或 Ollama 模型。',
     cloud: '请核对两端的 Base URL、模型和输出维度，并在本机填写有效的 API Key。',
     conflict: '检测到多个发布者或附件冲突。请先在 Zotero 中检查共享索引附件。',
+    upgradePublisher: '发布端仍在使用旧版同步协议。请升级发布端并重新发布索引。',
+    upgradeReceiver: '共享索引使用更新的同步协议。请升级本机的 Zotero Vectorize。',
     error: '共享索引更新失败。仍可使用本机已有索引。',
   },
   prefIndexSyncNow: '立即检查同步',
@@ -423,6 +426,8 @@ const EN_US: LocaleStrings = {
     model: 'A matching, verified ONNX or Ollama model is required.',
     cloud: 'Match the Base URL, model, and output dimensions across devices and enter a valid API key on this device.',
     conflict: 'Multiple publishers or an attachment conflict were detected. Check the shared index attachment in Zotero.',
+    upgradePublisher: 'The publisher is using an older sync format. Upgrade the publishing device and publish its index again.',
+    upgradeReceiver: 'The shared index uses a newer sync format. Upgrade Zotero Vectorize on this device.',
     error: 'The shared index could not be updated. Existing indexes are still searchable.',
   },
   prefIndexSyncNow: 'Check sync now',

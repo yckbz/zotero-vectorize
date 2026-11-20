@@ -1,7 +1,7 @@
 import * as z from 'zod/mini';
 import { buildSnippet } from '../core/chunker.ts';
 import { buildModelFingerprint } from '../core/hash.ts';
-import { bytesToFloat32, float32ToBytes, isFiniteVector } from '../core/math.ts';
+import { isFiniteVector } from '../core/math.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
 import type { PluginConfig, IndexedItemRecord, IndexedChunkRecord } from '../types/vectorize.ts';
 import type { ZoteroItem } from '../types/zotero.d.ts';
@@ -18,6 +18,8 @@ const int = (min: number, max: number) => z.number().check(z.int(), z.gte(min), 
 const bounded = (min: number, max: number) => z.string().check(z.minLength(min), z.maxLength(max));
 export const zoteroKey = z.string().check(z.regex(/^[A-Z0-9]{8}$/));
 export const md5Digest = z.string().check(z.regex(/^[a-f0-9]{32}$/));
+export const contentDigest = z.string().check(z.regex(/^[a-f0-9]{64}$/));
+export const rangeKey = z.string().check(z.regex(/^[A-Z0-9]{8}(?:\/[A-Z0-9]{8}(?:\/(?:0\d{6}|1000000))?)?$/));
 const hash = z.string().check(z.regex(/^[a-f0-9]{16}$/));
 const revision = z.string().check(z.regex(/^(?:[a-f0-9]{32}:[a-f0-9]{32}|(?:sha256:)?[a-f0-9]{64})$/));
 const model = z.string().check(z.regex(/^[a-zA-Z0-9][a-zA-Z0-9_./:-]{0,199}$/));
@@ -56,8 +58,28 @@ export interface SyncPart {
   digest: string;
 }
 
+export interface RangePart extends SyncPart {
+  end: string | null;
+  content: string;
+}
+
+export const SHARD_FILENAME = 'zotero-vectorize-shard.zvpart';
+
+// Legacy cache and retirement use the original numbered filenames.
 export function partFilename(i: number): string {
   return `zotero-vectorize-part-${i + 1}.zvpart`;
+}
+
+export async function sha256(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function recordKey(row: SyncRecord, attachmentParent?: string): string {
+  if (row[0] === 'item') return row[1];
+  if (row[0] === 'pdf') return row[2] + '/' + row[1];
+  if (!attachmentParent) throw new Error('Invalid shared passage parent');
+  return attachmentParent + '/' + row[1] + '/' + String(row[2]).padStart(7, '0');
 }
 
 export async function cloudEndpointDigest(baseUrl: string): Promise<string | null> {
@@ -68,8 +90,7 @@ export async function cloudEndpointDigest(baseUrl: string): Promise<string | nul
   if (url.username || url.password) return null;
   const path = url.pathname.replace(/\/+$/, '').replace(/\/embeddings$/, '');
   const bytes = new TextEncoder().encode(url.origin + path + '/embeddings');
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return sha256(bytes);
 }
 
 export function syncSearchConfig(settings: SyncHeader, local: PluginConfig): PluginConfig {
@@ -87,14 +108,16 @@ export function syncSearchConfig(settings: SyncHeader, local: PluginConfig): Plu
 
 export function packVector(vec: Float32Array | null): string | null {
   if (!vec) return null;
-  return btoa(String.fromCharCode(...float32ToBytes(vec)));
+  const bytes = new Uint8Array(vec.buffer as ArrayBuffer, vec.byteOffset, vec.byteLength);
+  return ChromeUtils.base64URLEncode(bytes, { pad: true });
 }
 
-function unpackVector(input: string | null, dimensions: number): Float32Array | null {
+function unpackVector(input: string | null, dimensions: number, legacy: boolean): Float32Array | null {
   if (input === null) return null;
-  const raw = atob(input);
-  if (raw.length !== dimensions * 4) throw new Error('Invalid shared vector length');
-  const vector = bytesToFloat32(Uint8Array.from(raw, (ch) => ch.charCodeAt(0)));
+  const encoded = legacy ? input.replaceAll('+', '-').replaceAll('/', '_') : input;
+  const raw = ChromeUtils.base64URLDecode(encoded, { padding: 'require' });
+  if (raw.byteLength !== dimensions * 4) throw new Error('Invalid shared vector length');
+  const vector = new Float32Array(raw);
   if (!isFiniteVector(vector)) throw new Error('Invalid shared vector values');
   return vector;
 }
@@ -131,58 +154,73 @@ export async function readFirstSyncRecord(path: string, maxLine?: number): Promi
   throw new Error('Shared index header is missing');
 }
 
-export async function writeSyncParts(
-  dir: string, manifest: SyncHeader, records: AsyncIterable<SyncRecord>, maxPartBytes: number,
-): Promise<SyncPart[]> {
+export async function prepareSyncParts(
+  dir: string, records: AsyncIterable<SyncRecord>, maxPartBytes: number,
+  previous: readonly (RangePart & { key?: string })[],
+): Promise<(RangePart & { key?: string })[]> {
   if (!Number.isSafeInteger(maxPartBytes) || maxPartBytes < 1 || maxPartBytes > MAX_PART_BYTES) {
     throw new Error('Invalid shared index part size');
   }
   const encoder = new TextEncoder();
-  const buffer = new Uint8Array(Math.min(BLOCK_SIZE, maxPartBytes));
-  const parts: SyncPart[] = [];
-  let path = PathUtils.join(dir, partFilename(0));
-  let buffered = 0;
-  let written = 0;
+  const buffer = new Uint8Array(maxPartBytes);
+  const parts: (RangePart & { key?: string })[] = [];
+  const byContent = new Map(previous.filter((part) => part.key).map((part) => [part.content, part]));
+  let used = 0;
   let total = 0;
-  let count = 0;
+  let range = 0;
+  let last = '';
+  let parent: string | undefined;
+  let attachment: string | undefined;
 
-  const flush = async () => {
-    if (!buffered) return;
-    await IOUtils.write(path, buffer.subarray(0, buffered), { mode: written ? 'append' : 'create' });
-    written += buffered;
-    buffered = 0;
+  const finishPart = async (end: string | null) => {
+    if (!used) {
+      // Absorb an empty range without changing the adjacent file's contents.
+      if (parts.length) parts[parts.length - 1].end = end;
+      return;
+    }
+    if (parts.length >= MAX_PARTS) throw new Error('Shared index exceeds the part count limit');
+    const data = buffer.subarray(0, used);
+    const content = await sha256(data);
+    const old = byContent.get(content);
+    if (old && old.bytes === used) {
+      parts.push({ ...old, end });
+    } else {
+      const stage = PathUtils.join(dir, content);
+      await IOUtils.makeDirectory(stage, { ignoreExisting: true });
+      const path = PathUtils.join(stage, SHARD_FILENAME);
+      await IOUtils.write(path, data);
+      const digest = md5Digest.parse(await Zotero.Utilities.Internal.md5Async(path));
+      parts.push({ end, bytes: used, content, digest });
+    }
+    used = 0;
   };
-  const finishPart = async () => {
-    await flush();
-    const digest = await Zotero.Utilities.Internal.md5Async(path);
-    parts.push({ bytes: written, digest: md5Digest.parse(digest) });
-    written = 0;
-    path = PathUtils.join(dir, partFilename(parts.length));
-  };
-  const append = async (row: unknown) => {
-    const line = JSON.stringify(row);
+
+  for await (const row of records) {
+    if (row[0] === 'item') attachment = undefined;
+    if (row[0] === 'pdf') {
+      attachment = row[1];
+      parent = row[2];
+    }
+    if (row[0] === 'chunk' && row[1] !== attachment) throw new Error('Invalid shared passage order');
+    const key = recordKey(row, parent);
+    if (key <= last) throw new Error('Shared index records are out of order');
+    last = key;
+    const line = JSON.stringify(record.parse(row));
     if (line.length > MAX_LINE) throw new Error('Shared index record is too large');
     const bytes = encoder.encode(line + '\n');
     if (bytes.length > maxPartBytes) throw new Error('Shared index record exceeds the part size');
     if (total + bytes.length > MAX_SNAPSHOT_BYTES) throw new Error('Shared index exceeds the file size limit');
-    if (written + buffered + bytes.length > maxPartBytes) {
-      await finishPart();
-      if (parts.length >= MAX_PARTS) throw new Error('Shared index exceeds the part count limit');
+    let end = previous[range]?.end;
+    while (end && key >= end) {
+      await finishPart(end);
+      end = previous[++range]?.end;
     }
-    if (buffered + bytes.length > buffer.length) await flush();
-    // A single bounded record always fits in a block.
-    buffer.set(bytes, buffered);
-    buffered += bytes.length;
+    if (used + bytes.length > maxPartBytes) await finishPart(key);
+    buffer.set(bytes, used);
+    used += bytes.length;
     total += bytes.length;
-  };
-
-  await append(syncHeader.parse(manifest));
-  for await (const row of records) {
-    await append(record.parse(row));
-    count++;
   }
-  await append(record.parse(['end', count]));
-  await finishPart();
+  await finishPart(null);
   return parts;
 }
 
@@ -192,39 +230,50 @@ export interface ReceivedSnapshot {
 }
 
 export async function readSyncSnapshot(
-  paths: readonly string[], expected: SyncHeader, libraryID: number, maxPartBytes = MAX_PART_BYTES,
+  paths: readonly string[], expected: SyncHeader, libraryID: number, ranges?: readonly RangePart[],
+  maxPartBytes = MAX_PART_BYTES,
 ): Promise<ReceivedSnapshot> {
-  let manifest: SyncHeader | undefined;
+  let manifest: SyncHeader | undefined = ranges ? expected : undefined;
   let count = 0;
   let ended = false;
-  let fingerprint = '';
+  const fingerprint = buildModelFingerprint(expected.engine, expected.model, expected.dimensions);
   const items = new Map<string, IndexedItemRecord | null>();
   const chunks: IndexedChunkRecord[] = [];
   const attachments = new Map<string, { item: ZoteroItem; sourceHash: string; itemKey: string } | null>();
   const seenChunks = new Set<string>();
+  const parents = new Map<string, string>();
+  let last = '';
   async function* records() {
-    for (const path of paths) yield* lines(path, maxPartBytes);
+    for (const [i, path] of paths.entries()) {
+      const start = ranges?.[i - 1]?.end;
+      const end = ranges?.[i].end;
+      for await (const line of lines(path, maxPartBytes)) yield { line, start, end };
+    }
   }
-  for await (const line of records()) {
+  for await (const { line, start, end } of records()) {
     const raw: unknown = JSON.parse(line);
     if (!manifest) {
       manifest = syncHeader.parse(raw);
       if (JSON.stringify(manifest) !== JSON.stringify(expected)) throw new Error('Shared index header does not match');
-      fingerprint = buildModelFingerprint(manifest.engine, manifest.model, manifest.dimensions);
       continue;
     }
     if (ended) throw new Error('Unexpected data after the shared index footer');
     const row = record.parse(raw);
     if (row[0] === 'end') {
-      if (row[1] !== count) throw new Error('Shared index record count does not match');
+      if (ranges || row[1] !== count) throw new Error('Invalid shared index footer');
       ended = true;
       continue;
+    }
+    if (ranges) {
+      const key = recordKey(row, parents.get(row[1]));
+      if (key <= last || (start && key < start) || (end && key >= end)) throw new Error('Invalid shared index range');
+      last = key;
     }
     count++;
     if (row[0] === 'item') {
       const [, itemKey, metadataHash, packed] = row;
       if (items.has(itemKey)) throw new Error('Duplicate shared item');
-      const vec = unpackVector(packed, manifest.dimensions);
+      const vec = unpackVector(packed, manifest.dimensions, !ranges);
       const source = await Zotero.Items.getByLibraryAndKeyAsync(libraryID, itemKey);
       if (!source || !isIndexableRegularItem(source)) {
         items.set(itemKey, null);
@@ -239,6 +288,7 @@ export async function readSyncSnapshot(
     } else if (row[0] === 'pdf') {
       const [, attachmentKey, itemKey, sourceHash] = row;
       if (!items.has(itemKey) || attachments.has(attachmentKey)) throw new Error('Invalid shared attachment reference');
+      if (ranges) parents.set(attachmentKey, itemKey);
       const parent = items.get(itemKey);
       const item = parent && await Zotero.Items.getByLibraryAndKeyAsync(libraryID, attachmentKey);
       if (!item || item.deleted || !item.isPDFAttachment() || item.parentItemID !== parent?.itemID) {
@@ -256,7 +306,7 @@ export async function readSyncSnapshot(
         throw new Error('Invalid shared passage reference');
       }
       seenChunks.add(chunkId);
-      const vector = unpackVector(packed, manifest.dimensions);
+      const vector = unpackVector(packed, manifest.dimensions, !ranges);
       const attachment = attachments.get(attachmentKey);
       if (!attachment) continue;
       const parent = items.get(attachment.itemKey)!;
@@ -269,7 +319,7 @@ export async function readSyncSnapshot(
       });
     }
   }
-  if (!manifest || !ended) throw new Error('Shared index is incomplete');
+  if (!manifest || (!ranges && !ended)) throw new Error('Shared index is incomplete');
   const index = new VectorSearchIndex();
   index.loadAll([...items.values()].filter((item): item is IndexedItemRecord => item !== null), chunks);
   return { manifest, index };
