@@ -11,7 +11,8 @@ import {
   type RangePart, type ReceivedSnapshot, type SyncHeader, type SyncRecord,
 } from './sync-snapshot.ts';
 import {
-  acceptedPublication, fileDigest, MAX_MANIFEST_BYTES, openWebDavProbe, readCachedManifest, readPublishedHead, readSyncDraft,
+  acceptedPublication, fileDigest, matchesUnconfirmedManifest, MAX_MANIFEST_BYTES, openWebDavProbe,
+  readCachedManifest, readPublishedHead, readSyncDraft,
   readSyncManifest, SyncProtocolVersionError, verifyPart, writeManifestFile,
   type AcceptedPublication, type LegacySyncDraft, type LegacySyncManifest, type SyncDraft, type SyncManifest,
 } from './sync-publication.ts';
@@ -702,7 +703,17 @@ export class IndexSync {
       if (legacyPending && state === 'conflict' &&
           (!draft.previous || await inspect(carrier, draft.previous.digest) !== 'present')) throw new SyncIssue('conflict');
       if (state === 'present' || (legacyPending && await this.legacyPartsAvailable(context, epoch, candidate, probe))) {
-        await this.confirmDraftCarrier(context, epoch, carrier, candidate);
+        await this.confirmDraftCarrier(context, epoch, carrier, candidate, async () => {
+          const currentState = await inspect(carrier, candidate.digest);
+          if (currentState === 'present') return;
+          if (legacyPending) {
+            if (currentState === 'missing') return;
+            if (currentState === 'conflict' && draft.previous &&
+                await inspect(carrier, draft.previous.digest) === 'present') return;
+            if (currentState === 'unconfirmed' && await matchesUnconfirmedManifest(carrier, dir, this.pathFor(carrier))) return;
+          }
+          throw new SyncIssue('conflict');
+        });
         if (!await this.retirePrevious(context, epoch, carrier, candidate.digest, probe, candidate.parts,
           draft.snapshot.publisher, draft.previous)) return false;
         await IOUtils.remove(dir, { recursive: true });
@@ -751,8 +762,10 @@ export class IndexSync {
     }
     if (carrier && head) {
       if (!this.isSynced(carrier, head.digest)) {
-        if (!await probe(carrier, head.digest)) throw new SyncIssue('webdav');
-        await this.confirmDraftCarrier(context, epoch, carrier, head);
+        const digest = head.digest;
+        await this.confirmDraftCarrier(context, epoch, carrier, head, async () => {
+          if (!await probe(carrier, digest)) throw new SyncIssue('webdav');
+        });
       }
       if (!await this.retireAttachments(context, epoch, probe, abandoned, abandoned.length > 0,
         { item: carrier, digest: head.digest })) return false;
@@ -788,12 +801,15 @@ export class IndexSync {
     return this.current(epoch, context);
   }
 
-  private async confirmDraftCarrier(context: Context, epoch: number, carrier: ZoteroItem, head: PublishedHead): Promise<void> {
+  private async confirmDraftCarrier(
+    context: Context, epoch: number, carrier: ZoteroItem, head: PublishedHead, verifyRemote: () => Promise<void>,
+  ): Promise<void> {
     const sync = Zotero.Sync!;
     if (!this.current(epoch, context)) return;
     if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
     const release = sync.Runner.delayIndefinite();
     try {
+      await verifyRemote();
       if (await fileDigest(this.pathFor(carrier)) !== head.digest) throw new SyncIssue('conflict');
       if (!this.current(epoch, context)) return;
       if (!this.isSynced(carrier, head.digest)) await sync.Storage.Local.updateSyncStates([carrier], 'to_upload');

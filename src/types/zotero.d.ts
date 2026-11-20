@@ -313,6 +313,7 @@ export interface ZoteroNamespace {
     ): Promise<{ status: number; responseText: string; response: any; getResponseHeader(name: string): string | null }>;
   };
   File: {
+    pathToFile(path: string): object;
     createDirectoryIfMissingAsync(path: string): Promise<void>;
     getContentsAsync(path: string): Promise<string>;
     getContentsFromURL?(url: string): string;

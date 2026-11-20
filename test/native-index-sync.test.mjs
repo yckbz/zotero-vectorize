@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -61,6 +62,7 @@ async function setup(t) {
     delete globalThis.IOUtils;
     delete globalThis.PathUtils;
     delete globalThis.ChromeUtils;
+    delete globalThis.Components;
     await fs.rm(root, { recursive: true, force: true });
   });
   globalThis.PathUtils = { join: path.join, parent: path.dirname, filename: path.basename };
@@ -69,6 +71,37 @@ async function setup(t) {
     base64URLDecode: (text) => {
       if (!/^(?:[\w-]{4})*(?:[\w-]{2}==|[\w-]{3}=)?$/.test(text)) throw new Error('Invalid Base64URL');
       return new Uint8Array(Buffer.from(text, 'base64url')).buffer;
+    },
+  };
+  // Model the ZIP APIs with the fixture's raw single-entry attachment.
+  globalThis.Components = {
+    interfaces: {},
+    classes: {
+      '@mozilla.org/libjar/zip-reader;1': {
+        createInstance: () => {
+          let contents;
+          return {
+            open: (file) => { contents = readFileSync(file); },
+            findEntries: () => {
+              let unread = true;
+              return { hasMore: () => unread, getNext: () => { unread = false; return SHARED_FILE; } };
+            },
+            getEntry: () => ({ realSize: contents.length }),
+            getInputStream: () => contents,
+            close() {},
+          };
+        },
+      },
+      '@mozilla.org/binaryinputstream;1': {
+        createInstance: () => {
+          let input;
+          return {
+            setInputStream: (stream) => { input = stream; },
+            readByteArray: (length) => Array.from(input.subarray(0, length)),
+            close() {},
+          };
+        },
+      },
     },
   };
   globalThis.IOUtils = {
@@ -207,19 +240,21 @@ async function setup(t) {
         request: async (method, { key, kind }, options) => {
           assert.equal(options.noCache, true);
           assert.deepEqual(options.successCodes, [200, 404]);
-          assert.equal(method, kind === 'prop' ? 'GET' : 'HEAD');
+          assert.equal(method, kind === 'prop' || options.responseType === 'arraybuffer' ? 'GET' : 'HEAD');
           transport.probes.push([method, key]);
           await transport.beforeProbe?.(method, key);
           if (transport.offline) throw new Error('offline');
           const file = remote.get(key);
           const missing = kind === 'prop' ? transport.missingProps : transport.missingFiles;
           if (!file || missing.has(key)) return { status: 404 };
+          if (options.responseType === 'arraybuffer') return { status: 200, response: new Uint8Array(file.bytes).buffer };
           if (kind === 'zip') return { status: 200, getResponseHeader: () => String(file.bytes.length) };
           const fields = { hash: transport.remoteHashes.get(key) ?? digest(file.bytes), mtime: '1234567890' };
           const root = { localName: 'properties', getElementsByTagName: (name) => [{ textContent: fields[name] }] };
           return { status: 200, response: { documentElement: root } };
         },
       },
+      File: { pathToFile: (file) => file },
       Notifier: {
         registerObserver: (obs, _types, id) => { observers.set(id, obs); return id; },
         unregisterObserver: (id) => observers.delete(id),
@@ -1371,6 +1406,16 @@ test('a v2 draft is reconciled before publishing v3 across interruption stages',
         assert.deepEqual(uploads, []);
         assert.ok((await fs.stat(draftPath)).isFile());
         transport.remoteHashes.clear();
+      }
+      if (step === 'carrier ZIP without metadata') {
+        const foreign = { ...staged, snapshot: { ...staged.snapshot, publisher: 'F'.repeat(24) } };
+        transport.manifest = foreign;
+        await source.indexSync.syncNow();
+        assert.equal(source.indexSync.getStatus().phase, 'conflict');
+        assert.deepEqual(transport.manifest, foreign);
+        assert.deepEqual(uploads, []);
+        assert.ok((await fs.stat(draftPath)).isFile());
+        transport.manifest = staged;
       }
       await source.indexSync.syncNow();
       assert.equal(source.indexSync.getStatus().phase, 'ready');

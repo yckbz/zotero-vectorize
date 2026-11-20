@@ -188,6 +188,54 @@ export async function verifyPart(path: string, expected: SyncPart & { content?: 
 
 type RemoteFileState = 'present' | 'missing' | 'unconfirmed' | 'conflict';
 
+// Without a .prop file, only the archived bytes can identify an interrupted upload.
+export async function matchesUnconfirmedManifest(item: ZoteroItem, dir: string, expectedPath: string): Promise<boolean> {
+  const expectedSize = await snapshotSize(expectedPath, MAX_MANIFEST_BYTES);
+  const expected = await IOUtils.read(expectedPath, { maxBytes: expectedSize + 1 });
+  const controller = Zotero.Sync!.Runner.getStorageController('webdav');
+  await controller._init();
+  const limit = MAX_MANIFEST_BYTES * 2;
+  let oversized = false;
+  const result = await Zotero.HTTP.request('GET', controller._getItemURI(item), {
+    noCache: true, successCodes: [200, 404], responseType: 'arraybuffer',
+    requestObserver: (request) => {
+      request.addEventListener('progress', ({ loaded }) => {
+        if (loaded <= limit) return;
+        oversized = true;
+        request.abort();
+      });
+    },
+  }).catch((error: unknown) => {
+    if (!oversized) throw error;
+  });
+  if (result?.status !== 200 || !result.response?.byteLength || result.response.byteLength > limit) return false;
+
+  const path = PathUtils.join(dir, 'check-remote-manifest.zip');
+  try {
+    await IOUtils.write(path, new Uint8Array(result.response));
+    const zip = Components.classes['@mozilla.org/libjar/zip-reader;1'].createInstance(Components.interfaces.nsIZipReader);
+    zip.open(Zotero.File.pathToFile(path));
+    try {
+      const entries = zip.findEntries(null);
+      if (!entries.hasMore()) return false;
+      const name = entries.getNext();
+      if (entries.hasMore() || name !== item.attachmentFilename || zip.getEntry(name).realSize !== expectedSize) return false;
+      const reader = Components.classes['@mozilla.org/binaryinputstream;1'].createInstance(Components.interfaces.nsIBinaryInputStream);
+      reader.setInputStream(zip.getInputStream(name));
+      try {
+        const actual: number[] = reader.readByteArray(expectedSize);
+        return actual.length === expected.length && actual.every((byte, i) => byte === expected[i]);
+      } finally {
+        reader.close();
+      }
+    } finally {
+      zip.close();
+    }
+  } finally {
+    await IOUtils.remove(path, { ignoreAbsent: true });
+  }
+}
+
 export async function openWebDavProbe() {
   const controller = Zotero.Sync!.Runner.getStorageController('webdav');
   await controller._init();
