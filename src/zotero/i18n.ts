@@ -102,6 +102,8 @@ export type LocaleStrings = {
   prefIndexSyncTitle: string;
   prefIndexSyncHint: string;
   prefIndexSyncRole: { off: string; publish: string; receive: string };
+  prefIndexSyncAdvanced: string;
+  prefIndexSyncPartSize: string;
   prefIndexSyncState: Record<'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' | 'error', string>;
   prefIndexSyncNow: string;
   prefItemsIndexed: string;
@@ -250,6 +252,8 @@ const ZH_CN: LocaleStrings = {
   prefIndexSyncTitle: '通过 Zotero 同步向量索引',
   prefIndexSyncHint: '使用「我的文库」已有的 WebDAV。只在一台设备选发布，其它设备选接收。索引附件含提取的 PDF 正文与模型参数，凭据保存在本机。',
   prefIndexSyncRole: { off: '关闭', publish: '发布本机索引', receive: '接收共享索引' },
+  prefIndexSyncAdvanced: '高级设置',
+  prefIndexSyncPartSize: '分片大小上限',
   prefIndexSyncState: {
     off: '使用本地索引。',
     waiting: '等待 Zotero 同步或主设备完成向量化。',
@@ -408,6 +412,8 @@ const EN_US: LocaleStrings = {
   prefIndexSyncTitle: 'Sync vector indexes through Zotero',
   prefIndexSyncHint: 'Uses the existing WebDAV setup for My Library. Choose one publisher and set other devices to receive. The index attachment contains extracted PDF text and model settings. Credentials stay on this device.',
   prefIndexSyncRole: { off: 'Off', publish: 'Publish this device’s index', receive: 'Receive the shared index' },
+  prefIndexSyncAdvanced: 'Advanced settings',
+  prefIndexSyncPartSize: 'Maximum part size',
   prefIndexSyncState: {
     off: 'Using the local index.',
     waiting: 'Waiting for Zotero sync or for the publisher to finish indexing.',

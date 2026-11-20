@@ -777,9 +777,19 @@ class VectorizePreferencesController {
       const button = el(doc, 'button', { type: 'button', className: 'zv-btn' }, [s.prefIndexSyncNow]) as HTMLButtonElement;
       const role = el(doc, 'select', { 'aria-label': s.prefIndexSyncTitle },
         Object.entries(s.prefIndexSyncRole).map(([value, label]) => el(doc, 'option', { value }, [label]))) as HTMLSelectElement;
+      const size = el(doc, 'select', { 'aria-label': s.prefIndexSyncPartSize },
+        sync.partSizesMiB.map((value) => el(doc, 'option', { value: String(value) }, [value + ' MiB']))) as HTMLSelectElement;
+      size.disabled = sync.partSizesMiB.length === 1;
+      const advanced = el(doc, 'details', { className: 'zv-sync-advanced' }, [
+        el(doc, 'summary', {}, [s.prefIndexSyncAdvanced]),
+        this.fieldRow(doc, s.prefIndexSyncPartSize, size),
+      ]);
       const update = () => {
         const status = sync.getStatus();
         role.value = status.role;
+        size.value = String(sync.getPartSizeMiB());
+        advanced.hidden = status.role !== 'publish';
+        if (advanced.hidden) advanced.open = false;
         button.disabled = status.role === 'off' || status.phase === 'working';
         state.textContent = status.role === 'receive' && status.phase === 'ready'
           ? s.prefSharedReady : s.prefIndexSyncState[status.phase];
@@ -796,6 +806,10 @@ class VectorizePreferencesController {
           state.textContent = s.prefIndexSyncState.error;
         }
       });
+      size.addEventListener('change', () => {
+        sync.setPartSizeMiB(Number(size.value));
+        update();
+      });
       button.addEventListener('click', () => void sync.syncNow());
       this.unsubSync = sync.subscribe(update);
       update();
@@ -803,6 +817,7 @@ class VectorizePreferencesController {
         el(doc, 'h2', { className: 'zv-pref-h2' }, [s.prefIndexSyncTitle]),
         el(doc, 'p', { className: 'zv-hint' }, [s.prefIndexSyncHint]),
         el(doc, 'div', { className: 'zv-btn-row' }, [role, button]),
+        advanced,
         state,
       ]));
     }

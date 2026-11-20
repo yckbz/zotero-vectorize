@@ -38,11 +38,11 @@ Click **Apply Model Settings** to switch models. Choose whether to keep the prev
 
 Set up WebDAV attachment sync for My Library on desktop devices signed in to the same Zotero account. In **Zotero Settings → Zotero Vectorize → Sync vector indexes through Zotero**, choose **Publish this device’s index** on one device and **Receive the shared index** on the others. Sync is off by default. Use **Check sync now** to see its status.
 
-The publisher updates one stored attachment in My Library through Zotero. Each publication transfers the current model’s vectors, PDF passages, and index and search settings together. The bundle limit is 512 MiB before WebDAV compression.
+The publisher uploads the index parts through Zotero, then updates a manifest attachment. Each publication transfers the current model’s vectors, PDF passages, and index and search settings, up to 1 GiB before WebDAV compression. In **Advanced settings**, the publisher can choose a part size limit of 64, 128, or 256 MiB. The default is 256 MiB. Upgrade all participating devices together when switching from the earlier sync format.
 
 ONNX and Ollama models require a matching revision. For OpenAI-compatible models, configure the same Base URL, model, and output dimensions on each device and enter an API key separately on every device. When dimensions are set to `0`, the plugin checks the dimensions actually returned by the service. The attachment contains an endpoint fingerprint for matching. Credentials, paths, and connection settings stay on each device.
 
-Receivers keep the last validated shared index alongside their own local indexes and settings. Existing indexes and manual local indexing remain available when WebDAV is unavailable. A receiver with a usable shared index suspends automatic indexing for My Library. Group libraries continue to use local indexes. Opening a shared passage verifies the PDF version before jumping to its page.
+Receivers switch to a new index after all its parts arrive and pass validation. During an interruption, the latest validated shared index, local indexes, and manual local indexing remain available. A receiver with a usable shared index suspends automatic indexing for My Library. Group libraries continue to use local indexes. Opening a shared passage verifies the PDF version before jumping to its page.
 
 ## Use Zotero Vectorize from an agent
 
@@ -76,5 +76,7 @@ npm run verify
 ```
 
 This checks types, builds and validates the XPI, and runs the tests. The installable package is `dist/zotero-vectorize.xpi`. To package without running the full verification suite, use `npm run package`.
+
+For a two-device sync test with a small library, build `dist/zotero-vectorize-sync-test.xpi` with `npm run package -- --sync-test-small-parts`. This build uses 1 MiB parts.
 
 [MIT License](LICENSE)

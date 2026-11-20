@@ -121,6 +121,14 @@
   display: none;
 }
 
+.zv-sync-advanced > summary {
+  cursor: pointer;
+}
+
+.zv-sync-advanced > .zv-field {
+  margin-top: 8px;
+}
+
 .zv-pref-h2 {
   margin: 0;
   font-size: 14px;

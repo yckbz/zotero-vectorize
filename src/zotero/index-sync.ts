@@ -6,16 +6,25 @@ import { PREF_BRANCH } from './config.ts';
 import { embeddingSettings, resolveEmbeddingProfile } from './embedding-profile.ts';
 import { extractItemMetadata, isIndexableRegularItem } from './extractor.ts';
 import {
-  cloudEndpointDigest, packVector, readSyncHeader, readSyncSnapshot, snapshotSize, syncSearchConfig, writeSyncSnapshot,
+  cloudEndpointDigest, LEGACY_MAX_BYTES, MIB, packVector, partFilename, readFirstSyncRecord, readSyncSnapshot,
+  snapshotSize, syncHeader, syncSearchConfig, writeSyncParts,
   type ReceivedSnapshot, type SyncHeader, type SyncRecord,
 } from './sync-snapshot.ts';
+import {
+  fileDigest, MAX_MANIFEST_BYTES, readPublishedHead, readSyncDraft, readSyncManifest, verifyPart, writeManifestFile,
+  type SyncDraft, type SyncManifest,
+} from './sync-publication.ts';
 import type { VectorStore } from './vector-store.ts';
 
+declare const __ZV_TEST_SYNC_PART_BYTES__: number;
 const TITLE = 'Zotero Vectorize Shared Index';
 const FILENAME = 'zotero-vectorize.zvindex';
+const PART_TITLE = TITLE + ' Part';
 const ROLE = PREF_BRANCH + 'syncRole';
 const PUBLISHER = PREF_BRANCH + 'syncPublisher';
 const BINDING = PREF_BRANCH + 'syncAttachment';
+const PART_SIZE = PREF_BRANCH + 'syncPartSizeMiB';
+const STAMP = PREF_BRANCH + 'syncPublishedStamp';
 export type SyncRole = 'off' | 'publish' | 'receive';
 type SyncPhase = 'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' | 'error';
 const DEVICE_MODEL_SETTINGS = {
@@ -42,7 +51,7 @@ interface IndexSyncDeps {
 }
 
 class SyncIssue extends Error {
-  constructor(readonly phase: 'webdav' | 'model' | 'cloud' | 'conflict') { super(phase); }
+  constructor(readonly phase: 'waiting' | 'webdav' | 'model' | 'cloud' | 'conflict') { super(phase); }
 }
 
 function publicationSettings(config: PluginConfig): string {
@@ -51,6 +60,8 @@ function publicationSettings(config: PluginConfig): string {
 }
 
 export class IndexSync {
+  readonly partSizesMiB: readonly number[] = typeof __ZV_TEST_SYNC_PART_BYTES__ === 'number'
+    ? [__ZV_TEST_SYNC_PART_BYTES__ / MIB] : [64, 128, 256];
   private role: SyncRole = 'off';
   private phase: SyncPhase = 'off';
   private observer: string | null = null;
@@ -77,6 +88,21 @@ export class IndexSync {
   getStatus() {
     const manifest = this.active?.manifest;
     return { role: this.role, phase: this.phase, lastReceived: manifest?.generation, model: manifest?.model };
+  }
+
+  getPartSizeMiB(): number {
+    const value = Zotero.Prefs.get(PART_SIZE, true);
+    return this.partSizesMiB.includes(value) ? value : this.partSizesMiB[this.partSizesMiB.length - 1];
+  }
+
+  setPartSizeMiB(value: number): void {
+    if (this.disposed || this.role !== 'publish' || !this.partSizesMiB.includes(value) || value === this.getPartSizeMiB()) return;
+    Zotero.Prefs.set(PART_SIZE, value, true);
+    this.schedule(0);
+  }
+
+  private partBytes(): number {
+    return this.getPartSizeMiB() * MIB;
   }
 
   getSharedStats() {
@@ -236,6 +262,7 @@ export class IndexSync {
     const run = this.reconcile(role, epoch, manual).catch((error: unknown) => {
       if (!this.current(epoch)) return;
       if (!this.active) this.releaseLocalIndexing();
+      if (!(error instanceof SyncIssue)) Zotero.logError(error);
       this.setPhase(error instanceof SyncIssue ? error.phase : 'error');
     }).finally(() => {
       this.running = null;
@@ -256,13 +283,10 @@ export class IndexSync {
     this.setPhase('working');
 
     if (role === 'receive' && !this.active) {
-      const cache = this.cachePath(account);
-      if (await IOUtils.exists(cache)) {
-        try {
-          await this.accept(cache, context, epoch, false);
-        } catch {
-          // A stale or damaged cache is independent of the local index.
-        }
+      try {
+        await this.restoreCache(context, epoch);
+      } catch {
+        // A stale or damaged cache is independent of the local index.
       }
     }
 
@@ -292,8 +316,8 @@ export class IndexSync {
       (Zotero.Users?.getCurrentUserID() === context.account && Zotero.Libraries.userLibraryID === context.libraryID));
   }
 
-  private cachePath(account: number): string {
-    return PathUtils.join(this.deps.store.getStoreDir(), 'shared-index-' + account + '.zvindex');
+  private cacheDir(account: number): string {
+    return PathUtils.join(this.deps.store.getStoreDir(), 'shared-index-' + account);
   }
 
   private async attachment(libraryID: number): Promise<ZoteroItem | undefined> {
@@ -305,7 +329,7 @@ export class IndexSync {
   }
 
   private pathFor(item: ZoteroItem): string {
-    return PathUtils.join(Zotero.Attachments.getStorageDirectory(item).path, FILENAME);
+    return PathUtils.join(Zotero.Attachments.getStorageDirectory(item).path, item.attachmentFilename!);
   }
 
   private async runNativeSync({ libraryID }: Context): Promise<void> {
@@ -316,6 +340,34 @@ export class IndexSync {
 
   private async publish(context: Context, epoch: number, manual: boolean): Promise<void> {
     const sync = Zotero.Sync!;
+    const dir = PathUtils.join(this.deps.store.getStoreDir(), 'publish-' + context.account);
+    const draftPath = PathUtils.join(dir, 'draft.json');
+    const draft = await IOUtils.exists(draftPath) ? await readSyncDraft(draftPath) : undefined;
+    const item = await this.attachment(context.libraryID);
+    if (!this.current(epoch, context)) return;
+    const binding = Zotero.Prefs.get(BINDING, true);
+    const publisher = Zotero.Prefs.get(PUBLISHER, true) || Zotero.Utilities.randomString?.(24);
+    if (!publisher) throw new SyncIssue('webdav');
+    let head: Awaited<ReturnType<typeof readPublishedHead>> | undefined;
+    if (item) {
+      if ((binding ? binding !== context.account + ':' + item.key : !draft) ||
+          item.attachmentSyncState === sync.Storage.Local.SYNC_STATE_IN_CONFLICT) throw new SyncIssue('conflict');
+      head = await readPublishedHead(this.pathFor(item));
+      if (head.snapshot.publisher !== publisher || head.snapshot.account !== context.account ||
+          (!binding && draft?.snapshot.generation !== head.snapshot.generation)) throw new SyncIssue('conflict');
+    } else if (binding) {
+      throw new SyncIssue('conflict');
+    }
+    if (draft) {
+      const currentGeneration = head?.snapshot.generation ?? null;
+      if (draft.snapshot.account !== context.account || draft.snapshot.publisher !== publisher ||
+          (currentGeneration !== (draft.previous?.generation ?? null) && currentGeneration !== draft.snapshot.generation)) {
+        throw new SyncIssue('conflict');
+      }
+      await this.finishPublication(context, epoch, dir, draft);
+      return;
+    }
+
     const progress = this.deps.getProgress();
     if (['scanning', 'indexing', 'paused'].includes(progress.phase)) {
       this.schedule(15_000);
@@ -343,27 +395,8 @@ export class IndexSync {
       void provider.dispose().catch(() => {});
     }
 
-    let item = await this.attachment(context.libraryID);
     if (!this.current(epoch, context)) return;
-    const binding = Zotero.Prefs.get(BINDING, true);
-    if (!item && !binding) {
-      // Establish the native library state before the first publication.
-      await this.runNativeSync(context);
-      if (!this.current(epoch, context)) return;
-      item = await this.attachment(context.libraryID);
-    }
-    const publisher = Zotero.Prefs.get(PUBLISHER, true) || Zotero.Utilities.randomString?.(24);
-    if (!publisher) throw new SyncIssue('webdav');
-    let previous: SyncHeader | undefined;
-    if (item) {
-      if (binding !== context.account + ':' + item.key ||
-          item.attachmentSyncState === sync.Storage.Local.SYNC_STATE_IN_CONFLICT) throw new SyncIssue('conflict');
-      previous = await readSyncHeader(this.pathFor(item));
-      if (previous.publisher !== publisher || previous.account !== context.account) throw new SyncIssue('conflict');
-    } else if (binding) {
-      throw new SyncIssue('conflict');
-    }
-
+    const previous = head?.snapshot;
     const layout = `1:${config.chunkSize}:${config.chunkOverlap}:${config.maxPdfPages}`;
     const source = await this.deps.store.readCommitted(async () => ({
       ...await this.deps.store.loadAll(profile.id, context.libraryID),
@@ -403,11 +436,11 @@ export class IndexSync {
         live.parentItemID === entry.parentItemID && parentKey && /^[a-f0-9]{32}$/.test(entry.fileHash)
         ? [[entry.attachmentID, { ...entry, parentKey }] as const] : [];
     }));
-    const stamp = fnv1a64(JSON.stringify([source.updated, { ...manifest, generation: 0 },
+    const maxPartBytes = this.partBytes();
+    const stamp = fnv1a64(JSON.stringify([2, maxPartBytes, source.updated, { ...manifest, generation: 0 },
       valid.map((entry) => [entry.itemKey, extractItemMetadata(byId.get(entry.itemID)!).metadataHash]),
       [...pdfs.values()].map((pdf) => [pdf.attachmentKey, pdf.parentKey, pdf.fileHash]), source.chunks.length]));
-    const stampPref = PREF_BRANCH + 'syncPublishedStamp';
-    if (item && Zotero.Prefs.get(stampPref, true) === stamp) {
+    if (item && Zotero.Prefs.get(STAMP, true) === stamp) {
       if (manual && item.attachmentSyncState !== sync.Storage.Local.SYNC_STATE_IN_SYNC) await this.runNativeSync(context);
       if (this.current(epoch, context)) {
         this.setPhase(item.attachmentSyncState === sync.Storage.Local.SYNC_STATE_IN_SYNC ? 'ready' : 'waiting');
@@ -419,6 +452,11 @@ export class IndexSync {
       this.setPhase('waiting');
       return;
     }
+    if (!this.current(epoch, context)) return;
+    const basePublication = item && head
+      ? { generation: head.snapshot.generation, digest: await fileDigest(this.pathFor(item)), keys: head.keys }
+      : null;
+    if (!this.current(epoch, context)) return;
 
     async function* records(): AsyncGenerator<SyncRecord> {
       for (const entry of valid) {
@@ -434,59 +472,191 @@ export class IndexSync {
           chunk.charStart, chunk.charEnd, chunk.text, packVector(chunk.vector)];
       }
     }
-    const stageDir = PathUtils.join(this.deps.store.getStoreDir(), 'publish-' + manifest.generation);
-    const stage = PathUtils.join(stageDir, FILENAME);
-    await IOUtils.makeDirectory(stageDir);
+    await IOUtils.remove(dir, { recursive: true, ignoreAbsent: true });
+    await IOUtils.makeDirectory(dir);
+    let prepared = false;
     try {
-      await writeSyncSnapshot(stage, manifest, records());
+      const parts = await writeSyncParts(dir, manifest, records(), maxPartBytes);
       if (!this.current(epoch, context)) return;
-      if (this.deps.store.activeProfile?.id !== profile.id || publicationSettings(this.deps.getConfig()) !== settings) {
+      if (!item) {
+        // Look for another publisher before importing any attachments for a first publication.
+        if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
+        await this.runNativeSync(context);
+        if (!this.current(epoch, context)) return;
+        if (await this.attachment(context.libraryID)) throw new SyncIssue('conflict');
+      }
+      if (!this.current(epoch, context)) return;
+      if (this.deps.store.activeProfile?.id !== profile.id || publicationSettings(this.deps.getConfig()) !== settings ||
+          this.partBytes() !== maxPartBytes) {
         this.setPhase('waiting');
         this.schedule(300);
         return;
       }
-      if (sync.Runner.syncInProgress) {
-        this.setPhase('waiting');
-        return;
-      }
-      if (item) {
-        const dest = this.pathFor(item);
-        // Stage on the destination volume, then replace only the managed file.
-        const temp = PathUtils.join(PathUtils.parent(PathUtils.parent(dest)), '.' + item.key + '-' + manifest.generation + '.pending');
-        try {
-          await IOUtils.copy(stage, temp);
-          if (!this.current(epoch, context)) return;
-          if (sync.Runner.syncInProgress) {
-            this.setPhase('waiting');
-            return;
-          }
-          const release = sync.Runner.delayIndefinite();
-          try {
-            await IOUtils.move(temp, dest);
-            await sync.Storage.Local.updateSyncStates([item], 'to_upload');
-          } finally {
-            release();
-          }
-        } finally {
-          await IOUtils.remove(temp, { ignoreAbsent: true });
-        }
-      } else {
-        if (!Zotero.Attachments.importFromFile) throw new SyncIssue('webdav');
-        Zotero.Prefs.set(PUBLISHER, publisher, true);
-        item = await Zotero.Attachments.importFromFile({
-          file: stage, libraryID: context.libraryID, title: TITLE, contentType: 'application/octet-stream',
-        });
-        Zotero.Prefs.set(BINDING, context.account + ':' + item.key, true);
-      }
-      Zotero.Prefs.set(stampPref, stamp, true);
-      if (this.current(epoch, context)) await this.runNativeSync(context);
-      if (this.current(epoch, context)) {
-        this.setPhase(item.attachmentSyncState === sync.Storage.Local.SYNC_STATE_IN_SYNC ? 'ready' : 'waiting');
-      }
+      const pending = { snapshot: manifest, stamp, parts, previous: basePublication };
+      Zotero.Prefs.set(PUBLISHER, publisher, true);
+      await writeManifestFile(draftPath, pending);
+      prepared = true;
+      await this.finishPublication(context, epoch, dir, pending);
     } finally {
-      await IOUtils.remove(stageDir, { recursive: true, ignoreAbsent: true });
+      if (!prepared) await IOUtils.remove(dir, { recursive: true, ignoreAbsent: true });
+    }
+  }
+
+  private partTitle(publisher: string, generation: number, index: number): string {
+    return `${PART_TITLE} ${publisher} ${generation} ${index + 1}`;
+  }
+
+  private isPart(item: ZoteroItem | false, libraryID: number, title: string, index: number): item is ZoteroItem {
+    return !!item && !item.deleted && item.libraryID === libraryID && !item.parentItemID &&
+      !!item.isStoredFileAttachment?.() && item.attachmentFilename === partFilename(index) &&
+      item.getField('title') === title;
+  }
+
+  private async finishPublication(context: Context, epoch: number, dir: string, draft: SyncDraft): Promise<void> {
+    if (!this.current(epoch, context)) return;
+    const sync = Zotero.Sync!;
+    const { SYNC_STATE_IN_SYNC, SYNC_STATE_IN_CONFLICT } = sync.Storage.Local;
+    const { snapshot, parts, previous } = draft;
+    const { publisher, generation } = snapshot;
+    const synced = (item: ZoteroItem, digest: string) => {
+      if (item.attachmentSyncState === SYNC_STATE_IN_CONFLICT) throw new SyncIssue('conflict');
+      return item.attachmentSyncState === SYNC_STATE_IN_SYNC && item.attachmentSyncedHash === digest;
+    };
+    const importFile = async (file: string, title: string) => {
+      if (!Zotero.Attachments.importFromFile) throw new SyncIssue('webdav');
+      return Zotero.Attachments.importFromFile({
+        file, libraryID: context.libraryID, title, contentType: 'application/octet-stream',
+      });
+    };
+
+    const titles = new Map(parts.map((_part, i) => [this.partTitle(publisher, generation, i), i]));
+    const byIndex = new Map<number, ZoteroItem>();
+    for (const item of await Zotero.Items.getAll(context.libraryID, true, false)) {
+      if (!item.isStoredFileAttachment?.()) continue;
+      const title = item.getField('title');
+      const i = titles.get(title);
+      if (i === undefined) continue;
+      if (byIndex.has(i) || !this.isPart(item, context.libraryID, title, i)) throw new SyncIssue('conflict');
+      byIndex.set(i, item);
+    }
+    const attachments: ZoteroItem[] = [];
+    for (const [i, part] of parts.entries()) {
+      if (!this.current(epoch, context)) return;
+      let item = byIndex.get(i);
+      if (!item) item = await importFile(PathUtils.join(dir, partFilename(i)), this.partTitle(publisher, generation, i));
+      if (!synced(item, part.digest)) await verifyPart(this.pathFor(item), part);
+      attachments.push(item);
+    }
+    if (!this.current(epoch, context)) return;
+    if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
+    if (attachments.some((item, i) => !synced(item, parts[i].digest))) {
+      await this.runNativeSync(context);
+      if (!this.current(epoch, context)) return;
+      if (attachments.some((item, i) => !synced(item, parts[i].digest))) throw new SyncIssue('waiting');
     }
 
+    const manifest: SyncManifest = {
+      type: 'zotero-vectorize-index-manifest', version: 2, snapshot,
+      parts: parts.map((part, i) => ({ ...part, key: attachments[i].key })),
+    };
+    const stage = PathUtils.join(dir, FILENAME);
+    await writeManifestFile(stage, manifest);
+    const digest = await fileDigest(stage);
+    let carrier = await this.attachment(context.libraryID);
+    if (!this.current(epoch, context)) return;
+    if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
+    const binding = Zotero.Prefs.get(BINDING, true);
+    const release = sync.Runner.delayIndefinite();
+    try {
+      if (carrier) {
+        const bound = context.account + ':' + carrier.key;
+        if ((binding && binding !== bound) || carrier.attachmentSyncState === SYNC_STATE_IN_CONFLICT) {
+          throw new SyncIssue('conflict');
+        }
+        const dest = this.pathFor(carrier);
+        const existing = await fileDigest(dest);
+        if (existing !== digest) {
+          if (!binding || existing !== previous?.digest) throw new SyncIssue('conflict');
+          const pending = PathUtils.join(PathUtils.parent(PathUtils.parent(dest)), '.' + carrier.key + '.zvmanifest.pending');
+          try {
+            await IOUtils.copy(stage, pending);
+            if (!this.current(epoch, context)) return;
+            await IOUtils.move(pending, dest);
+          } finally {
+            await IOUtils.remove(pending, { ignoreAbsent: true });
+          }
+        }
+        if (!this.current(epoch, context)) return;
+        if (!synced(carrier, digest)) await sync.Storage.Local.updateSyncStates([carrier], 'to_upload');
+      } else {
+        if (binding || previous) throw new SyncIssue('conflict');
+        carrier = await importFile(stage, TITLE);
+      }
+      Zotero.Prefs.set(BINDING, context.account + ':' + carrier.key, true);
+    } finally {
+      release();
+    }
+    if (!this.current(epoch, context)) return;
+    if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
+    if (!synced(carrier, digest)) await this.runNativeSync(context);
+    if (!this.current(epoch, context)) return;
+    if (!synced(carrier, digest)) throw new SyncIssue('waiting');
+
+    const retired: number[] = [];
+    for (const [i, key] of (previous?.keys ?? []).entries()) {
+      const item = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, key);
+      if (previous && this.isPart(item, context.libraryID, this.partTitle(publisher, previous.generation, i), i)) {
+        retired.push(item.id);
+      }
+    }
+    if (!this.current(epoch, context)) return;
+    if (retired.length) await Zotero.Items.erase(retired);
+    if (!this.current(epoch, context)) return;
+    if (previous?.keys.length) {
+      if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
+      await this.runNativeSync(context);
+    }
+    if (!this.current(epoch, context)) return;
+    Zotero.Prefs.set(STAMP, draft.stamp, true);
+    await IOUtils.remove(dir, { recursive: true, ignoreAbsent: true });
+    if (this.current(epoch, context)) this.setPhase('ready');
+  }
+
+  private cacheParts(dir: string, digest: string): string {
+    return PathUtils.join(dir, 'parts-' + digest);
+  }
+
+  private async restoreCache(context: Context, epoch: number): Promise<void> {
+    const dir = this.cacheDir(context.account);
+    const path = PathUtils.join(dir, 'current.zvmanifest');
+    if (await IOUtils.exists(path)) {
+      const manifest = await readSyncManifest(path);
+      const digest = await fileDigest(path);
+      this.checkPublication(manifest.snapshot, context, digest);
+      const parts = this.cacheParts(dir, digest);
+      const paths = manifest.parts.map((_part, i) => PathUtils.join(parts, partFilename(i)));
+      for (const [i, file] of paths.entries()) {
+        if (!this.current(epoch, context)) return;
+        await verifyPart(file, manifest.parts[i]);
+      }
+      await this.accept(manifest.snapshot, paths, context, epoch, digest);
+    } else {
+      // Preserve the last locally accepted snapshot through the beta protocol upgrade.
+      const previous = dir + '.zvindex';
+      if (!await IOUtils.exists(previous)) return;
+      const manifest = syncHeader.parse(await readFirstSyncRecord(previous));
+      const digest = await fileDigest(previous);
+      this.checkPublication(manifest, context, digest);
+      await this.accept(manifest, [previous], context, epoch, digest, undefined, LEGACY_MAX_BYTES);
+    }
+  }
+
+  private async pruneParts(dir: string, keep: readonly string[]): Promise<void> {
+    for (const path of await IOUtils.getChildren(dir)) {
+      if (/^parts-[a-f0-9]{32}$/.test(PathUtils.filename(path)) && !keep.includes(path)) {
+        await IOUtils.remove(path, { recursive: true, ignoreAbsent: true });
+      }
+    }
   }
 
   private async receive(context: Context, epoch: number): Promise<void> {
@@ -508,32 +678,70 @@ export class IndexSync {
       this.setPhase('ready');
       return;
     }
-    await snapshotSize(dest);
-    const stage = PathUtils.join(this.deps.store.getStoreDir(), 'receive-' + context.account + '.pending');
+    await snapshotSize(dest, MAX_MANIFEST_BYTES);
+    const dir = this.cacheDir(context.account);
+    await IOUtils.makeDirectory(dir);
+    const stage = PathUtils.join(dir, 'receive.pending');
+    const cache = PathUtils.join(dir, 'current.zvmanifest');
     try {
       await IOUtils.copy(dest, stage);
-      const digest = await Zotero.Utilities.Internal.md5Async(stage);
+      const manifest = await readSyncManifest(stage);
+      const digest = await fileDigest(stage);
       if (item.attachmentSyncedHash && digest !== item.attachmentSyncedHash) throw new Error('Shared index checksum changed');
-      if (this.active?.digest !== digest || this.needsReconcile) {
-        await this.accept(stage, context, epoch, true, digest);
+      this.checkPublication(manifest.snapshot, context, digest);
+      const parts = this.cacheParts(dir, digest);
+      const accepted = await IOUtils.exists(cache) ? this.cacheParts(dir, await fileDigest(cache)) : null;
+      await this.pruneParts(dir, accepted ? [parts, accepted] : [parts]);
+      await IOUtils.makeDirectory(parts);
+      const paths: string[] = [];
+      for (const [i, part] of manifest.parts.entries()) {
+        if (!this.current(epoch, context)) return;
+        const path = PathUtils.join(parts, partFilename(i));
+        const verified = await verifyPart(path, part).then(() => true, () => false);
+        if (!verified) {
+          const file = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, part.key);
+          if (!file || file.deleted) throw new SyncIssue('waiting');
+          const { publisher, generation } = manifest.snapshot;
+          if (!this.isPart(file, context.libraryID, this.partTitle(publisher, generation, i), i) ||
+              file.attachmentSyncState === sync.Storage.Local.SYNC_STATE_IN_CONFLICT) throw new SyncIssue('conflict');
+          if (await sync.Runner.downloadFile(file) === false) throw new SyncIssue('webdav');
+          if (!this.current(epoch, context)) return;
+          const source = this.pathFor(file);
+          if (!await IOUtils.exists(source)) throw new SyncIssue('waiting');
+          if (await snapshotSize(source, part.bytes) !== part.bytes) throw new Error('Invalid shared index part size');
+          await IOUtils.copy(source, path);
+          await verifyPart(path, part);
+        }
+        paths.push(path);
       }
+      await this.accept(manifest.snapshot, paths, context, epoch, digest, () => IOUtils.move(stage, cache));
       if (this.current(epoch, context)) {
-        this.setPhase(this.active?.digest === digest && !this.needsReconcile ? 'ready' : 'waiting');
+        const ready = this.active?.digest === digest && !this.needsReconcile;
+        if (ready) {
+          await this.pruneParts(dir, [parts]);
+          await IOUtils.remove(dir + '.zvindex', { ignoreAbsent: true });
+        }
+        if (this.current(epoch, context)) this.setPhase(ready ? 'ready' : 'waiting');
       }
     } finally {
       await IOUtils.remove(stage, { ignoreAbsent: true });
     }
   }
 
-  private async accept(path: string, context: Context, epoch: number, commit: boolean, digest?: string): Promise<void> {
-    const libraryRevision = this.libraryRevision;
-    const manifest = await readSyncHeader(path);
+  private checkPublication(manifest: SyncHeader, context: Context, digest: string): void {
     if (manifest.account !== context.account) throw new Error('Shared index account changed');
     const previous = this.active?.manifest;
     if (previous && (previous.publisher !== manifest.publisher || previous.generation > manifest.generation ||
-        (previous.generation === manifest.generation && !!digest && this.active?.digest !== digest))) {
+        (previous.generation === manifest.generation && this.active?.digest !== digest))) {
       throw new SyncIssue('conflict');
     }
+  }
+
+  private async accept(
+    manifest: SyncHeader, paths: readonly string[], context: Context, epoch: number, digest: string,
+    commit?: () => Promise<void>, maxPartBytes?: number,
+  ): Promise<void> {
+    const libraryRevision = this.libraryRevision;
     const config = syncSearchConfig(manifest, this.deps.getConfig());
     if (manifest.engine === 'openai' && (!config.openaiApiKey.trim() || config.openaiModel.trim() !== manifest.model ||
         (config.openaiDimensions !== 0 && config.openaiDimensions !== manifest.dimensions) ||
@@ -552,14 +760,13 @@ export class IndexSync {
         const status = await provider.testConnection();
         if (!status.ok || status.dimensions !== manifest.dimensions) throw new SyncIssue('model');
       }
-      const received = await readSyncSnapshot(path, context.account, context.libraryID);
-      const hash = digest ?? await Zotero.Utilities.Internal.md5Async(path);
-      if (!this.current(epoch, context) || !hash) return;
+      const received = await readSyncSnapshot(paths, manifest, context.libraryID, maxPartBytes);
+      if (!this.current(epoch, context)) return;
       if (libraryRevision !== this.libraryRevision) {
         this.schedule(500);
         return;
       }
-      if (commit) await IOUtils.move(path, this.cachePath(context.account));
+      if (commit) await commit();
       if (!this.current(epoch, context)) return;
       if (libraryRevision !== this.libraryRevision) {
         this.schedule(500);
@@ -567,7 +774,7 @@ export class IndexSync {
       }
       adopted = true;
       this.needsReconcile = false;
-      this.setReceived({ ...received, provider, digest: hash });
+      this.setReceived({ ...received, provider, digest });
       this.releaseLocalIndexing();
     } finally {
       if (!adopted) void provider.dispose().catch(() => {});

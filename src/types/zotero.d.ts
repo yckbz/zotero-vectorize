@@ -186,6 +186,7 @@ export interface ZoteroNamespace {
     getIDs(libraryID: number, onlyTopLevel?: boolean, includeDeleted?: boolean): Promise<number[]>;
     getByLibraryAndKey(libraryID: number, key: string): ZoteroItem | false;
     getByLibraryAndKeyAsync(libraryID: number, key: string): Promise<ZoteroItem | false>;
+    erase(ids: number[]): Promise<void>;
   };
   Attachments: {
     LINK_MODE_LINKED_FILE: number;

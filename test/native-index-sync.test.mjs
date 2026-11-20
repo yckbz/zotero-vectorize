@@ -10,6 +10,7 @@ import { SqliteConnection } from './_sqlite.mjs';
 const PREFIX = 'extensions.zotero-vectorize.';
 const MODEL_REVISION = 'a'.repeat(32) + ':' + 'b'.repeat(32);
 const SHARED_FILE = 'zotero-vectorize.zvindex';
+const TITLE = 'Zotero Vectorize Shared Index';
 const digest = (data) => createHash('md5').update(data).digest('hex');
 const pdfBytes = Buffer.from('unchanged synthetic PDF');
 
@@ -18,7 +19,31 @@ async function setup(t) {
   const { VectorizeService } = await importTs('src/zotero/service.ts');
   const { jumpToSearchHit } = await importTs('src/zotero/navigation.ts');
   const { OpenAICompatProvider } = await importTs('src/engines/openai.ts');
-  const transport = { bytes: null, title: null, offline: false, errors: 0, uploads: 0, downloads: 0, syncs: 0 };
+  const remote = new Map();
+  let nextKey = 0;
+  const allocateKey = () => 'PART' + String(++nextKey).padStart(4, '0');
+  const transport = {
+    remote, offline: false, errors: 0, uploads: 0, downloads: 0, syncs: 0,
+    partUploads: [], partDownloads: [], erased: [], missingMetadata: new Set(), missingFiles: new Set(),
+    get manifest() {
+      const head = remote.get('INDEX001');
+      return head ? JSON.parse(String(head.bytes)) : null;
+    },
+    set manifest(data) {
+      remote.set('INDEX001', { title: TITLE, filename: SHARED_FILE, bytes: Buffer.from(JSON.stringify(data) + '\n') });
+    },
+    get bytes() {
+      return this.manifest ? Buffer.concat(this.manifest.parts.map(({ key }) => remote.get(key).bytes)) : null;
+    },
+    set bytes(bytes) {
+      const snapshot = JSON.parse(String(bytes).split('\n')[0]);
+      const key = allocateKey();
+      remote.set(key, { title: `${TITLE} Part ${snapshot.publisher} ${snapshot.generation} 1`,
+        filename: 'zotero-vectorize-part-1.zvpart', bytes });
+      this.manifest = { type: 'zotero-vectorize-index-manifest', version: 2, snapshot,
+        parts: [{ key, bytes: bytes.length, digest: digest(bytes) }] };
+    },
+  };
   const live = new Set();
   t.after(async () => {
     for (const service of live) await service.shutdown();
@@ -27,7 +52,7 @@ async function setup(t) {
     delete globalThis.PathUtils;
     await fs.rm(root, { recursive: true, force: true });
   });
-  globalThis.PathUtils = { join: path.join, parent: path.dirname };
+  globalThis.PathUtils = { join: path.join, parent: path.dirname, filename: path.basename };
   globalThis.IOUtils = {
     makeDirectory: (file) => fs.mkdir(file, { recursive: true }),
     stat: async (file) => {
@@ -46,17 +71,19 @@ async function setup(t) {
         await handle.close();
       }
     },
-    write: (file, bytes, options) => fs.writeFile(file, bytes, { flag: options?.mode === 'append' ? 'a' : 'wx' }),
+    write: (file, bytes, options) => fs.writeFile(file, bytes, {
+      flag: options?.mode === 'append' ? 'a' : options?.mode === 'create' ? 'wx' : 'w',
+    }),
     copy: fs.copyFile,
     move: fs.rename,
     remove: (file, options) => fs.rm(file, { force: Boolean(options?.ignoreAbsent), recursive: Boolean(options?.recursive) }),
+    getChildren: async (dir) => (await fs.readdir(dir)).map((file) => path.join(dir, file)),
   };
 
   async function createDevice(name, shift, role, localEngine = 'local-onnx') {
     const dir = path.join(root, name);
     const storage = (key) => path.join(dir, 'storage', key);
     const pdfFile = path.join(storage('ATTACH01'), 'paper.pdf');
-    const carrierFile = path.join(storage('INDEX001'), SHARED_FILE);
     const prefs = new Map([
       [PREFIX + 'engine', localEngine],
       [PREFIX + 'openaiApiKey', 'local-secret'],
@@ -84,6 +111,7 @@ async function setup(t) {
     items.set(2 + shift, {
       id: 2 + shift, key: 'ATTACH01', libraryID: 1, parentItemID: 1 + shift,
       getDisplayTitle: () => 'Paper PDF',
+      getField: (field) => field === 'title' ? 'Paper PDF' : '',
       isRegularItem: () => false, isAttachment: () => true, isPDFAttachment: () => true,
       isStoredFileAttachment: () => true,
       getFilePathAsync: async () => flags.pdfAvailable ? pdfFile : false,
@@ -96,25 +124,31 @@ async function setup(t) {
     if (flags.pdfAvailable) await fs.writeFile(pdfFile, pdfBytes);
 
     const observers = new Map();
-    const carrier = {
-      id: 4 + shift, key: 'INDEX001', libraryID: 1, itemType: 'attachment', attachmentFilename: SHARED_FILE,
+    let nextItemId = 4 + shift;
+    const makeAttachment = (key, attachmentFilename, title) => ({
+      id: nextItemId++, key, libraryID: 1, itemType: 'attachment', attachmentFilename,
       attachmentSyncState: 0,
       isRegularItem: () => false, isAttachment: () => true, isPDFAttachment: () => false, isStoredFileAttachment: () => true,
-      getField: (field) => field === 'title' ? transport.title : '',
-    };
+      getField: (field) => field === 'title' ? title : '',
+    });
+    const carrier = makeAttachment('INDEX001', SHARED_FILE, TITLE);
+    const eraseQueue = new Set();
+    const attachmentPath = (item) => path.join(storage(item.key), item.attachmentFilename);
     async function downloadFile(item) {
-      if (transport.beforeDownload) await transport.beforeDownload();
+      if (transport.beforeDownload) await transport.beforeDownload(item);
       if (transport.downloadUnavailable) return false;
       if (transport.offline) throw new Error('offline');
       if (item.key === 'ATTACH01') {
         await fs.writeFile(pdfFile, pdfBytes);
         flags.pdfAvailable = true;
-      } else if (transport.bytes) {
-        transport.downloads++;
-        await fs.mkdir(storage(carrier.key), { recursive: true });
-        await fs.writeFile(carrierFile, transport.bytes);
-        carrier.attachmentSyncedHash = digest(transport.bytes);
-        carrier.attachmentSyncState = 2;
+      } else if (remote.has(item.key) && !transport.missingFiles.has(item.key)) {
+        const file = remote.get(item.key);
+        if (item === carrier) transport.downloads++;
+        else transport.partDownloads.push(item.key);
+        await fs.mkdir(storage(item.key), { recursive: true });
+        await fs.writeFile(attachmentPath(item), file.bytes);
+        item.attachmentSyncedHash = digest(file.bytes);
+        item.attachmentSyncState = 2;
       }
     }
     const zotero = {
@@ -128,17 +162,26 @@ async function setup(t) {
         getAsync: async (id) => items.get(id),
         getAll: async (libraryID) => [...items.values()].filter((item) => item.libraryID === libraryID && !item.deleted),
         getByLibraryAndKeyAsync: async (libraryID, key) => [...items.values()].find((item) => item.libraryID === libraryID && item.key === key),
+        erase: async (ids) => {
+          for (const id of ids) {
+            const item = items.get(id);
+            eraseQueue.add(item.key);
+            items.delete(id);
+            await fs.rm(storage(item.key), { recursive: true, force: true });
+          }
+        },
       },
       Attachments: {
         getStorageDirectory: (item) => ({ path: storage(item.key) }),
         importFromFile: async ({ file, libraryID, title }) => {
           assert.equal(libraryID, 1);
-          assert.equal(path.basename(file), SHARED_FILE);
-          transport.title = title;
-          await fs.mkdir(storage(carrier.key), { recursive: true });
-          await fs.copyFile(file, carrierFile);
-          items.set(carrier.id, carrier);
-          return carrier;
+          const filename = path.basename(file);
+          const item = filename === SHARED_FILE ? carrier : makeAttachment(allocateKey(), filename, title);
+          await fs.mkdir(storage(item.key), { recursive: true });
+          await fs.copyFile(file, attachmentPath(item));
+          items.set(item.id, item);
+          await transport.afterImport?.(item);
+          return item;
         },
       },
       Notifier: {
@@ -154,12 +197,39 @@ async function setup(t) {
             if (transport.offline) {
               transport.errors++;
               onError(new Error('offline'));
-            } else if (!shift && items.has(carrier.id) && carrier.attachmentSyncState === 0) {
-              transport.bytes = await fs.readFile(carrierFile);
-              transport.uploads++;
-              carrier.attachmentSyncState = 2;
-            } else if (shift && transport.bytes) {
-              items.set(carrier.id, carrier);
+            } else if (!shift) {
+              for (const item of items.values()) {
+                if (item.attachmentSyncState !== 0) continue;
+                try {
+                  await transport.beforeUpload?.(item);
+                } catch (error) {
+                  onError(error);
+                  return;
+                }
+                const bytes = await fs.readFile(attachmentPath(item));
+                remote.set(item.key, { title: item.getField('title'), filename: item.attachmentFilename, bytes });
+                item.attachmentSyncedHash = digest(bytes);
+                item.attachmentSyncState = 2;
+                if (item === carrier) transport.uploads++;
+                else transport.partUploads.push(item.key);
+              }
+              for (const key of eraseQueue) {
+                try {
+                  await transport.beforeErase?.(key);
+                } catch (error) {
+                  onError(error);
+                  return;
+                }
+                remote.delete(key);
+                eraseQueue.delete(key);
+                transport.erased.push(key);
+              }
+            } else {
+              for (const [key, file] of remote) {
+                if (transport.missingMetadata.has(key) || [...items.values()].some((item) => item.key === key)) continue;
+                const item = key === carrier.key ? carrier : makeAttachment(key, file.filename, file.title);
+                items.set(item.id, item);
+              }
             }
           },
           downloadFile,
@@ -168,7 +238,6 @@ async function setup(t) {
           SYNC_STATE_IN_SYNC: 2, SYNC_STATE_IN_CONFLICT: 5,
           getModeForLibrary: () => 'webdav',
           async updateSyncStates([item], state) {
-            assert.equal(item, carrier);
             assert.equal(state, 'to_upload');
             carrier.attachmentSyncState = 0;
           },
@@ -186,6 +255,7 @@ async function setup(t) {
     async function start() {
       globalThis.Zotero = zotero;
       const service = new VectorizeService({ dataDir: dir, rootURI: 'file:///sync-test/' });
+      if (flags.partBytes) service.indexSync.partBytes = () => flags.partBytes;
       live.add(service);
       service.providerManager.createProvider = (config) => {
         const { engine } = config;
@@ -294,7 +364,7 @@ test('shared coverage follows the accepted version through updates, outages, and
   assert.equal(changes.at(-1), null);
 });
 
-test('Zotero publishes one personal-library attachment and a fresh profile searches it without embedding documents', async (t) => {
+test('Zotero publishes a manifest and private-library indexes stay local while a fresh profile searches the shared index', async (t) => {
   const { createDevice, transport, jumpToSearchHit } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'off');
   let source = await publisher.start();
@@ -405,7 +475,7 @@ test('receiving a shorter shared PDF index preserves searches for local pages', 
   await destination.indexSync.syncNow();
   assert.equal(destination.indexSync.getStatus().phase, 'webdav');
   await assertLocalPage('fulltext');
-  assert.equal(transport.bytes, publication);
+  assert.deepEqual(transport.bytes, publication);
   assert.equal(transport.uploads, 1);
 });
 
@@ -639,4 +709,265 @@ test('cloud sharing matches the configured endpoint, model and actual dimensions
     new URL(request.url).href === apiUrl + '/embeddings'));
   assert.ok(receiver.events.cloudRequests.some((request) => request.input === 'diffusion'));
   assert.ok(receiver.events.cloudRequests.every((request) => !JSON.stringify(request.input).includes('finement')));
+});
+
+test('a part size change publishes a new generation and the preference persists on restart', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'off');
+  let source = await publisher.start();
+  await source.startIndexing();
+  assert.equal(source.indexSync.getPartSizeMiB(), 256);
+  source.indexSync.setPartSizeMiB(64);
+  assert.equal(source.indexSync.getPartSizeMiB(), 256);
+  source.indexSync.setRole('publish');
+  source.indexSync.setPartSizeMiB(512);
+  assert.equal(source.indexSync.getPartSizeMiB(), 256);
+  await source.indexSync.syncNow();
+  const first = transport.manifest;
+  source.indexSync.setPartSizeMiB(64);
+  transport.beforeErase = () => { throw new Error('Interrupted remote retirement'); };
+  await source.indexSync.syncNow();
+  assert.ok(transport.manifest.snapshot.generation > first.snapshot.generation);
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.deepEqual(transport.erased, []);
+  assert.equal(transport.uploads, 2);
+  await publisher.shutdown(source);
+
+  source = await publisher.start();
+  transport.beforeErase = undefined;
+  assert.equal(source.indexSync.getPartSizeMiB(), 64);
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.deepEqual(transport.erased, first.parts.map((part) => part.key));
+  assert.equal(transport.uploads, 2);
+});
+
+test('publishing resumes the same generation after interrupted import, part upload, and manifest upload', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'off');
+  publisher.flags.partBytes = 512;
+  let source = await publisher.start();
+  await source.startIndexing();
+  source.indexSync.setRole('publish');
+  transport.afterImport = () => { throw new Error('Interrupted after importing an attachment'); };
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'error');
+  assert.equal(transport.manifest, null);
+  const firstPart = [...publisher.items.values()].find((item) => item.attachmentFilename?.endsWith('.zvpart'));
+  assert.ok(firstPart);
+  await publisher.shutdown(source);
+
+  source = await publisher.start();
+  transport.afterImport = undefined;
+  transport.beforeUpload = (item) => {
+    if (item.key !== firstPart.key) throw new Error('Interrupted upload');
+  };
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.deepEqual(transport.partUploads, [firstPart.key]);
+  assert.equal(transport.manifest, null);
+  const partKeys = [...publisher.items.values()].filter((item) => item.attachmentFilename?.endsWith('.zvpart'))
+    .map((item) => item.key);
+  assert.ok(partKeys.length >= 2);
+  await publisher.shutdown(source);
+
+  source = await publisher.start();
+  transport.beforeUpload = undefined;
+  transport.afterImport = (item) => {
+    if (item === publisher.carrier) throw new Error('Interrupted after importing the manifest');
+  };
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'error');
+  assert.deepEqual(transport.partUploads, partKeys);
+  assert.equal(transport.manifest, null);
+  await publisher.shutdown(source);
+
+  source = await publisher.start();
+  transport.afterImport = undefined;
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.deepEqual(transport.partUploads, partKeys);
+  assert.deepEqual(transport.manifest.parts.map((part) => part.key), partKeys);
+  assert.equal(transport.uploads, 1);
+  assert.equal(publisher.prefs.get(PREFIX + 'syncAttachment'), '101:INDEX001');
+});
+
+test('a missing or corrupted part keeps the old generation searchable across restarts', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'off');
+  publisher.zotero.PDFWorker.getFullText = async () => {
+    const pages = Array.from({ length: 7 }, (_, page) =>
+      `Page ${page + 1} describes diffusion in carbon nanotubes. ` + '纳米管'.repeat(24));
+    return { text: pages.join('\f'), extractedPages: pages.length, totalPages: pages.length };
+  };
+  let source = await publisher.start();
+  await source.startIndexing();
+  source.indexSync.setRole('publish');
+  await source.indexSync.syncNow();
+  const first = transport.manifest;
+  const original = transport.bytes;
+  assert.equal(first.parts.length, 1);
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  let destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, first.snapshot.generation);
+  const search = async () => {
+    const { hits, diagnostics: { durationMs: _duration, ...diagnostics } } =
+      await destination.search('diffusion', { mode: 'fulltext', filterItemIDs: new Set([101]) });
+    return { hits, diagnostics };
+  };
+  const originalSearch = await search();
+  assert.equal(originalSearch.diagnostics.vectorSearchUsed, true);
+  await receiver.shutdown(destination);
+
+  publisher.flags.partBytes = 512;
+  source = await publisher.start();
+  transport.beforeUpload = (item) => {
+    if (item === publisher.carrier) throw new Error('Manifest upload interrupted');
+  };
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.deepEqual(transport.manifest, first);
+  assert.deepEqual(transport.erased, []);
+  await publisher.shutdown(source);
+  source = await publisher.start();
+  transport.beforeUpload = undefined;
+  await source.indexSync.syncNow();
+  const second = transport.manifest;
+  const [firstKey, middleKey, ...laterKeys] = second.parts.map((part) => part.key);
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.ok(laterKeys.length > 0);
+  assert.deepEqual(transport.erased, [first.parts[0].key]);
+  assert.ok(second.parts.every((part) => part.bytes <= 512));
+  assert.deepEqual(String(transport.bytes).split('\n').slice(1), String(original).split('\n').slice(1));
+  await publisher.shutdown(source);
+
+  transport.partDownloads.length = 0;
+  transport.missingMetadata.add(middleKey);
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'waiting');
+  assert.equal(destination.indexSync.active?.manifest.generation, first.snapshot.generation);
+  assert.deepEqual(transport.partDownloads, [firstKey]);
+  assert.deepEqual(await search(), originalSearch);
+  await receiver.shutdown(destination);
+
+  transport.offline = true;
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, first.snapshot.generation);
+  assert.deepEqual(await search(), originalSearch);
+  transport.offline = false;
+  transport.missingMetadata.clear();
+  transport.missingFiles.add(middleKey);
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'waiting');
+  assert.equal(destination.indexSync.active?.manifest.generation, first.snapshot.generation);
+  assert.deepEqual(transport.partDownloads, [firstKey]);
+  transport.missingFiles.clear();
+  const middle = transport.remote.get(middleKey);
+  const valid = middle.bytes;
+  middle.bytes = Buffer.from(valid);
+  middle.bytes[0] ^= 1;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'error');
+  assert.equal(destination.indexSync.active?.manifest.generation, first.snapshot.generation);
+  assert.deepEqual(await search(), originalSearch);
+
+  middle.bytes = valid;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.active?.manifest.generation, second.snapshot.generation);
+  assert.deepEqual(transport.partDownloads, [firstKey, middleKey, middleKey, ...laterKeys]);
+  assert.deepEqual(await search(), originalSearch);
+  await receiver.shutdown(destination);
+
+  transport.offline = true;
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, second.snapshot.generation);
+  assert.deepEqual(await search(), originalSearch);
+});
+
+test('invalid manifests and conflicting generations are rejected before downloading parts', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const original = transport.manifest;
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  const before = transport.partDownloads.length;
+  const [part] = original.parts;
+  for (const [manifest, phase] of [
+    [{ ...original, parts: [part, part] }, 'error'],
+    [{ ...original, parts: Array.from({ length: 5 }, (_, i) =>
+      ({ ...part, key: 'SYNTH00' + i, bytes: 256 * 1024 * 1024 })) }, 'error'],
+    [{ ...original, parts: [{ ...part, key: 'UNSEEN01' }] }, 'conflict'],
+    [{ ...original, snapshot: { ...original.snapshot, generation: original.snapshot.generation - 1 } }, 'conflict'],
+    [{ ...original, snapshot: { ...original.snapshot, publisher: 'X'.repeat(24) } }, 'conflict'],
+  ]) {
+    transport.manifest = manifest;
+    await destination.indexSync.syncNow();
+    assert.equal(destination.indexSync.getStatus().phase, phase);
+    assert.equal(transport.partDownloads.length, before);
+    assert.equal(destination.indexSync.active.manifest.generation, original.snapshot.generation);
+  }
+});
+
+test('a beta publisher upgrades its bound attachment while a beta receiver can still open its accepted cache offline', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const original = transport.manifest;
+  const legacy = transport.bytes;
+  await publisher.shutdown(source);
+
+  const carrier = transport.remote.get('INDEX001');
+  carrier.bytes = legacy;
+  original.parts.forEach(({ key }) => transport.remote.delete(key));
+  await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), legacy);
+  publisher.carrier.attachmentSyncedHash = digest(legacy);
+  publisher.prefs.set(PREFIX + 'syncPublishedStamp', '0'.repeat(16));
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  transport.offline = true;
+  let destination = await receiver.start();
+  const cache = path.join(destination.store.getStoreDir(), 'shared-index-101.zvindex');
+  destination.indexSync.setPartSizeMiB(64);
+  assert.equal(destination.indexSync.getPartSizeMiB(), 256);
+  await fs.writeFile(cache, legacy);
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, original.snapshot.generation);
+  assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+  await receiver.shutdown(destination);
+
+  transport.offline = false;
+  publisher.flags.partBytes = 512;
+  source = await publisher.start();
+  transport.beforeUpload = (item) => {
+    if (item !== publisher.carrier) assert.deepEqual(transport.remote.get('INDEX001').bytes, legacy);
+  };
+  await source.indexSync.syncNow();
+  transport.beforeUpload = undefined;
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(publisher.items.get(4), publisher.carrier);
+  assert.equal(transport.manifest.parts.length, 2);
+  assert.ok(transport.manifest.snapshot.generation > original.snapshot.generation);
+  await publisher.shutdown(source);
+
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.active?.manifest.generation, transport.manifest.snapshot.generation);
+  await assert.rejects(fs.stat(cache), { code: 'ENOENT' });
 });
