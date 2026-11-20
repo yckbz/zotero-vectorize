@@ -38,7 +38,9 @@ Click **Apply Model Settings** to switch models. Choose whether to keep the prev
 
 Set up WebDAV attachment sync for My Library on desktop devices signed in to the same Zotero account. In **Zotero Settings → Zotero Vectorize → Sync vector indexes through Zotero**, choose **Publish this device’s index** on one device and **Receive the shared index** on the others. Sync is off by default. Use **Check sync now** to see its status.
 
-The publisher uploads the index parts through Zotero, then updates a manifest attachment. Each publication transfers the current model’s vectors, PDF passages, and index and search settings, up to 1 GiB before WebDAV compression. In **Advanced settings**, the publisher can choose a part size limit of 64, 128, or 256 MiB. The default is 256 MiB. Upgrade all participating devices together when switching from the earlier sync format.
+The publisher uploads changed index parts through Zotero, then updates a manifest attachment. Devices with a verified copy reuse unchanged parts across publications. First-time setup transfers the full shared index for the current model, up to 1 GiB before WebDAV compression. The default part size limit is 32 MiB. Choose 8, 16, 32, 64, 128, or 256 MiB in **Advanced settings**. A smaller limit reduces the size of each file that needs retransmitting and increases the number of attachments and WebDAV checks.
+
+Finish any pending publication with the previous plugin before upgrading. Upgrade all participating devices together. The first publication in the new format uploads the full shared index once.
 
 ONNX and Ollama models require a matching revision. For OpenAI-compatible models, configure the same Base URL, model, and output dimensions on each device and enter an API key separately on every device. When dimensions are set to `0`, the plugin checks the dimensions actually returned by the service. The attachment contains an endpoint fingerprint for matching. Credentials, paths, and connection settings stay on each device.
 
