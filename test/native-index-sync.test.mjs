@@ -1106,6 +1106,57 @@ test('invalid manifests and conflicting generations are rejected before download
   }
 });
 
+test('an unreadable cache manifest cannot cause data loss during an incomplete update', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const first = transport.manifest;
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  let destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active.manifest.generation, first.snapshot.generation);
+  const cachedHead = path.join(destination.store.getStoreDir(), 'shared-index-101', 'current.zvmanifest');
+  await receiver.shutdown(destination);
+
+  source = await publisher.start();
+  publisher.items.set(700, publisher.makePaper(700, 'ZZZNEW01', 1, 'New metadata-only paper'));
+  await source.indexItems([700]);
+  await source.indexSync.syncNow();
+  const [newPart] = transport.manifest.parts;
+  assert.ok(first.parts.every((part) => part.key !== newPart.key));
+  await publisher.shutdown(source);
+
+  transport.offline = true;
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active.manifest.generation, first.snapshot.generation);
+  transport.offline = false;
+  transport.missingMetadata.add(newPart.key);
+  const read = IOUtils.read;
+  IOUtils.read = async (file, options) => {
+    if (file === cachedHead) throw new Error('Temporary failure reading the accepted manifest');
+    return read(file, options);
+  };
+  try {
+    await destination.indexSync.syncNow();
+    assert.equal(destination.indexSync.getStatus().phase, 'waiting');
+    assert.equal(destination.indexSync.active.manifest.generation, first.snapshot.generation);
+  } finally {
+    IOUtils.read = read;
+  }
+  await receiver.shutdown(destination);
+
+  transport.offline = true;
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, first.snapshot.generation);
+  assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+});
+
 test('a beta publisher upgrades its bound attachment while a beta receiver can still open its accepted cache offline', async (t) => {
   const { createDevice, transport } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'publish');
@@ -1388,6 +1439,38 @@ test('a second publisher discovers the existing head before importing or uploadi
   assert.deepEqual(transport.partUploads, uploads);
   assert.deepEqual(transport.erased, []);
   assert.equal(second.prefs.get(PREFIX + 'syncAttachment'), undefined);
+});
+
+test('retirement preserves shards referenced by a head synced during cleanup', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const base = transport.manifest;
+  const [oldPart] = base.parts;
+  let competing;
+  const lookup = publisher.zotero.Items.getByLibraryAndKeyAsync;
+  publisher.zotero.Items.getByLibraryAndKeyAsync = async (libraryID, key) => {
+    const item = await lookup(libraryID, key);
+    const head = transport.manifest;
+    if (!competing && key === oldPart.key && head.snapshot.generation > base.snapshot.generation) {
+      competing = { ...base, snapshot: { ...base.snapshot, generation: head.snapshot.generation + 1 } };
+      transport.manifest = competing;
+      const bytes = transport.remote.get(publisher.carrier.key).bytes;
+      await fs.writeFile(path.join(publisher.dir, 'storage', publisher.carrier.key, SHARED_FILE), bytes);
+      publisher.carrier.attachmentSyncedHash = digest(bytes);
+    }
+    return item;
+  };
+  publisher.items.set(700, publisher.makePaper(700, 'ZZZNEW01', 1, 'New metadata-only paper'));
+  await source.indexItems([700]);
+  await source.indexSync.syncNow();
+  assert.ok(competing);
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.deepEqual(transport.manifest, competing);
+  assert.ok(transport.remote.has(oldPart.key));
+  assert.deepEqual(transport.erased, []);
 });
 
 test('resuming a draft repairs a lost ZIP before exposing the manifest', async (t) => {

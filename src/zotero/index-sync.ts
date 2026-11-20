@@ -730,8 +730,6 @@ export class IndexSync {
     if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
     if (!this.isSynced(carrier, digest)) await this.runNativeSync(context);
     if (!this.current(epoch, context)) return false;
-    if (!this.isSynced(carrier, digest)) throw new SyncIssue('waiting');
-    if (!await probe(carrier, digest)) throw new SyncIssue('webdav');
 
     const referenced = new Set(manifest.parts.map((part) => part.key));
     const retired: number[] = [];
@@ -746,7 +744,18 @@ export class IndexSync {
       }
     }
     if (!this.current(epoch, context)) return false;
-    if (retired.length) await Zotero.Items.erase(retired);
+    if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
+    const releaseRetirement = sync.Runner.delayIndefinite();
+    try {
+      // Resolving the retired attachments may have overlapped with another Zotero sync.
+      if (await fileDigest(this.pathFor(carrier)) !== digest) throw new SyncIssue('conflict');
+      if (!this.isSynced(carrier, digest)) throw new SyncIssue('waiting');
+      if (!await probe(carrier, digest)) throw new SyncIssue('webdav');
+      if (!this.current(epoch, context)) return false;
+      if (retired.length) await Zotero.Items.erase(retired);
+    } finally {
+      releaseRetirement();
+    }
     if (!this.current(epoch, context)) return false;
     if (needsRetirementSync) {
       if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
@@ -851,7 +860,7 @@ export class IndexSync {
       if (accepted?.version === 3) {
         for (const part of accepted.parts) keep.add(this.cachedPart(dir, part));
       }
-      await this.pruneParts(dir, keep, false);
+      if (accepted || (!this.active && !await IOUtils.exists(cache))) await this.pruneParts(dir, keep, false);
       for (const [i, part] of manifest.parts.entries()) {
         if (!this.current(epoch, context)) return;
         const path = paths[i];
