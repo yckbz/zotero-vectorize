@@ -9,11 +9,15 @@ import { extractItemMetadata, isIndexableRegularItem } from './extractor.ts';
 
 const BLOCK_SIZE = 256 * 1024;
 const MAX_LINE = 64 * 1024;
-export const MAX_SYNC_BYTES = 512 * 1024 * 1024;
+export const MIB = 1024 * 1024;
+export const MAX_PART_BYTES = 256 * MIB;
+export const MAX_SNAPSHOT_BYTES = 1024 * MIB;
+export const MAX_PARTS = 1024;
+export const LEGACY_MAX_BYTES = 512 * MIB;
 const int = (min: number, max: number) => z.number().check(z.int(), z.gte(min), z.lte(max));
 const bounded = (min: number, max: number) => z.string().check(z.minLength(min), z.maxLength(max));
-const key = z.string().check(z.regex(/^[A-Z0-9]{8}$/));
-const md5 = z.string().check(z.regex(/^[a-f0-9]{32}$/));
+export const zoteroKey = z.string().check(z.regex(/^[A-Z0-9]{8}$/));
+export const md5Digest = z.string().check(z.regex(/^[a-f0-9]{32}$/));
 const hash = z.string().check(z.regex(/^[a-f0-9]{16}$/));
 const revision = z.string().check(z.regex(/^(?:[a-f0-9]{32}:[a-f0-9]{32}|(?:sha256:)?[a-f0-9]{64})$/));
 const model = z.string().check(z.regex(/^[a-zA-Z0-9][a-zA-Z0-9_./:-]{0,199}$/));
@@ -28,7 +32,7 @@ const headerFields = {
   hybridSemanticWeight: z.number().check(z.gte(0), z.lte(1)),
   normalizeNotation: z.boolean(), maxResults: int(3, 40),
 };
-const header = z.discriminatedUnion('engine', [
+export const syncHeader = z.discriminatedUnion('engine', [
   z.strictObject({ ...headerFields, engine: z.enum(['local-onnx', 'ollama']), revision }),
   z.strictObject({ ...headerFields, engine: z.literal('openai'),
     model: bounded(1, 300).check(z.regex(/^[^\u0000-\u001f\u007f]+$/)),
@@ -37,15 +41,24 @@ const header = z.discriminatedUnion('engine', [
 ]);
 const vector = z.nullable(bounded(4, 44_000));
 const record = z.union([
-  z.tuple([z.literal('item'), key, hash, vector]),
-  z.tuple([z.literal('pdf'), key, key, md5]),
-  z.tuple([z.literal('chunk'), key, int(0, 1_000_000), int(0, 1_000_000), bounded(1, 32),
+  z.tuple([z.literal('item'), zoteroKey, hash, vector]),
+  z.tuple([z.literal('pdf'), zoteroKey, zoteroKey, md5Digest]),
+  z.tuple([z.literal('chunk'), zoteroKey, int(0, 1_000_000), int(0, 1_000_000), bounded(1, 32),
     int(0, Number.MAX_SAFE_INTEGER), int(0, Number.MAX_SAFE_INTEGER), bounded(1, 4000), vector]),
   z.tuple([z.literal('end'), int(0, 10_000_000)]),
 ]);
 
-export type SyncHeader = z.infer<typeof header>;
+export type SyncHeader = z.infer<typeof syncHeader>;
 export type SyncRecord = Exclude<z.infer<typeof record>, ['end', number]>;
+
+export interface SyncPart {
+  bytes: number;
+  digest: string;
+}
+
+export function partFilename(i: number): string {
+  return `zotero-vectorize-part-${i + 1}.zvpart`;
+}
 
 export async function cloudEndpointDigest(baseUrl: string): Promise<string | null> {
   const input = baseUrl.trim();
@@ -86,16 +99,16 @@ function unpackVector(input: string | null, dimensions: number): Float32Array | 
   return vector;
 }
 
-export async function snapshotSize(path: string): Promise<number> {
+export async function snapshotSize(path: string, maxBytes: number): Promise<number> {
   const stat = await IOUtils.stat(path);
-  if (stat.type !== 'regular' || stat.size <= 0 || stat.size > MAX_SYNC_BYTES) {
+  if (stat.type !== 'regular' || stat.size <= 0 || stat.size > maxBytes) {
     throw new Error('Invalid shared index file size');
   }
   return stat.size;
 }
 
-async function* lines(path: string): AsyncGenerator<string> {
-  const size = await snapshotSize(path);
+async function* lines(path: string, maxBytes: number, maxLine = MAX_LINE): AsyncGenerator<string> {
+  const size = await snapshotSize(path, maxBytes);
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let rest = '';
   for (let offset = 0; offset < size; offset += BLOCK_SIZE) {
@@ -105,37 +118,72 @@ async function* lines(path: string): AsyncGenerator<string> {
     const entries = (rest + decoder.decode(bytes, { stream: true })).split('\n');
     rest = entries.pop()!;
     for (const entry of entries) {
-      if (entry.length > MAX_LINE) throw new Error('Shared index record is too large');
+      if (entry.length > maxLine) throw new Error('Shared index record is too large');
       yield entry;
     }
-    if (rest.length > MAX_LINE) throw new Error('Shared index record is too large');
+    if (rest.length > maxLine) throw new Error('Shared index record is too large');
   }
   if (rest + decoder.decode()) throw new Error('Incomplete shared index record');
 }
 
-export async function readSyncHeader(path: string): Promise<SyncHeader> {
-  for await (const line of lines(path)) return header.parse(JSON.parse(line));
+export async function readFirstSyncRecord(path: string, maxLine?: number): Promise<unknown> {
+  for await (const line of lines(path, LEGACY_MAX_BYTES, maxLine)) return JSON.parse(line);
   throw new Error('Shared index header is missing');
 }
 
-export async function writeSyncSnapshot(path: string, manifest: SyncHeader, records: AsyncIterable<SyncRecord>): Promise<void> {
-  let buffer = JSON.stringify(header.parse(manifest)) + '\n';
-  let size = 0;
-  let count = 0;
-  const flush = async () => {
-    const bytes = new TextEncoder().encode(buffer);
-    if (size + bytes.length > MAX_SYNC_BYTES) throw new Error('Shared index exceeds the file size limit');
-    await IOUtils.write(path, bytes, { mode: size ? 'append' : 'create' });
-    size += bytes.length;
-    buffer = '';
-  };
-  for await (const row of records) {
-    buffer += JSON.stringify(record.parse(row)) + '\n';
-    count++;
-    if (buffer.length >= BLOCK_SIZE) await flush();
+export async function writeSyncParts(
+  dir: string, manifest: SyncHeader, records: AsyncIterable<SyncRecord>, maxPartBytes: number,
+): Promise<SyncPart[]> {
+  if (!Number.isSafeInteger(maxPartBytes) || maxPartBytes < 1 || maxPartBytes > MAX_PART_BYTES) {
+    throw new Error('Invalid shared index part size');
   }
-  buffer += JSON.stringify(['end', count]) + '\n';
-  await flush();
+  const encoder = new TextEncoder();
+  const buffer = new Uint8Array(Math.min(BLOCK_SIZE, maxPartBytes));
+  const parts: SyncPart[] = [];
+  let path = PathUtils.join(dir, partFilename(0));
+  let buffered = 0;
+  let written = 0;
+  let total = 0;
+  let count = 0;
+
+  const flush = async () => {
+    if (!buffered) return;
+    await IOUtils.write(path, buffer.subarray(0, buffered), { mode: written ? 'append' : 'create' });
+    written += buffered;
+    buffered = 0;
+  };
+  const finishPart = async () => {
+    await flush();
+    const digest = await Zotero.Utilities.Internal.md5Async(path);
+    parts.push({ bytes: written, digest: md5Digest.parse(digest) });
+    written = 0;
+    path = PathUtils.join(dir, partFilename(parts.length));
+  };
+  const append = async (row: unknown) => {
+    const line = JSON.stringify(row);
+    if (line.length > MAX_LINE) throw new Error('Shared index record is too large');
+    const bytes = encoder.encode(line + '\n');
+    if (bytes.length > maxPartBytes) throw new Error('Shared index record exceeds the part size');
+    if (total + bytes.length > MAX_SNAPSHOT_BYTES) throw new Error('Shared index exceeds the file size limit');
+    if (written + buffered + bytes.length > maxPartBytes) {
+      await finishPart();
+      if (parts.length >= MAX_PARTS) throw new Error('Shared index exceeds the part count limit');
+    }
+    if (buffered + bytes.length > buffer.length) await flush();
+    // A single bounded record always fits in a block.
+    buffer.set(bytes, buffered);
+    buffered += bytes.length;
+    total += bytes.length;
+  };
+
+  await append(syncHeader.parse(manifest));
+  for await (const row of records) {
+    await append(record.parse(row));
+    count++;
+  }
+  await append(record.parse(['end', count]));
+  await finishPart();
+  return parts;
 }
 
 export interface ReceivedSnapshot {
@@ -143,7 +191,9 @@ export interface ReceivedSnapshot {
   index: VectorSearchIndex;
 }
 
-export async function readSyncSnapshot(path: string, account: number, libraryID: number): Promise<ReceivedSnapshot> {
+export async function readSyncSnapshot(
+  paths: readonly string[], expected: SyncHeader, libraryID: number, maxPartBytes = MAX_PART_BYTES,
+): Promise<ReceivedSnapshot> {
   let manifest: SyncHeader | undefined;
   let count = 0;
   let ended = false;
@@ -152,11 +202,14 @@ export async function readSyncSnapshot(path: string, account: number, libraryID:
   const chunks: IndexedChunkRecord[] = [];
   const attachments = new Map<string, { item: ZoteroItem; sourceHash: string; itemKey: string } | null>();
   const seenChunks = new Set<string>();
-  for await (const line of lines(path)) {
+  async function* records() {
+    for (const path of paths) yield* lines(path, maxPartBytes);
+  }
+  for await (const line of records()) {
     const raw: unknown = JSON.parse(line);
     if (!manifest) {
-      manifest = header.parse(raw);
-      if (manifest.account !== account) throw new Error('Shared index belongs to another Zotero account');
+      manifest = syncHeader.parse(raw);
+      if (JSON.stringify(manifest) !== JSON.stringify(expected)) throw new Error('Shared index header does not match');
       fingerprint = buildModelFingerprint(manifest.engine, manifest.model, manifest.dimensions);
       continue;
     }

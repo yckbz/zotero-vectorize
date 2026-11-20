@@ -9,7 +9,6 @@ const ROOT = path.resolve(__dirname, '..');
 const ADDON_DIR = path.join(ROOT, 'addon');
 const BUILD_DIR = path.join(ROOT, 'build');
 const DIST_DIR = path.join(ROOT, 'dist');
-const XPI_PATH = path.join(DIST_DIR, 'zotero-vectorize.xpi');
 
 async function copyDir(src, dest) {
   await fs.mkdir(dest, { recursive: true });
@@ -29,6 +28,7 @@ async function copyDir(src, dest) {
 async function main() {
   const args = new Set(process.argv.slice(2));
   const shouldPackage = args.has('--xpi');
+  const smallSyncParts = args.has('--sync-test-small-parts');
 
   await fs.rm(BUILD_DIR, { recursive: true, force: true });
   await fs.mkdir(BUILD_DIR, { recursive: true });
@@ -44,6 +44,7 @@ async function main() {
     format: 'iife',
     platform: 'browser',
     target: 'firefox115',
+    define: { __ZV_TEST_SYNC_PART_BYTES__: smallSyncParts ? String(1024 * 1024) : 'undefined' },
     charset: 'utf8',
     sourcemap: false,
     minify: false,
@@ -104,8 +105,9 @@ async function main() {
   }
 
   if (shouldPackage) {
+    const xpiPath = path.join(DIST_DIR, smallSyncParts ? 'zotero-vectorize-sync-test.xpi' : 'zotero-vectorize.xpi');
     await fs.mkdir(DIST_DIR, { recursive: true });
-    await fs.rm(XPI_PATH, { force: true });
+    await fs.rm(xpiPath, { force: true });
 
     const pyScript = `
 import os, sys, zipfile
@@ -120,9 +122,9 @@ with zipfile.ZipFile(out_xpi, 'w', compression=zipfile.ZIP_DEFLATED, compresslev
             rel = os.path.relpath(full, build_dir).replace(os.sep, '/')
             zf.write(full, rel)
 `;
-    execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', pyScript, BUILD_DIR, XPI_PATH], { stdio: 'inherit' });
-    const stat = await fs.stat(XPI_PATH);
-    console.log(`Packaged ${XPI_PATH} (${(stat.size / 1024).toFixed(1)} KB)`);
+    execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', pyScript, BUILD_DIR, xpiPath], { stdio: 'inherit' });
+    const stat = await fs.stat(xpiPath);
+    console.log(`Packaged ${xpiPath} (${(stat.size / 1024).toFixed(1)} KB)`);
   }
 }
 
