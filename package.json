@@ -1,6 +1,6 @@
 {
   "name": "zotero-vectorize",
-  "version": "1.0.3-beta.2",
+  "version": "1.0.3-beta.3",
   "description": "Local-first semantic search, cross-lingual recall, full-text passage navigation, and automatic background vectorization plugin for Zotero.",
   "license": "MIT",
   "type": "module",
