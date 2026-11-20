@@ -25,6 +25,7 @@ async function setup(t) {
   const transport = {
     remote, offline: false, errors: 0, uploads: 0, downloads: 0, syncs: 0,
     partUploads: [], partDownloads: [], erased: [], missingMetadata: new Set(), missingFiles: new Set(),
+    missingProps: new Set(), remoteHashes: new Map(), probes: [], forcedUploads: [],
     get manifest() {
       const head = remote.get('INDEX001');
       return head ? JSON.parse(String(head.bytes)) : null;
@@ -184,6 +185,23 @@ async function setup(t) {
           return item;
         },
       },
+      HTTP: {
+        request: async (method, { key, kind }, options) => {
+          assert.equal(options.noCache, true);
+          assert.deepEqual(options.successCodes, [200, 404]);
+          assert.equal(method, kind === 'prop' ? 'GET' : 'HEAD');
+          transport.probes.push([method, key]);
+          await transport.beforeProbe?.(method, key);
+          if (transport.offline) throw new Error('offline');
+          const file = remote.get(key);
+          const missing = kind === 'prop' ? transport.missingProps : transport.missingFiles;
+          if (!file || missing.has(key)) return { status: 404 };
+          if (kind === 'zip') return { status: 200, getResponseHeader: () => String(file.bytes.length) };
+          const fields = { hash: transport.remoteHashes.get(key) ?? digest(file.bytes), mtime: '1234567890' };
+          const root = { localName: 'properties', getElementsByTagName: (name) => [{ textContent: fields[name] }] };
+          return { status: 200, response: { documentElement: root } };
+        },
+      },
       Notifier: {
         registerObserver: (obs, _types, id) => { observers.set(id, obs); return id; },
         unregisterObserver: (id) => observers.delete(id),
@@ -191,6 +209,11 @@ async function setup(t) {
       Sync: {
         Runner: {
           enabled: true, syncInProgress: false, delayIndefinite: () => () => {},
+          getStorageController: () => ({
+            _init: async () => {},
+            _getItemURI: ({ key }) => ({ key, kind: 'zip' }),
+            _getItemPropertyURI: ({ key }) => ({ key, kind: 'prop' }),
+          }),
           async sync({ libraries, onError }) {
             assert.deepEqual(libraries, [1]);
             transport.syncs++;
@@ -199,7 +222,7 @@ async function setup(t) {
               onError(new Error('offline'));
             } else if (!shift) {
               for (const item of items.values()) {
-                if (item.attachmentSyncState !== 0) continue;
+                if (![0, 3].includes(item.attachmentSyncState)) continue;
                 try {
                   await transport.beforeUpload?.(item);
                 } catch (error) {
@@ -208,6 +231,9 @@ async function setup(t) {
                 }
                 const bytes = await fs.readFile(attachmentPath(item));
                 remote.set(item.key, { title: item.getField('title'), filename: item.attachmentFilename, bytes });
+                transport.missingFiles.delete(item.key);
+                transport.missingProps.delete(item.key);
+                transport.remoteHashes.delete(item.key);
                 item.attachmentSyncedHash = digest(bytes);
                 item.attachmentSyncState = 2;
                 if (item === carrier) transport.uploads++;
@@ -237,9 +263,11 @@ async function setup(t) {
         Storage: { Local: {
           SYNC_STATE_IN_SYNC: 2, SYNC_STATE_IN_CONFLICT: 5,
           getModeForLibrary: () => 'webdav',
-          async updateSyncStates([item], state) {
-            assert.equal(state, 'to_upload');
-            carrier.attachmentSyncState = 0;
+          async updateSyncStates(moved, state) {
+            for (const item of moved) {
+              item.attachmentSyncState = state === 'force_upload' ? 3 : 0;
+              if (state === 'force_upload') transport.forcedUploads.push(item.key);
+            }
           },
         } },
       },
@@ -557,8 +585,8 @@ test('offline sync, corrupted publications, account changes and model drift pres
   service.indexSync.setRole('receive');
   await service.indexSync.syncNow();
   const generation = service.indexSync.active.manifest.generation;
-  const valid = transport.bytes;
-  const corrupted = String(valid).trimEnd().split('\n');
+  const valid = transport.manifest;
+  const corrupted = String(transport.bytes).trimEnd().split('\n');
   const header = JSON.parse(corrupted[0]);
   header.generation++;
   corrupted[0] = JSON.stringify(header);
@@ -606,7 +634,7 @@ test('offline sync, corrupted publications, account changes and model drift pres
 
   subscriber.flags.revision = 'f'.repeat(32) + ':' + 'b'.repeat(32);
   transport.offline = false;
-  transport.bytes = valid;
+  transport.manifest = valid;
   service = await subscriber.start();
   await service.indexSync.syncNow();
   assert.equal(service.indexSync.getStatus().phase, 'model');
@@ -970,4 +998,284 @@ test('a beta publisher upgrades its bound attachment while a beta receiver can s
   assert.equal(destination.indexSync.getStatus().phase, 'ready');
   assert.equal(destination.indexSync.active?.manifest.generation, transport.manifest.snapshot.generation);
   await assert.rejects(fs.stat(cache), { code: 'ENOENT' });
+});
+
+test('a published generation repairs a missing ZIP and a fully missing part with the same keys', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 512;
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const manifest = transport.manifest;
+  const [first, second] = manifest.parts.map((part) => part.key);
+  const oldPayload = transport.bytes;
+  transport.missingFiles.add(first);
+  transport.missingFiles.add(second);
+  transport.missingProps.add(second);
+  transport.beforeUpload = () => { throw new Error('WebDAV refused repair'); };
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.deepEqual(transport.manifest, manifest);
+  assert.ok(transport.missingFiles.has(first));
+
+  transport.beforeUpload = undefined;
+  transport.forcedUploads.length = 0;
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.deepEqual(transport.forcedUploads, [first, second]);
+  assert.deepEqual(transport.manifest, manifest);
+  assert.deepEqual(transport.bytes, oldPayload);
+  assert.equal(transport.uploads, 1);
+  assert.deepEqual(transport.erased, []);
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, manifest.snapshot.generation);
+  assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+});
+
+test('an inconclusive remote check, conflicting hashes and modified local parts prohibit repair', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 512;
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const [first, second] = transport.manifest.parts.map((part) => part.key);
+  transport.missingFiles.add(first);
+  transport.beforeProbe = (method, key) => {
+    if (method === 'HEAD' && key === first) throw new Error('Permission denied or server unavailable');
+  };
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.deepEqual(transport.forcedUploads, []);
+  transport.beforeProbe = undefined;
+
+  transport.remoteHashes.set(second, '0'.repeat(32));
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.deepEqual(transport.forcedUploads, []);
+  transport.remoteHashes.clear();
+
+  transport.missingProps.add(second);
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.deepEqual(transport.forcedUploads, []);
+  transport.missingProps.clear();
+
+  transport.remoteHashes.set('INDEX001', '0'.repeat(32));
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.deepEqual(transport.forcedUploads, []);
+  transport.remoteHashes.clear();
+
+  const local = path.join(publisher.dir, 'storage', first, transport.remote.get(first).filename);
+  const bytes = await fs.readFile(local);
+  bytes[0] ^= 1;
+  await fs.writeFile(local, bytes);
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'error');
+  assert.deepEqual(transport.forcedUploads, []);
+  assert.equal(transport.uploads, 1);
+  assert.ok(transport.missingFiles.has(first));
+});
+
+test('if a missing part reappears during local verification, its remote digest is checked again before repair', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const [part] = transport.manifest.parts;
+  const md5Async = publisher.zotero.Utilities.Internal.md5Async;
+  const partPath = path.join(publisher.dir, 'storage', part.key, transport.remote.get(part.key).filename);
+  for (const replacement of [part.digest, '0'.repeat(32)]) {
+    transport.missingFiles.add(part.key);
+    publisher.zotero.Utilities.Internal.md5Async = async (file) => {
+      if (file === partPath) {
+        transport.missingFiles.delete(part.key);
+        transport.remoteHashes.set(part.key, replacement);
+      }
+      return md5Async(file);
+    };
+    await source.indexSync.syncNow();
+    assert.equal(source.indexSync.getStatus().phase, replacement === part.digest ? 'ready' : 'conflict');
+    assert.deepEqual(transport.forcedUploads, []);
+  }
+  publisher.zotero.Utilities.Internal.md5Async = md5Async;
+});
+
+test('a concurrent carrier update cannot be overwritten by a prepared generation', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const originalPartCount = transport.partUploads.length;
+  const current = transport.manifest;
+  const loadAll = source.store.loadAll.bind(source.store);
+  const changedHead = { ...current, snapshot: { ...current.snapshot, generation: current.snapshot.generation + 1 } };
+  source.store.loadAll = async (...args) => {
+    const records = await loadAll(...args);
+    transport.manifest = changedHead;
+    const bytes = transport.remote.get(publisher.carrier.key).bytes;
+    await fs.writeFile(path.join(publisher.dir, 'storage', publisher.carrier.key, SHARED_FILE), bytes);
+    publisher.carrier.attachmentSyncedHash = digest(bytes);
+    return records;
+  };
+  source.updateConfig({ hybridSemanticWeight: 0.35 });
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.deepEqual(transport.manifest, changedHead);
+  assert.equal(transport.uploads, 1);
+  assert.equal(transport.partUploads.length, originalPartCount);
+  assert.deepEqual(transport.erased, []);
+});
+
+test('a conflicting remote carrier blocks a new publication before any parts are uploaded', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const current = transport.manifest;
+  const uploads = transport.partUploads.length;
+  transport.remoteHashes.set(publisher.carrier.key, '0'.repeat(32));
+  source.updateConfig({ hybridSemanticWeight: 0.35 });
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.deepEqual(transport.manifest, current);
+  assert.equal(transport.uploads, 1);
+  assert.equal(transport.partUploads.length, uploads);
+  assert.deepEqual(transport.erased, []);
+});
+
+test('resuming a draft repairs a lost ZIP before exposing the manifest', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 512;
+  let source = await publisher.start();
+  await source.startIndexing();
+  transport.beforeUpload = (item) => {
+    if (item === publisher.carrier) throw new Error('Interrupted manifest upload');
+  };
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.equal(transport.manifest, null);
+  const parts = [...transport.partUploads];
+  assert.ok(parts.length > 1);
+  await publisher.shutdown(source);
+
+  transport.missingFiles.add(parts[0]);
+  transport.beforeUpload = (item) => {
+    if (item === publisher.carrier) assert.equal(transport.missingFiles.has(parts[0]), false);
+  };
+  source = await publisher.start();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.deepEqual(transport.forcedUploads, [parts[0]]);
+  assert.deepEqual(transport.manifest.parts.map((part) => part.key), parts);
+});
+
+test('committed generation identity survives missing cache data and rejects stale or conflicting manifests', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const older = transport.bytes;
+  source.updateConfig({ hybridSemanticWeight: 0.35 });
+  await source.indexSync.syncNow();
+  const latest = transport.manifest;
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  let destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  const localRows = await destination.store.loadAll();
+  const dir = path.join(destination.store.getStoreDir(), 'shared-index-101');
+  const head = path.join(dir, 'current.zvmanifest');
+  const hash = digest(await fs.readFile(head));
+  await receiver.shutdown(destination);
+  const accepted = PREFIX + 'syncAccepted.101';
+  assert.deepEqual(JSON.parse(receiver.prefs.get(accepted)), {
+    publisher: latest.snapshot.publisher, generation: latest.snapshot.generation, digest: hash,
+  });
+  receiver.prefs.delete(accepted); // An existing cache from before the independent identity was recorded.
+  await fs.unlink(path.join(dir, 'parts-' + hash, 'zotero-vectorize-part-1.zvpart'));
+  transport.bytes = older;
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'conflict');
+  assert.equal(destination.indexSync.active, null);
+  assert.equal(digest(await fs.readFile(head)), hash);
+  assert.equal(JSON.parse(receiver.prefs.get(accepted)).generation, latest.snapshot.generation);
+  await receiver.shutdown(destination);
+
+  await fs.unlink(head);
+  destination = await receiver.start();
+  for (const manifest of [
+    transport.manifest,
+    { ...latest, parts: [{ ...latest.parts[0], key: 'ABCDEFGH' }] },
+    { ...latest, snapshot: { ...latest.snapshot, publisher: 'X'.repeat(24), generation: latest.snapshot.generation + 1 } },
+  ]) {
+    transport.manifest = manifest;
+    const downloads = transport.partDownloads.length;
+    await destination.indexSync.syncNow();
+    assert.equal(destination.indexSync.getStatus().phase, 'conflict');
+    assert.equal(destination.indexSync.active, null);
+    assert.equal(transport.partDownloads.length, downloads);
+  }
+  await receiver.shutdown(destination);
+
+  const corruptHead = { ...latest, snapshot: { ...latest.snapshot, generation: latest.snapshot.generation + 10_000 } };
+  await fs.writeFile(head, JSON.stringify(corruptHead));
+  destination = await receiver.start();
+  transport.manifest = latest;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.active?.manifest.generation, latest.snapshot.generation);
+  assert.equal(JSON.parse(receiver.prefs.get(accepted)).generation, latest.snapshot.generation);
+  assert.deepEqual(await destination.store.loadAll(), localRows);
+});
+
+test('one check resumes an acknowledged draft and publishes the newly selected part size', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  let source = await publisher.start();
+  await source.startIndexing();
+  const directory = path.join(source.store.getStoreDir(), 'publish-101');
+  const remove = IOUtils.remove;
+  IOUtils.remove = async (file, options) => {
+    if (file === directory && transport.uploads === 1) throw new Error('Interrupted before removing committed draft');
+    return remove(file, options);
+  };
+  try {
+    await source.indexSync.syncNow();
+    assert.equal(source.indexSync.getStatus().phase, 'error');
+  } finally {
+    IOUtils.remove = remove;
+  }
+  const first = transport.manifest;
+  await publisher.shutdown(source);
+
+  source = await publisher.start();
+  source.indexSync.setPartSizeMiB(64);
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(source.indexSync.getPartSizeMiB(), 64);
+  assert.equal(transport.uploads, 2);
+  assert.ok(transport.manifest.snapshot.generation > first.snapshot.generation);
+  assert.deepEqual(transport.erased, first.parts.map((part) => part.key));
+  await source.indexSync.syncNow();
+  assert.equal(transport.uploads, 2);
 });

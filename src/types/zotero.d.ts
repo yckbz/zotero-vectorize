@@ -200,13 +200,18 @@ export interface ZoteroNamespace {
       delayIndefinite(): () => void;
       sync(options: { libraries: number[]; background: boolean; onError?: (error: unknown) => void }): Promise<unknown>;
       downloadFile(item: ZoteroItem): Promise<unknown>;
+      getStorageController(mode: 'webdav'): {
+        _init(): Promise<void>;
+        _getItemURI(item: ZoteroItem): object;
+        _getItemPropertyURI(item: ZoteroItem): object;
+      };
     };
     Storage: {
       Local: {
         readonly SYNC_STATE_IN_SYNC: number;
         readonly SYNC_STATE_IN_CONFLICT: number;
         getModeForLibrary(libraryID: number): string;
-        updateSyncStates(items: ZoteroItem[], state: 'to_upload'): Promise<void>;
+        updateSyncStates(items: ZoteroItem[], state: 'to_upload' | 'force_upload'): Promise<void>;
       };
     };
   };
@@ -292,15 +297,17 @@ export interface ZoteroNamespace {
   HTTP: {
     request(
       method: string,
-      url: string,
+      url: string | object,
       options?: {
         headers?: Record<string, string>;
         body?: string;
         timeout?: number;
         responseType?: string;
         successCodes?: number[] | false;
+        noCache?: boolean;
+        requestObserver?: (request: XMLHttpRequest) => void;
       }
-    ): Promise<{ status: number; responseText: string; response: any }>;
+    ): Promise<{ status: number; responseText: string; response: any; getResponseHeader(name: string): string | null }>;
   };
   File: {
     createDirectoryIfMissingAsync(path: string): Promise<void>;
