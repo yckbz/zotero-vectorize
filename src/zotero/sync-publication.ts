@@ -37,9 +37,26 @@ const draftSchema = z.strictObject({
     parts: parts(z.strictObject({ key: zoteroKey, content: z.optional(contentDigest) })),
   })),
 });
+const legacyDraftSchema = z.strictObject({
+  snapshot: syncHeader,
+  stamp: z.string().check(z.regex(/^[a-f0-9]{16}$/)),
+  parts: parts(z.strictObject(partFields)).check(z.minLength(1)),
+  previous: z.nullable(z.strictObject({
+    generation: z.number().check(z.int(), z.gte(1)),
+    digest: md5Digest,
+    keys: z.array(zoteroKey).check(z.maxLength(MAX_PARTS)),
+  })),
+});
 
 export type SyncManifest = z.infer<typeof manifestSchema>;
+export type LegacySyncManifest = z.infer<typeof legacyManifestSchema>;
 export type SyncDraft = z.infer<typeof draftSchema>;
+export type LegacySyncDraft = Omit<z.infer<typeof legacyDraftSchema>, 'previous' | 'stamp'> &
+  { version: 2; previous: SyncDraft['previous'] };
+
+export class SyncProtocolVersionError extends Error {
+  constructor(readonly version: number) { super('Unsupported shared index protocol version'); }
+}
 
 export const acceptedPublication = z.strictObject({
   publisher: z.string().check(z.regex(/^[a-zA-Z0-9]{24}$/)),
@@ -78,7 +95,14 @@ async function readManifestJSON(path: string): Promise<unknown> {
 }
 
 export async function readSyncManifest(path: string): Promise<SyncManifest> {
-  const manifest = manifestSchema.parse(await readManifestJSON(path));
+  const value = await readManifestJSON(path);
+  if (typeof value === 'object' && value !== null && 'type' in value &&
+      value.type === 'zotero-vectorize-index-manifest' && 'version' in value &&
+      typeof value.version === 'number' && Number.isSafeInteger(value.version)) {
+    if (value.version === 2) legacyManifest(value);
+    if (value.version >= 2 && value.version !== 3) throw new SyncProtocolVersionError(value.version);
+  }
+  const manifest = manifestSchema.parse(value);
   validateParts(manifest.parts, manifest.partBytes);
   return manifest;
 }
@@ -90,16 +114,27 @@ export async function readCachedManifest(path: string) {
     validateParts(latest.data.parts, latest.data.partBytes);
     return latest.data;
   }
+  return legacyManifest(value);
+}
+
+function legacyManifest(value: unknown): LegacySyncManifest {
   const legacy = legacyManifestSchema.parse(value);
   if (!legacy.parts.length) throw new Error('Empty legacy shared index');
   validateParts(legacy.parts, MAX_PART_BYTES);
   return legacy;
 }
 
-export async function readSyncDraft(path: string): Promise<SyncDraft> {
+export async function readSyncDraft(path: string): Promise<SyncDraft | LegacySyncDraft> {
   const value = await readManifestJSON(path);
   if (typeof value === 'object' && value !== null && !('version' in value)) {
-    throw new Error('Finish the pending shared index publication using the previous plugin version before upgrading.');
+    const { snapshot, parts, previous } = legacyDraftSchema.parse(value);
+    validateParts(parts, MAX_PART_BYTES);
+    if (previous && (previous.generation >= snapshot.generation || new Set(previous.keys).size !== previous.keys.length)) {
+      throw new Error('Invalid legacy shared index draft');
+    }
+    return { version: 2, snapshot, parts, previous: previous && {
+      generation: previous.generation, digest: previous.digest, parts: previous.keys.map((key) => ({ key })),
+    } };
   }
   const draft = draftSchema.parse(value);
   validateParts(draft.parts, draft.partBytes);
@@ -151,7 +186,7 @@ export async function verifyPart(path: string, expected: SyncPart & { content?: 
   }
 }
 
-type RemoteFileState = 'present' | 'missing' | 'conflict';
+type RemoteFileState = 'present' | 'missing' | 'unconfirmed' | 'conflict';
 
 export async function openWebDavProbe() {
   const controller = Zotero.Sync!.Runner.getStorageController('webdav');
@@ -166,7 +201,7 @@ export async function openWebDavProbe() {
     if (prop.status === 404) {
       // A ZIP without its hash metadata may be in the middle of a native WebDAV upload.
       const zip = await Zotero.HTTP.request('HEAD', controller._getItemURI(item), options);
-      return zip.status === 404 ? 'missing' : 'conflict';
+      return zip.status === 404 ? 'missing' : 'unconfirmed';
     }
     const doc: Document | null = prop.response;
     const root = doc?.documentElement;

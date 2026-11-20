@@ -94,6 +94,7 @@ async function setup(t) {
     }),
     copy: fs.copyFile,
     move: fs.rename,
+    setModificationTime: (file, modified) => fs.utimes(file, modified / 1000, modified / 1000),
     remove: (file, options) => fs.rm(file, { force: Boolean(options?.ignoreAbsent), recursive: Boolean(options?.recursive) }),
     getChildren: async (dir) => (await fs.readdir(dir)).map((file) => path.join(dir, file)),
   };
@@ -1207,12 +1208,7 @@ test('a beta publisher upgrades its bound attachment while a beta receiver can s
   await assert.rejects(fs.stat(cache), { code: 'ENOENT' });
 });
 
-test('v2 ownership and offline cache survive a coordinated cutover and the old part retires after commit', async (t) => {
-  const { createDevice, transport } = await setup(t);
-  const publisher = await createDevice('publisher', 0, 'publish');
-  let source = await publisher.start();
-  await source.startIndexing();
-  await source.indexSync.syncNow();
+async function seedV2Head(publisher, transport) {
   const { snapshot, parts: [{ key }] } = transport.manifest;
   const legacyBytes = transport.bytes;
   const filename = 'zotero-vectorize-part-1.zvpart';
@@ -1229,6 +1225,16 @@ test('v2 ownership and offline cache survive a coordinated cutover and the old p
   const head = transport.remote.get('INDEX001').bytes;
   publisher.carrier.attachmentSyncedHash = digest(head);
   await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), head);
+  return { snapshot, key, filename, legacyBytes, head };
+}
+
+test('v2 ownership and offline cache survive a coordinated cutover and the old part retires after commit', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const { snapshot, key, filename, legacyBytes, head } = await seedV2Head(publisher, transport);
   await publisher.shutdown(source);
 
   const receiver = await createDevice('receiver', 100, 'receive');
@@ -1242,9 +1248,13 @@ test('v2 ownership and offline cache survive a coordinated cutover and the old p
   await destination.indexSync.syncNow();
   assert.equal(destination.indexSync.active?.manifest.generation, snapshot.generation);
   assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+  transport.offline = false;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'upgradePublisher');
+  assert.equal(destination.indexSync.active.manifest.generation, snapshot.generation);
+  assert.deepEqual(transport.partDownloads, []);
   await receiver.shutdown(destination);
 
-  transport.offline = false;
   source = await publisher.start();
   transport.beforeErase = () => assert.equal(transport.manifest.version, 3);
   await source.indexSync.syncNow();
@@ -1259,6 +1269,219 @@ test('v2 ownership and offline cache survive a coordinated cutover and the old p
   assert.equal(destination.indexSync.getStatus().phase, 'ready');
   assert.equal(destination.indexSync.active.manifest.generation, transport.manifest.snapshot.generation);
   await assert.rejects(fs.stat(cachedParts), { code: 'ENOENT' });
+});
+
+test('a fresh receiver distinguishes old and new sync formats from malformed manifests', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const latest = transport.manifest;
+  await seedV2Head(publisher, transport);
+  const legacy = transport.manifest;
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const destination = await receiver.start();
+  for (const [manifest, phase] of [
+    [legacy, 'upgradePublisher'],
+    [{ ...latest, version: 4 }, 'upgradeReceiver'],
+    [{ ...legacy, parts: [] }, 'error'],
+  ]) {
+    transport.manifest = manifest;
+    await destination.indexSync.syncNow();
+    assert.equal(destination.indexSync.getStatus().phase, phase);
+    assert.equal(destination.indexSync.active, null);
+    assert.deepEqual(transport.partDownloads, []);
+  }
+});
+
+test('a v2 draft is reconciled before publishing v3 across interruption stages', async (t) => {
+  for (const step of [
+    'first draft', 'parts uploaded', 'carrier pending', 'carrier ZIP without metadata', 'carrier confirmed', 'carrier with lost part',
+  ]) {
+    await t.test(step, async (branch) => {
+      const { createDevice, transport } = await setup(branch);
+      const publisher = await createDevice('publisher', 0, 'publish');
+      let source = await publisher.start();
+      await source.startIndexing();
+      await source.indexSync.syncNow();
+      const { snapshot, key, filename, legacyBytes, head } = await seedV2Head(publisher, transport);
+      const first = step === 'first draft';
+      const base = transport.manifest;
+      if (first) {
+        await publisher.zotero.Items.erase([publisher.carrier.id]);
+        const attachment = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, key);
+        await publisher.zotero.Items.erase([attachment.id]);
+        publisher.prefs.delete(PREFIX + 'syncAttachment');
+        await publisher.zotero.Sync.Runner.sync({ libraries: [1] });
+        publisher.carrier.attachmentSyncState = 0;
+        delete publisher.carrier.attachmentSyncedHash;
+      }
+      const draftDir = path.join(source.store.getStoreDir(), 'publish-101');
+      const next = { ...snapshot, generation: snapshot.generation + 1 };
+      const payload = Buffer.from(JSON.stringify(next) + String(legacyBytes).slice(String(legacyBytes).indexOf('\n')));
+      const part = { bytes: payload.length, digest: digest(payload) };
+      await fs.mkdir(draftDir, { recursive: true });
+      const stagedPart = path.join(draftDir, filename);
+      await fs.writeFile(stagedPart, payload);
+      const partItem = await publisher.zotero.Attachments.importFromFile({
+        file: stagedPart, libraryID: 1, title: `${TITLE} Part ${next.publisher} ${next.generation} 1`,
+      });
+      await publisher.zotero.Sync.Runner.sync({ libraries: [1] });
+      const staged = { ...base, snapshot: next, parts: [{ ...part, key: partItem.key }] };
+      const carrierPath = path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE);
+      if (step.startsWith('carrier')) {
+        await fs.writeFile(carrierPath, JSON.stringify(staged) + '\n');
+        publisher.carrier.attachmentSyncState = 0;
+        if (step === 'carrier ZIP without metadata' || step === 'carrier confirmed') {
+          await publisher.zotero.Sync.Runner.sync({ libraries: [1] });
+        }
+        if (step === 'carrier ZIP without metadata') {
+          transport.missingProps.add(publisher.carrier.key);
+          publisher.carrier.attachmentSyncState = 0;
+          publisher.carrier.attachmentSyncedHash = digest(head);
+        }
+        if (step === 'carrier with lost part') {
+          publisher.items.delete(partItem.id);
+          transport.remote.delete(partItem.key);
+        }
+      }
+      const draftPath = path.join(draftDir, 'draft.json');
+      await fs.writeFile(draftPath, JSON.stringify({
+        snapshot: next, stamp: '1'.repeat(16), parts: [part],
+        previous: first ? null : { generation: snapshot.generation, digest: digest(head), keys: [key] },
+      }));
+      await publisher.shutdown(source);
+
+      const uploads = [];
+      transport.beforeUpload = async (item) => {
+        if (item !== publisher.carrier) return;
+        const current = JSON.parse(await fs.readFile(carrierPath, 'utf8'));
+        uploads.push(current.version);
+        if (current.version === 2) assert.ok(transport.remote.has(partItem.key));
+      };
+      source = await publisher.start();
+      if (step === 'carrier pending') {
+        transport.remoteHashes.set(publisher.carrier.key, 'f'.repeat(32));
+        await source.indexSync.syncNow();
+        assert.equal(source.indexSync.getStatus().phase, 'conflict');
+        assert.deepEqual(transport.manifest, base);
+        assert.deepEqual(uploads, []);
+        assert.ok((await fs.stat(draftPath)).isFile());
+        transport.remoteHashes.clear();
+      }
+      await source.indexSync.syncNow();
+      assert.equal(source.indexSync.getStatus().phase, 'ready');
+      assert.equal(transport.manifest.version, 3);
+      assert.ok(transport.manifest.snapshot.generation > next.generation);
+      assert.deepEqual(uploads, ['carrier pending', 'carrier ZIP without metadata'].includes(step) ? [2, 3] : [3]);
+      assert.ok(!transport.remote.has(partItem.key));
+      assert.ok(!transport.remote.has(key));
+      await assert.rejects(fs.stat(draftPath), { code: 'ENOENT' });
+    });
+  }
+});
+
+test('published shard renames preserve reuse and one check replaces a missing attachment', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 256;
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const base = transport.manifest;
+  const [lost, ...healthy] = base.parts;
+  assert.ok(healthy.length);
+  const renamed = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, healthy[0].key);
+  renamed.getField = (field) => field === 'title' ? 'Renamed shard' : '';
+  transport.remote.get(renamed.key).title = 'Renamed shard';
+  await source.indexSync.run(false);
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.deepEqual(transport.manifest, base);
+
+  const removed = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, lost.key);
+  await publisher.zotero.Items.erase([removed.id]);
+  await publisher.zotero.Sync.Runner.sync({ libraries: [1] });
+  transport.partUploads.length = 0;
+  await source.indexSync.syncNow();
+  const next = transport.manifest;
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.ok(next.snapshot.generation > base.snapshot.generation);
+  const [{ key, ...range }] = next.parts;
+  assert.notEqual(key, lost.key);
+  assert.deepEqual({ ...range, key: lost.key }, lost);
+  assert.deepEqual(next.parts.slice(1), healthy);
+  assert.deepEqual(transport.partUploads, [key]);
+  const moved = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, key);
+  moved.parentItemID = 1;
+  transport.partUploads.length = 0;
+  await source.indexSync.run(false);
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.ok(transport.manifest.snapshot.generation > next.snapshot.generation);
+  assert.deepEqual(transport.partUploads, [transport.manifest.parts[0].key]);
+  assert.notEqual(transport.manifest.parts[0].key, key);
+  assert.ok(transport.remote.has(key), 'The user-managed attachment must not be deleted');
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+});
+
+test('a lost reuse key in a v3 draft is repaired against the confirmed head', async (t) => {
+  for (const confirmed of [false, true]) {
+    await t.test(confirmed ? 'carrier confirmed' : 'carrier only staged locally', async (branch) => {
+      const { createDevice, transport } = await setup(branch);
+      const publisher = await createDevice('publisher', 0, 'publish');
+      publisher.flags.partBytes = 256;
+      let source = await publisher.start();
+      await source.startIndexing();
+      await source.indexSync.syncNow();
+      const previous = transport.manifest;
+      const [missing] = previous.parts;
+      const draftDir = path.join(source.store.getStoreDir(), 'publish-101');
+      publisher.items.set(700, publisher.makePaper(700, 'ZZZNEW01', 1, 'Another document'));
+      await source.indexItems([700]);
+      transport.beforeUpload = (item) => {
+        if (item === publisher.carrier) throw new Error('Interrupted carrier upload');
+      };
+      await source.indexSync.syncNow();
+      assert.equal(source.indexSync.getStatus().phase, 'webdav');
+      assert.deepEqual(transport.manifest, previous);
+      const draft = JSON.parse(await fs.readFile(path.join(draftDir, 'draft.json'), 'utf8'));
+      assert.ok(draft.parts.some((part) => part.key === missing.key));
+      const locallyStaged = JSON.parse(await fs.readFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), 'utf8'));
+      if (confirmed) {
+        transport.beforeUpload = undefined;
+        await publisher.zotero.Sync.Runner.sync({ libraries: [1] });
+        assert.deepEqual(transport.manifest, locallyStaged);
+      }
+      await publisher.shutdown(source);
+
+      const lost = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, missing.key);
+      publisher.items.delete(lost.id);
+      transport.remote.delete(lost.key);
+      transport.beforeUpload = async (item) => {
+        if (item === publisher.carrier) {
+          const next = JSON.parse(await fs.readFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), 'utf8'));
+          assert.ok(next.snapshot.generation > locallyStaged.snapshot.generation);
+          assert.ok(next.parts.every(({ key }) => key !== missing.key && transport.remote.has(key)));
+        }
+      };
+      const downloads = transport.downloads;
+      source = await publisher.start();
+      await source.indexSync.syncNow();
+      assert.equal(source.indexSync.getStatus().phase, 'ready');
+      assert.equal(transport.downloads - downloads, confirmed ? 0 : 1);
+      assert.ok(transport.manifest.snapshot.generation > locallyStaged.snapshot.generation);
+      assert.ok(transport.manifest.parts.every(({ key }) => key !== missing.key && transport.remote.has(key)));
+      await assert.rejects(fs.stat(draftDir), { code: 'ENOENT' });
+    });
+  }
 });
 
 test('a published generation repairs a missing ZIP and a fully missing part with the same keys', async (t) => {

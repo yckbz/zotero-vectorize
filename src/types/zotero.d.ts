@@ -77,6 +77,7 @@ export interface IOUtilsNamespace {
   move(source: string, dest: string, options?: { noOverwrite?: boolean }): Promise<void>;
   copy(source: string, dest: string, options?: { noOverwrite?: boolean }): Promise<void>;
   stat(path: string): Promise<{ size: number; lastModified: number; type: string }>;
+  setModificationTime(path: string, modificationTime: number): Promise<number>;
   getChildren(path: string): Promise<string[]>;
 }
 

@@ -156,7 +156,7 @@ export async function readFirstSyncRecord(path: string, maxLine?: number): Promi
 
 export async function prepareSyncParts(
   dir: string, records: AsyncIterable<SyncRecord>, maxPartBytes: number,
-  previous: readonly (RangePart & { key: string })[],
+  previous: readonly (RangePart & { key?: string })[],
 ): Promise<(RangePart & { key?: string })[]> {
   if (!Number.isSafeInteger(maxPartBytes) || maxPartBytes < 1 || maxPartBytes > MAX_PART_BYTES) {
     throw new Error('Invalid shared index part size');
@@ -164,7 +164,7 @@ export async function prepareSyncParts(
   const encoder = new TextEncoder();
   const buffer = new Uint8Array(maxPartBytes);
   const parts: (RangePart & { key?: string })[] = [];
-  const byContent = new Map(previous.map((part) => [part.content, part]));
+  const byContent = new Map(previous.filter((part) => part.key).map((part) => [part.content, part]));
   let used = 0;
   let total = 0;
   let range = 0;
