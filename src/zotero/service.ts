@@ -68,6 +68,7 @@ export class VectorizeService {
   private queryVectorCache = new Map<string, { fp: string; vec: Float32Array }>();
   private indexUpdateListeners = new Set<() => void>();
   private initialized = false;
+  private shuttingDown = false;
   private maintenance = Promise.resolve();
   private indexGeneration = 0;
   private initPromise: Promise<void> | null = null;
@@ -143,6 +144,7 @@ export class VectorizeService {
   }
 
   async init(): Promise<void> {
+    if (this.shuttingDown) throw new Error('Zotero Vectorize is shutting down');
     if (this.initialized) return;
     if (this.initPromise) return this.initPromise;
 
@@ -180,6 +182,8 @@ export class VectorizeService {
   }
 
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    await this.initPromise?.catch(() => {});
     this.indexSync.dispose();
     if (this.stopConfigObserver) {
       this.stopConfigObserver();

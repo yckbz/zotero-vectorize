@@ -16,6 +16,8 @@ interface WindowUiHandles {
 }
 
 let service: VectorizeService | null = null;
+let mcpController: McpController | null = null;
+let lifecycle = Promise.resolve();
 let pluginRootURI = '';
 let registeredPrefPaneId: string | null = null;
 let unregisterItemSection: (() => void) | null = null;
@@ -154,7 +156,7 @@ function attachLegacyFallbackMenus(win: any): () => void {
 let usedMenuManager = false;
 
 function attachWindow(win: any): void {
-  if (!win || !service || windowHandles.has(win)) return;
+  if (!win || !service || !mcpController || windowHandles.has(win)) return;
   try {
     insertWindowFtl(win);
     injectWindowStyles(win);
@@ -200,7 +202,25 @@ async function uninstall(_data: any, _reason: number): Promise<void> {
   // Keep user's isolated vectorize.sqlite intact in case of upgrade/reinstall
 }
 
-async function startup(data: { id: string; version: string; rootURI: string }, _reason: number): Promise<void> {
+function queueLifecycle(operation: () => Promise<void>): Promise<void> {
+  const next = lifecycle.then(operation);
+  lifecycle = next.catch(() => {});
+  return next;
+}
+
+function startup(data: { id: string; version: string; rootURI: string }, _reason: number): Promise<void> {
+  return queueLifecycle(async () => {
+    if (service) return;
+    try {
+      await startPlugin(data);
+    } catch (error) {
+      await stopPlugin().catch((cleanupError) => Zotero.logError(cleanupError));
+      throw error;
+    }
+  });
+}
+
+async function startPlugin(data: { version: string; rootURI: string }): Promise<void> {
   pluginRootURI = data.rootURI;
   const resources = Components.classes['@mozilla.org/network/protocol;1?name=resource']
     .getService(Components.interfaces.nsIResProtocolHandler);
@@ -208,12 +228,15 @@ async function startup(data: { id: string; version: string; rootURI: string }, _
   unregisterWorkerResources = () => resources.setSubstitution(ONNX_WORKER_RESOURCE, null);
   const dataDir = Zotero.DataDirectory.dir;
 
-  service = new VectorizeService({
+  const instance = new VectorizeService({
     rootURI: pluginRootURI,
     dataDir,
   });
-  (Zotero as any).Vectorize = service;
-  Zotero.VectorizeMcp = new McpController(service, data.version, pluginRootURI);
+  const controller = new McpController(instance, data.version, pluginRootURI);
+  service = instance;
+  mcpController = controller;
+  (Zotero as any).Vectorize = instance;
+  Zotero.VectorizeMcp = controller;
 
   // Register native Preferences pane
   if (Zotero.PreferencePanes?.register) {
@@ -233,14 +256,14 @@ async function startup(data: { id: string; version: string; rootURI: string }, _
   }
 
   // Register native Item Pane section
-  unregisterItemSection = registerSimilarPapersSection(pluginRootURI, service);
+  unregisterItemSection = registerSimilarPapersSection(pluginRootURI, instance);
 
   // Register menus (MenuManager with legacy XUL menu fallback)
   usedMenuManager = registerPluginMenus();
 
   // Initialize DB & search index asynchronously (does not block Zotero startup)
-  void service.init().catch((e) => Zotero.logError(e));
-  Zotero.VectorizeMcp.restore();
+  void instance.init().catch((e) => Zotero.logError(e));
+  controller.restore();
 
   // Attach to any already-open main windows (e.g., on dynamic plugin install/enable)
   const wins = Zotero.getMainWindows?.() ?? [];
@@ -248,14 +271,24 @@ async function startup(data: { id: string; version: string; rootURI: string }, _
     if (win?.document?.readyState === 'complete') {
       attachWindow(win);
     } else if (win?.addEventListener) {
-      win.addEventListener('load', () => attachWindow(win), { once: true });
+      win.addEventListener('load', () => {
+        if (service === instance) attachWindow(win);
+      }, { once: true });
     }
   }
 }
 
-async function shutdown(_data: any, _reason: number): Promise<void> {
-  await Zotero.VectorizeMcp?.dispose();
-  delete Zotero.VectorizeMcp;
+function shutdown(_data: any, _reason: number): Promise<void> {
+  return queueLifecycle(stopPlugin);
+}
+
+async function stopPlugin(): Promise<void> {
+  const controller = mcpController;
+  await controller?.dispose();
+  mcpController = null;
+  if (Zotero.VectorizeMcp === controller) delete Zotero.VectorizeMcp;
+  if ((Zotero as any).Vectorize === service) delete (Zotero as any).Vectorize;
+
   for (const win of Array.from(windowHandles.keys())) {
     detachWindow(win);
   }
@@ -284,15 +317,10 @@ async function shutdown(_data: any, _reason: number): Promise<void> {
     registeredPrefPaneId = null;
   }
 
-  if (service) {
-    await service.shutdown();
-    service = null;
-  }
+  await service?.shutdown();
   unregisterWorkerResources?.();
   unregisterWorkerResources = null;
-  if ((Zotero as any).Vectorize) {
-    delete (Zotero as any).Vectorize;
-  }
+  service = null;
 }
 
 function onMainWindowLoad(data: { window: any }): void {
