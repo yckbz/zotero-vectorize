@@ -189,11 +189,16 @@ test('forced rebuilding preserves saved attachment states until shared passages 
   const saved = svc.store.activeProfile.id;
   await svc.applyEmbeddingConfig({ ...configA, openaiBaseUrl: 'https://b.invalid/v1' }, false);
   await svc.startIndexing();
-  const db = new DatabaseSync(svc.store.getDbPath(), { readOnly: true });
-  t.after(() => db.close());
-  const savedStates = () => db.prepare(
-    'SELECT attachment_id AS id, status FROM attachment_embeddings WHERE profile_id = ? ORDER BY attachment_id'
-  ).all(saved);
+  const savedStates = () => {
+    const db = new DatabaseSync(svc.store.getDbPath(), { readOnly: true });
+    try {
+      return db.prepare(
+        'SELECT attachment_id AS id, status FROM attachment_embeddings WHERE profile_id = ? ORDER BY attachment_id'
+      ).all(saved);
+    } finally {
+      db.close();
+    }
+  };
   await svc.startIndexing(true);
   assert.deepEqual(savedStates().map(({ id, status }) => [id, status]), [[101, 'indexed'], [102, 'indexed']]);
 
