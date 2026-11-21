@@ -943,6 +943,111 @@ test('a queued Ollama activation cannot overwrite a model switched under index m
   assert.ok((await service.listEmbeddingProfiles()).every(({ engine }) => engine === 'openai'));
 });
 
+for (const shared of [false, true]) {
+  test(`Ollama recovery keeps ${shared ? 'shared ONNX' : 'local lexical'} search available while a PDF read drains`,
+    { timeout: 5000 }, async (t) => {
+    const { createDevice } = await setup(t);
+    if (shared) {
+      const publisher = await createDevice('publisher', 0, 'off');
+      const source = await publisher.start();
+      await source.startIndexing();
+      source.indexSync.setRole('publish');
+      await source.indexSync.syncNow();
+      assert.equal(source.indexSync.getStatus().phase, 'ready');
+      await publisher.shutdown(source);
+    }
+
+    const device = await createDevice('device', shared ? 100 : 0, 'off', 'ollama');
+    let online = false;
+    device.flags.ollamaHttp = async (method) => {
+      assert.equal(method, 'GET');
+      if (!online) throw new Error('Ollama is offline');
+      return { status: 200, json: { models: [{ name: 'bge-m3:latest', digest: 'a'.repeat(64) }] } };
+    };
+    const service = await device.start();
+    await service.pendingOllama.probe;
+    if (shared) {
+      service.indexSync.setRole('receive');
+      await service.indexSync.syncNow();
+      assert.equal(service.indexSync.active.manifest.engine, 'local-onnx');
+      // The receiving device still indexes its private group library.
+      device.items.get(103).getAttachments = () => [200];
+      device.items.set(200, {
+        ...device.items.get(102), id: 200, parentItemID: 103, libraryID: 2, key: 'GROUPPDF',
+        getFilePathAsync: async () => device.pdfFile, attachmentHash: digest(pdfBytes),
+        attachmentModificationTime: 789,
+      });
+      await fs.writeFile(device.pdfFile, pdfBytes);
+    } else {
+      await service.startIndexing();
+      await fs.writeFile(device.pdfFile, Buffer.from('Updated fixture PDF'));
+    }
+
+    const reading = Promise.withResolvers();
+    const extracted = Promise.withResolvers();
+    t.mock.method(device.zotero.PDFWorker, 'getFullText', async (id) => {
+      assert.equal(id, shared ? 200 : 2);
+      reading.resolve();
+      return extracted.promise;
+    });
+    const draining = Promise.withResolvers();
+    const suspend = service.indexer.withWritesSuspended.bind(service.indexer);
+    t.mock.method(service.indexer, 'withWritesSuspended', (operation) => {
+      draining.resolve();
+      return suspend(operation);
+    });
+    const loading = Promise.withResolvers();
+    const loaded = Promise.withResolvers();
+    const loadAll = service.store.loadAll.bind(service.store);
+    t.mock.method(service.store, 'loadAll', async (profileId) => {
+      loading.resolve();
+      await loaded.promise;
+      return loadAll(profileId);
+    });
+
+    const scan = service.indexer.startLibraryScan(false, true);
+    let recovery;
+    let searchDuringCommit;
+    let timer;
+    const finishPdf = () => extracted.resolve({
+      text: 'Hydrogen diffusion in a fixture PDF.', extractedPages: 1, totalPages: 1,
+    });
+    try {
+      await reading.promise;
+      online = true;
+      recovery = service.verifyPendingOllama();
+      await draining.promise;
+
+      const [search, status] = await Promise.race([
+        Promise.all([service.search('hydrogen'), service.getEngineStatus()]),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Reads are waiting for the PDF extraction')), 2000);
+        }),
+      ]);
+      assert.ok(search.hits.length);
+      assert.equal(search.diagnostics.vectorSearchUsed, shared);
+      assert.equal(status.neuralAvailable, false);
+      assert.equal(service.store.activeProfile, null);
+
+      finishPdf();
+      await loading.promise;
+      let returned = false;
+      searchDuringCommit = service.search('hydrogen').then((response) => {
+        returned = true;
+        return response;
+      });
+      await new Promise(setImmediate);
+      assert.equal(returned, false, 'Search must wait for the actual Profile change');
+    } finally {
+      clearTimeout(timer);
+      finishPdf();
+      loaded.resolve();
+      await Promise.all([scan, recovery, searchDuringCommit]);
+    }
+    assert.equal(service.store.activeProfile.engine, 'ollama');
+  });
+}
+
 test('Ollama readiness retries automatically without starting a scan when startup indexing is off', async (t) => {
   const { createDevice } = await setup(t);
   const device = await createDevice('device', 0, 'off', 'ollama');

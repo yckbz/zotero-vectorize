@@ -84,6 +84,7 @@ export class VectorizeService {
   private initialized = false;
   private shuttingDown = false;
   private maintenance = Promise.resolve();
+  private indexReadBarrier = Promise.resolve();
   private indexGeneration = 0;
   private initPromise: Promise<void> | null = null;
   private pendingOllama: PendingOllamaModel | null = null;
@@ -248,7 +249,7 @@ export class VectorizeService {
 
   async getEngineStatus(): Promise<EngineHealthStatus> {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     const provider = await this.getProvider();
     const status = await provider.getStatus();
     if (status.engine === 'ollama' && this.pendingOllama) {
@@ -358,7 +359,7 @@ export class VectorizeService {
         if (this.shuttingDown) return;
         this.indexSync.onOllamaAvailable();
         await this.scheduleOllamaStartupScan(0, provider);
-      }, stillPending);
+      }, stillPending, { keepReadsDuringDrain: true });
     })().catch((error: unknown) => {
       if (!this.shuttingDown) Zotero.logError(error);
     }).finally(() => {
@@ -419,15 +420,25 @@ export class VectorizeService {
     }
   }
 
-  private withIndexMaintenance<T>(operation: () => Promise<T>, affectsActiveIndex = () => true): Promise<T> {
+  private withIndexMaintenance<T>(
+    operation: () => Promise<T>,
+    affectsActiveIndex = () => true,
+    { keepReadsDuringDrain = false } = {}
+  ): Promise<T> {
     const run = this.maintenance.then(() => {
       if (!affectsActiveIndex()) return operation();
       return this.indexer.withWritesSuspended(async () => {
+        if (keepReadsDuringDrain) {
+          // Reads can use the old index while an in-flight PDF or SQLite write drains.
+          this.indexReadBarrier = Promise.all([this.indexReadBarrier, settled]).then(() => undefined);
+        }
         this.indexGeneration++;
         return operation();
       });
     });
-    this.maintenance = run.then(() => undefined, () => undefined);
+    const settled = run.then(() => undefined, () => undefined);
+    this.maintenance = settled;
+    if (!keepReadsDuringDrain) this.indexReadBarrier = settled;
     return run;
   }
 
@@ -474,7 +485,7 @@ export class VectorizeService {
 
   async listEmbeddingProfiles() {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     return this.store.listProfiles();
   }
 
@@ -591,7 +602,7 @@ export class VectorizeService {
     await this.init();
     options?.signal?.throwIfAborted();
     const clean = (query || '').trim();
-    await this.maintenance;
+    await this.indexReadBarrier;
     const generation = this.indexGeneration;
     options?.signal?.throwIfAborted();
     const shared = this.indexSync.active;
@@ -697,13 +708,13 @@ export class VectorizeService {
 
   async getStats(activeModel?: Pick<EngineHealthStatus, 'modelFingerprint' | 'dimensions'>): Promise<StoreStats> {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     return this.store.getStats(activeModel);
   }
 
   async getSearchCoverage(): Promise<Pick<StoreStats, 'indexedItems' | 'indexedChunks'>> {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     const shared = this.indexSync.active;
     if (!shared) return this.getStats();
     // The summary includes searchable PDF passages even when the default mode is metadata-only.
