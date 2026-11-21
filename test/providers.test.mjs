@@ -7,6 +7,32 @@ const { OpenAICompatProvider } = await importTs('src/engines/openai.ts');
 const { LocalOnnxProvider } = await importTs('src/engines/local-onnx.ts');
 const { formatTextForModel } = await importTs('src/engines/provider.ts');
 
+test('ONNX shares an in-flight revision and retries after a file hashing failure', async (t) => {
+  const previous = globalThis.Zotero;
+  t.after(() => { globalThis.Zotero = previous; });
+  const hashing = Promise.withResolvers();
+  let attempts = 0;
+  let failing = true;
+  globalThis.Zotero = { Utilities: { Internal: { md5Async: () => {
+    attempts++;
+    return failing ? hashing.promise : Promise.resolve('a'.repeat(32));
+  } } } };
+  const provider = new LocalOnnxProvider({
+    dataDir: '/fixture', workerScriptUrl: 'file:///worker',
+    fs: { join: (...parts) => parts.join('/'), exists: async () => true },
+  });
+  const failed = [provider.getModelRevision(), provider.getModelRevision()].map((revision) =>
+    assert.rejects(revision, /file temporarily unreadable/));
+  hashing.reject(new Error('file temporarily unreadable'));
+  await Promise.all(failed);
+  assert.equal(attempts, 2);
+  failing = false;
+  const expected = ['a'.repeat(32), 'a'.repeat(32)].join(':');
+  assert.deepEqual(await Promise.all([provider.getModelRevision(), provider.getModelRevision()]), [expected, expected]);
+  assert.equal(await provider.getModelRevision(), expected);
+  assert.equal(attempts, 4);
+});
+
 test('formatTextForModel applies E5 / Nomic / BGE query & passage prefixes accurately', () => {
   assert.equal(formatTextForModel('attention', 'query', 'Xenova/multilingual-e5-small'), 'query: attention');
   assert.equal(formatTextForModel('paper text', 'passage', 'Xenova/multilingual-e5-small'), 'passage: paper text');

@@ -125,7 +125,7 @@ export class LocalOnnxProvider implements EmbeddingProvider {
   }
 
   async getModelRevision(): Promise<string | null> {
-    this.modelRevision ??= (async () => {
+    const request = this.modelRevision ??= (async () => {
       const assets = await this.resolveExistingAssets();
       if (!assets) return null;
       const hashes = await Promise.all([
@@ -135,9 +135,13 @@ export class LocalOnnxProvider implements EmbeddingProvider {
       if (hashes.some((hash) => !hash)) throw new Error('Could not identify local model files');
       return hashes.join(':');
     })();
-    const revision = await this.modelRevision;
-    if (!revision) this.modelRevision = undefined;
-    return revision;
+    let revision: string | null = null;
+    try {
+      revision = await request;
+      return revision;
+    } finally {
+      if (!revision && this.modelRevision === request) this.modelRevision = undefined;
+    }
   }
 
   getModelDir(): string {
