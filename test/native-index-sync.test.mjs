@@ -840,6 +840,45 @@ test('late Ollama startup reuses SQLite vectors and resumes WebDAV publication i
   assert.ok(transport.manifest.snapshot.generation > previousManifest.snapshot.generation);
 });
 
+test('shared tag notifications update paper metadata and retain PDF chunks until the attachment is removed', async (t) => {
+  const { createDevice } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'off');
+  publisher.items.get(1).getTags = () => [{ tag: 'transport' }];
+  const source = await publisher.start();
+  await source.startIndexing();
+  source.indexSync.setRole('publish');
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const paper = receiver.items.get(101);
+  paper.getTags = () => [{ tag: 'transport' }];
+  const service = await receiver.start();
+  await service.indexSync.syncNow();
+  const { index } = service.indexSync.active;
+  const { notify } = receiver.observers.get('zotero-vectorize-shared-index');
+  const chunks = index.getItemChunks(101);
+  assert.ok(chunks.length);
+  assert.ok(index.getItemById(101).vector);
+
+  const initialRevision = service.indexSync.libraryRevision;
+  notify('remove', 'item-tag', ['102-8']);
+  assert.deepEqual(index.getItemChunks(101), chunks);
+  assert.equal(service.indexSync.libraryRevision, initialRevision);
+  paper.getTags = () => [];
+  notify('remove', 'item-tag', ['101-7']);
+  notify('delete', 'item-tag', ['101-7']);
+  assert.deepEqual(index.getItemById(101).tags, []);
+  assert.equal(index.getItemById(101).vector, null);
+  assert.deepEqual(index.getItemChunks(101), chunks);
+
+  receiver.items.delete(102);
+  notify('delete', 'item', [102]);
+  assert.ok(index.getItemById(101));
+  assert.deepEqual(index.getItemChunks(101), []);
+});
+
 test('a receiver can search an independent shared index during local Ollama verification', async (t) => {
   const { createDevice } = await setup(t);
   const publisher = await createDevice('publisher', 0, 'off');
