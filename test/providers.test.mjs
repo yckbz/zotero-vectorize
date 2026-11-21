@@ -7,6 +7,42 @@ const { OpenAICompatProvider } = await importTs('src/engines/openai.ts');
 const { LocalOnnxProvider } = await importTs('src/engines/local-onnx.ts');
 const { formatTextForModel } = await importTs('src/engines/provider.ts');
 
+test('Ollama shares pending revision requests and retries unavailable or missing digests', async () => {
+  let requests = 0;
+  let reply = Promise.withResolvers();
+  const provider = new OllamaEmbeddingProvider({ http: async () => { requests++; return reply.promise; } });
+  const model = (digest) => ({ status: 200, text: '', json: { models: [{ name: 'bge-m3:latest', digest }] } });
+
+  const offline = provider.getModelRevision();
+  assert.equal(provider.getModelRevision(true), offline);
+  reply.reject(new Error('Ollama is offline'));
+  assert.equal(await offline, null);
+
+  reply = Promise.withResolvers();
+  const missing = provider.getModelRevision();
+  reply.resolve(model('   '));
+  assert.equal(await missing, null);
+
+  reply = Promise.withResolvers();
+  const identified = provider.getModelRevision();
+  reply.resolve(model('a'.repeat(64)));
+  assert.equal(await identified, 'a'.repeat(64));
+  assert.equal(await provider.getModelRevision(), 'a'.repeat(64));
+  assert.equal(requests, 3);
+
+  reply = Promise.withResolvers();
+  const refreshed = provider.getModelRevision(true);
+  assert.equal(provider.getModelRevision(), refreshed);
+  reply.reject(new Error('Ollama is offline again'));
+  assert.equal(await refreshed, null);
+
+  reply = Promise.withResolvers();
+  const changed = provider.getModelRevision();
+  reply.resolve(model('b'.repeat(64)));
+  assert.equal(await changed, 'b'.repeat(64));
+  assert.equal(requests, 5);
+});
+
 test('ONNX shares an in-flight revision and retries after a file hashing failure', async (t) => {
   const previous = globalThis.Zotero;
   t.after(() => { globalThis.Zotero = previous; });

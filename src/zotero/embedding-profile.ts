@@ -38,7 +38,7 @@ export async function resolveEmbeddingProfile(
   config: PluginConfig, provider: EmbeddingProvider, dimensions = 0
 ): Promise<EmbeddingProfile | null> {
   const revision = await provider.getModelRevision?.();
-  if (config.engine === 'local-onnx' && !revision) return null;
+  if ((config.engine === 'local-onnx' || config.engine === 'ollama') && !revision) return null;
   // A local model may move directories without changing the actual embedding space.
   const settings = config.engine === 'local-onnx'
     ? JSON.stringify([config.engine, config.localModelId, config.localMaxSeqLength])

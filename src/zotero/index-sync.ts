@@ -48,6 +48,7 @@ interface IndexSyncDeps {
   store: VectorStore;
   getConfig(): PluginConfig;
   getProgress(): IndexProgress;
+  isWaitingForOllama(): boolean;
   createProvider(config: PluginConfig): EmbeddingProvider;
   onUpdate(): void;
   onLocalAvailable(): void;
@@ -215,6 +216,10 @@ export class IndexSync {
       this.needsReconcile = true;
       this.schedule(0);
     }
+  }
+
+  onOllamaAvailable(): void {
+    if (this.role === 'receive' && (!this.active || this.phase === 'model')) this.schedule(0);
   }
 
   private releaseLocalIndexing(): void {
@@ -420,7 +425,7 @@ export class IndexSync {
     const config = this.deps.getConfig();
     const settings = publicationSettings(config);
     const profile = this.deps.store.activeProfile;
-    if (!profile) throw new SyncIssue('model');
+    if (!profile) throw new SyncIssue(this.deps.isWaitingForOllama() ? 'waiting' : 'model');
     const provider = this.deps.createProvider(config);
     let model: SnapshotModel;
     try {
