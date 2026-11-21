@@ -31,7 +31,7 @@ export type SyncRole = 'off' | 'publish' | 'receive';
 export type SyncPhase = 'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' |
   'upgradePublisher' | 'upgradeReceiver' | 'error';
 const DEVICE_MODEL_SETTINGS = {
-  'local-onnx': ['localModelDir', 'localMirror'],
+  'local-onnx': ['localModelDir'],
   ollama: ['ollamaUrl'],
   openai: ['openaiBaseUrl', 'openaiModel', 'openaiDimensions', 'openaiApiKey'],
 } as const satisfies Record<EngineType, readonly (keyof PluginConfig)[]>;

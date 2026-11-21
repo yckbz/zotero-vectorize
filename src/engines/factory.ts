@@ -20,7 +20,6 @@ export class ProviderManager {
       config.engine,
       config.localModelId,
       config.localModelDir,
-      config.localMirror,
       config.localMaxSeqLength,
       config.ollamaUrl,
       config.ollamaModel,
@@ -38,13 +37,16 @@ export class ProviderManager {
       return this.activeProvider;
     }
 
-    const previousProvider = this.activeProvider;
     const provider = this.createProvider(config);
-
-    this.activeProvider = provider;
-    this.activeSignature = sig;
-    await previousProvider?.dispose().catch(() => {});
+    await this.activateProvider(config, provider);
     return provider;
+  }
+
+  async activateProvider(config: PluginConfig, provider: EmbeddingProvider): Promise<void> {
+    const previous = this.activeProvider;
+    this.activeProvider = provider;
+    this.activeSignature = this.signatureFor(config);
+    await previous?.dispose().catch(() => {});
   }
 
   createProvider(config: PluginConfig): EmbeddingProvider {
@@ -66,7 +68,6 @@ export class ProviderManager {
       provider = new LocalOnnxProvider({
         modelId: config.localModelId,
         customModelDir: config.localModelDir,
-        mirror: config.localMirror,
         maxSeqLength: config.localMaxSeqLength,
         dataDir: this.dataDir,
         workerScriptUrl: this.workerScriptUrl,

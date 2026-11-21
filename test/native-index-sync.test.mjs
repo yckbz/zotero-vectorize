@@ -339,8 +339,10 @@ async function setup(t) {
       const service = new VectorizeService({ dataDir: dir, rootURI: 'file:///sync-test/' });
       if (flags.partBytes) service.indexSync.partBytes = () => flags.partBytes;
       live.add(service);
+      const createProvider = service.providerManager.createProvider.bind(service.providerManager);
       service.providerManager.createProvider = (config) => {
         const { engine } = config;
+        if (engine === 'local-onnx' && flags.useLocalOnnx) return createProvider(config);
         if (engine === 'ollama' && flags.ollamaHttp) {
           return new OllamaEmbeddingProvider({ baseUrl: config.ollamaUrl, model: config.ollamaModel, http: flags.ollamaHttp });
         }
@@ -938,6 +940,95 @@ test('Ollama readiness retries automatically without starting a scan when startu
   t.mock.timers.tick(60_000);
   assert.equal(probes, 4);
 });
+
+async function testLocalDownload(t, draftDownload, switchModel = false) {
+  const { createDevice } = await setup(t);
+  const device = await createDevice('device', 0, 'off');
+  device.flags.useLocalOnnx = true;
+  const { Services, Worker } = globalThis;
+  t.after(() => { globalThis.Services = Services; globalThis.Worker = Worker; });
+  globalThis.IOUtils.readUTF8 = (file) => fs.readFile(file, 'utf8');
+  globalThis.Worker = class {
+    addEventListener(type, callback) {
+      if (type === 'message') this.reply = callback;
+    }
+    postMessage({ id, type, payload }) {
+      const result = type === 'init' ? { dimensions: 2 } :
+        { vectors: payload.texts.map(() => new Float32Array([1, 0])) };
+      queueMicrotask(() => this.reply({ data: { id, ok: true, result } }));
+    }
+    terminate() {}
+  };
+
+  const urls = [];
+  const activeRequest = Promise.withResolvers();
+  let stall = false;
+  const fetchModelAsset = async (url, { signal }) => {
+    urls.push(new URL(url));
+    if (!stall || new URL(url).pathname.endsWith('/tokenizer.json')) return new Response('{}');
+    activeRequest.resolve(signal);
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  };
+  globalThis.Services = { appShell: { hiddenDOMWindow: { fetch: fetchModelAsset, AbortController, crypto } } };
+
+  const service = await device.start();
+  if (!draftDownload && !switchModel) {
+    const activation = t.mock.method(service.store, 'activateProfile', async () => {
+      throw new Error('fixture Profile commit failed');
+    });
+    await assert.rejects(service.downloadLocalModel(), /Profile commit failed/);
+    activation.mock.restore();
+    assert.equal(service.store.activeProfile, null);
+    assert.deepEqual(await fs.readdir((await service.getProvider()).getModelDir()), []);
+    urls.length = 0;
+  }
+  await service.downloadLocalModel(undefined, { ...service.getConfig(), localMirror: 'hf-mirror' });
+  const provider = await service.getProvider();
+  assert.equal(urls.length, 3);
+  assert.ok(urls.every(({ hostname }) => hostname === 'hf-mirror.com'));
+  assert.equal(service.store.activeProfile.engine, 'local-onnx');
+  const profileID = service.store.activeProfile.id;
+  service.updateConfig({ localMirror: 'hf-mirror' });
+  assert.equal(device.prefs.get(PREFIX + 'localMirror'), 'hf-mirror');
+  assert.equal(await service.getProvider(), provider);
+  assert.equal(service.store.activeProfile.id, profileID);
+  await service.startIndexing();
+
+  const modelDir = draftDownload ? path.join(device.dir, 'draft-model') : provider.getModelDir();
+  const draft = draftDownload ? { ...service.getConfig(), localModelDir: modelDir } : undefined;
+  const asset = draftDownload ? 'tokenizer.json' : 'config.json';
+  if (draftDownload) await fs.mkdir(modelDir);
+  else await fs.rm(path.join(modelDir, asset));
+  await fs.writeFile(path.join(modelDir, asset + '.part'), 'stale');
+  stall = true;
+  const pending = service.downloadLocalModel(undefined, draft);
+  const interrupted = assert.rejects(pending, { name: 'AbortError' });
+  const signal = await activeRequest.promise;
+  assert.equal((await service.getEngineStatus()).ready, true);
+  assert.ok((await service.search('hydrogen')).hits.length);
+  assert.ok((await service.getStats()).indexedItems);
+  assert.equal((await service.listEmbeddingProfiles()).find(({ active }) => active).id, profileID);
+  if (draftDownload) assert.equal(await IOUtils.exists(path.join(modelDir, 'tokenizer.json')), false);
+  if (switchModel) {
+    await assert.rejects(service.applyEmbeddingConfig({
+      ...service.getConfig(), localModelDir: path.join(device.dir, 'missing'),
+    }, false), /model files missing/);
+    assert.equal(signal.aborted, false);
+    await service.applyEmbeddingConfig({ ...service.getConfig(), engine: 'openai' }, false);
+    assert.equal(service.store.activeProfile.engine, 'openai');
+  } else await device.shutdown(service);
+  await interrupted;
+  assert.equal(signal.aborted, true);
+  assert.equal(urls.length, draftDownload ? 5 : 4);
+  assert.deepEqual((await fs.readdir(modelDir)).sort(), draftDownload ? [] : ['model_quantized.onnx', 'tokenizer.json']);
+}
+
+test('an active model download uses the requested mirror and is canceled at shutdown',
+  { timeout: 5000 }, (t) => testLocalDownload(t, false));
+test('a draft model download leaves the active engine usable and is canceled at shutdown',
+  { timeout: 5000 }, (t) => testLocalDownload(t, true));
+test('a successful engine switch cancels an active download and a failed switch keeps it running',
+  { timeout: 5000 }, (t) => testLocalDownload(t, false, true));
 
 test('an Ollama digest change disables shared neural results without affecting a local engine', async (t) => {
   const { createDevice } = await setup(t);

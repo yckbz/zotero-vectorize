@@ -277,7 +277,7 @@ test('Automatic batch probing surfaces authentication and unrelated validation e
   }
 });
 
-test('LocalOnnxProvider downloads assets with mirror fallback and drives worker protocol', async () => {
+test('Local ONNX falls back after stalls, downloads complete assets, and drives the worker', async (t) => {
   const memFiles = new Map();
   const fsMock = {
     exists: async (p) => memFiles.has(p),
@@ -318,35 +318,82 @@ test('LocalOnnxProvider downloads assets with mirror fallback and drives worker 
   }
 
   const fetchedUrls = [];
+  const headerRequest = Promise.withResolvers();
+  const bufferRequest = Promise.withResolvers();
+  const bufferReady = Promise.withResolvers();
+  const bodyRequest = Promise.withResolvers();
+  const firstChunk = Promise.withResolvers();
+  const secondChunk = Promise.withResolvers();
   const provider = new LocalOnnxProvider({
     modelId: 'Xenova/multilingual-e5-small',
-    mirror: 'hf-mirror',
     dataDir: '/tmp/zdata',
     workerScriptUrl: 'resource://zotero-vectorize-workers/onnx-worker.mjs',
     fs: fsMock,
     workerFactory: () => new MockWorker(),
-    fetchFn: async (url) => {
-      fetchedUrls.push(String(url));
-      // Verify model mirror fallback independently of the packaged runtime.
-      if (String(url).includes('hf-mirror.com')) {
-        return { ok: false, status: 502, headers: new Headers(), arrayBuffer: async () => new ArrayBuffer(0) };
+    fetchFn: async (url, { signal }) => {
+      const { hostname, pathname } = new URL(url);
+      fetchedUrls.push({ hostname, pathname });
+      if (hostname === 'hf-mirror.com' && pathname.endsWith('/tokenizer.json')) {
+        headerRequest.resolve(signal);
+        return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
       }
-      return {
-        ok: true,
-        status: 200,
-        headers: new Headers({ 'content-length': '4' }),
-        arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
-      };
+      if (pathname.endsWith('/tokenizer.json')) {
+        return { ok: true, arrayBuffer: () => {
+          bufferRequest.resolve(signal);
+          return bufferReady.promise;
+        } };
+      }
+      if (hostname === 'hf-mirror.com' && pathname.endsWith('/config.json')) {
+        return new Response(new ReadableStream({ start(controller) {
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+          bodyRequest.resolve({ controller, signal });
+        } }));
+      }
+      if (pathname.endsWith('/config.json')) return new Response('{}');
+      if (hostname === 'huggingface.co' && pathname.endsWith('/onnx/model.onnx')) return new Response('model');
+      return new Response(null, { status: 404 });
     },
   });
 
   const beforeStatus = await provider.getStatus();
   assert.equal(beforeStatus.needsSetup, true);
 
-  await provider.downloadModel();
-  assert.ok(fetchedUrls.some((u) => u.includes('hf-mirror.com')));
-  assert.ok(fetchedUrls.some((u) => u.includes('huggingface.co')));
-  assert.ok(fetchedUrls.every((u) => u.includes('/resolve/main/')));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const downloading = provider.prepareModelDownload('hf-mirror', ({ file, loadedBytes }) => {
+    if (file.includes('config.json')) {
+      if (loadedBytes === 1) firstChunk.resolve();
+      if (loadedBytes === 2) secondChunk.resolve();
+    }
+  });
+  const headerSignal = await headerRequest.promise;
+  t.mock.timers.tick(30_000);
+  assert.equal(headerSignal.aborted, true);
+  const bufferSignal = await bufferRequest.promise;
+  t.mock.timers.tick(35_000);
+  assert.equal(bufferSignal.aborted, false);
+  bufferReady.resolve(new TextEncoder().encode('{}').buffer);
+  const { controller, signal: bodySignal } = await bodyRequest.promise;
+  controller.enqueue(new Uint8Array([1]));
+  await firstChunk.promise;
+  t.mock.timers.tick(29_000);
+  controller.enqueue(new Uint8Array([2]));
+  await secondChunk.promise;
+  t.mock.timers.tick(29_000);
+  assert.equal(bodySignal.aborted, false);
+  t.mock.timers.tick(1000);
+  assert.equal(bodySignal.aborted, true);
+  await downloading;
+  t.mock.timers.reset();
+  assert.equal(await fsMock.exists(provider.getModelDir() + '/config.json'), false);
+  await provider.commitModelDownload(new AbortController().signal);
+
+  assert.deepEqual(fetchedUrls.map(({ hostname }) => hostname), [
+    'hf-mirror.com', 'huggingface.co', 'hf-mirror.com', 'huggingface.co',
+    'hf-mirror.com', 'huggingface.co', 'hf-mirror.com', 'huggingface.co',
+  ]);
+  assert.ok(fetchedUrls.at(-1).pathname.endsWith('/onnx/model.onnx'));
+  assert.equal(await fsMock.readUTF8(provider.getModelDir() + '/config.json'), '{}');
+  assert.equal([...memFiles.keys()].some((file) => file.endsWith('.part')), false);
 
   const afterStatus = await provider.getStatus();
   assert.equal(afterStatus.ready, true);
@@ -498,7 +545,8 @@ test('LocalOnnxProvider skips model download when customModelDir already has onn
   });
 
   assert.equal(await provider.hasInstalledAssets(), true);
-  await provider.downloadModel();
+  await provider.prepareModelDownload('huggingface');
+  await provider.commitModelDownload(new AbortController().signal);
   assert.equal(fetchCount, 0);
   await provider.dispose();
 });

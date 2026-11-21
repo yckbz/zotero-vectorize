@@ -9,7 +9,7 @@ import type {
 } from '../types/vectorize.ts';
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import type { DownloadProgressInfo } from '../engines/local-onnx.ts';
-import { LocalOnnxProvider, ONNX_WORKER_RESOURCE } from '../engines/local-onnx.ts';
+import { createModelDownloadController, LocalOnnxProvider, ONNX_WORKER_RESOURCE } from '../engines/local-onnx.ts';
 import { OllamaEmbeddingProvider } from '../engines/ollama.ts';
 import { ProviderManager } from '../engines/factory.ts';
 import type { EmbeddingProvider } from '../engines/provider.ts';
@@ -25,7 +25,7 @@ import { getStrings } from './i18n.ts';
 import { syncSearchConfig } from './sync-snapshot.ts';
 
 const ENGINE_SETTINGS = [
-  'engine', 'localModelId', 'localModelDir', 'localMirror', 'localMaxSeqLength', 'ollamaUrl', 'ollamaModel',
+  'engine', 'localModelId', 'localModelDir', 'localMaxSeqLength', 'ollamaUrl', 'ollamaModel',
   'openaiBaseUrl', 'openaiApiKey', 'openaiModel', 'openaiDimensions', 'openaiBatchSize',
 ] as const satisfies readonly (keyof PluginConfig)[];
 const STARTUP_SCAN_DELAY_MS = 3500;
@@ -88,6 +88,9 @@ export class VectorizeService {
   private initPromise: Promise<void> | null = null;
   private pendingOllama: PendingOllamaModel | null = null;
   private startupScanAt = 0;
+  private modelDownload: {
+    controller: AbortController; done: Promise<void>; settings: string; startedActive: boolean;
+  } | null = null;
 
   constructor(options: { rootURI: string; dataDir: string }) {
     this.config = readPluginConfig();
@@ -224,6 +227,8 @@ export class VectorizeService {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     this.stopOllamaProbe();
+    const download = this.modelDownload;
+    download?.controller.abort();
     await this.initPromise?.catch(() => {});
     this.indexSync.dispose();
     if (this.stopConfigObserver) {
@@ -231,6 +236,7 @@ export class VectorizeService {
       this.stopConfigObserver = null;
     }
     await this.maintenance;
+    await download?.done.catch(() => {});
     await this.indexer.dispose();
     await this.providerManager.dispose();
     await this.store.close();
@@ -362,30 +368,55 @@ export class VectorizeService {
   }
 
   async downloadLocalModel(onProgress?: (p: DownloadProgressInfo) => void, draft?: PluginConfig): Promise<void> {
-    const target = draft ?? this.config;
-    if (draft && embeddingSettings(draft) !== embeddingSettings(this.config)) {
-      const provider = this.providerManager.createProvider(draft);
-      try {
-        if (!(provider instanceof LocalOnnxProvider)) throw new Error('Active engine is not Local ONNX');
-        await provider.downloadModel(onProgress);
-      } finally {
-        await provider.dispose();
-      }
-      return;
-    }
-
-    await this.init();
-
-    await this.withIndexMaintenance(async () => {
-      const provider = await this.getProvider();
-      if (!(provider instanceof LocalOnnxProvider)) throw new Error('Active engine is not Local ONNX');
-      await provider.downloadModel(onProgress);
-      const profile = await resolveEmbeddingProfile(target, provider, (await provider.getStatus()).dimensions);
-      await this.store.activateProfile(profile);
-      await this.reloadIndex();
+    if (this.shuttingDown) throw new Error('Zotero Vectorize is shutting down');
+    if (this.modelDownload) throw new Error('A model download is already in progress');
+    const target = { ...(draft ?? this.config) };
+    if (target.engine !== 'local-onnx') throw new Error('Selected engine is not Local ONNX');
+    const controller = createModelDownloadController();
+    const done = this.runModelDownload(target, controller, onProgress).finally(() => {
+      this.modelDownload = null;
     });
-    this.indexer.requestModelBackfill(await this.getProvider());
-    this.indexSync.onConfigChanged();
+    const settings = embeddingSettings(target);
+    this.modelDownload = { controller, done, settings, startedActive: settings === embeddingSettings(this.config) };
+    return done;
+  }
+
+  private async runModelDownload(
+    target: PluginConfig, controller: AbortController, onProgress?: (p: DownloadProgressInfo) => void
+  ): Promise<void> {
+    const targetsActiveModel = () => embeddingSettings(target) === embeddingSettings(this.config);
+    await this.init();
+    const { signal } = controller;
+    signal.throwIfAborted();
+    const provider = this.providerManager.createProvider(target);
+    let adopted = false;
+    try {
+      if (!(provider instanceof LocalOnnxProvider)) throw new Error('Selected engine is not Local ONNX');
+      await provider.prepareModelDownload(target.localMirror, onProgress, controller);
+      const profile = await resolveEmbeddingProfile(target, provider, (await provider.getStatus()).dimensions);
+      signal.throwIfAborted();
+      if (!profile) throw new Error('Could not identify the downloaded model');
+      await this.withIndexMaintenance(async () => {
+        signal.throwIfAborted();
+        if (!targetsActiveModel()) {
+          await provider.commitModelDownload(signal);
+          return;
+        }
+        const { items, chunks } = await this.store.loadAll(profile.id);
+        await provider.commitModelDownload(signal, () => this.store.activateProfile(profile));
+        await this.providerManager.activateProvider(this.config, provider);
+        adopted = true;
+        this.searchIndex.loadAll(items, chunks);
+        this.queryVectorCache.clear();
+        this.notifyIndexUpdated();
+      }, () => !signal.aborted && targetsActiveModel());
+      if (adopted && !signal.aborted && targetsActiveModel()) {
+        this.indexer.requestModelBackfill(provider);
+        this.indexSync.onConfigChanged();
+      }
+    } finally {
+      if (!adopted) await provider.dispose();
+    }
   }
 
   private withIndexMaintenance<T>(operation: () => Promise<T>, affectsActiveIndex = () => true): Promise<T> {
@@ -427,8 +458,10 @@ export class VectorizeService {
           writePluginConfig(this.config);
           throw error;
         }
-        this.config = saved;
+        this.config = { ...this.config, ...changes };
         this.stopOllamaProbe();
+        const download = this.modelDownload;
+        if (download?.startedActive && download.settings !== embeddingSettings(this.config)) download.controller.abort();
         await this.providerManager.dispose();
         await this.reloadIndex();
       });
@@ -484,6 +517,7 @@ export class VectorizeService {
     engineLabel: string;
     errorNote?: string;
   }> {
+    const generation = this.indexGeneration;
     const provider = sharedProvider ?? await this.providerManager.getProvider(config);
     signal?.throwIfAborted();
     const status = await provider.getStatus();
@@ -508,7 +542,7 @@ export class VectorizeService {
     try {
       const vec = await provider.embedQuery(query);
       const fp = provider.getModelFingerprint(vec.length);
-      if (!sharedProvider && config === this.config && !signal?.aborted) {
+      if (!sharedProvider && config === this.config && generation === this.indexGeneration && !signal?.aborted) {
         if (this.queryVectorCache.size >= 64) {
           const firstKey = this.queryVectorCache.keys().next().value;
           if (firstKey !== undefined) this.queryVectorCache.delete(firstKey);

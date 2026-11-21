@@ -44,7 +44,7 @@ test('plugin lifecycle keeps one MCP owner and finishes shutdown before starting
     },
     interfaces: { nsIResProtocolHandler: {} },
   };
-  globalThis.Services = { io: { newURI: (uri) => uri } };
+  globalThis.Services = { io: { newURI: (uri) => uri }, appShell: { hiddenDOMWindow: globalThis } };
   globalThis.Zotero = {
     DataDirectory: { dir: dataDir },
     DBConnection: SqliteConnection,
