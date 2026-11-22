@@ -9,30 +9,44 @@ import type {
 } from '../types/vectorize.ts';
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import type { DownloadProgressInfo } from '../engines/local-onnx.ts';
-import { LocalOnnxProvider, ONNX_WORKER_RESOURCE } from '../engines/local-onnx.ts';
+import { createModelDownloadController, LocalOnnxProvider, ONNX_WORKER_RESOURCE } from '../engines/local-onnx.ts';
 import { OllamaEmbeddingProvider } from '../engines/ollama.ts';
 import { ProviderManager } from '../engines/factory.ts';
 import type { EmbeddingProvider } from '../engines/provider.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
-import { embeddingSettings, resolveEmbeddingProfile } from './embedding-profile.ts';
+import { embeddingSettings, resolveEmbeddingProfile, type EmbeddingProfile } from './embedding-profile.ts';
 import { extractItemMetadata, isIndexableRegularItem } from './extractor.ts';
 import { rotateBackups } from '../core/compat-json.ts';
 import { observeConfigChanges, readPluginConfig, writePluginConfig } from './config.ts';
 import { VectorStore } from './vector-store.ts';
 import { BackgroundIndexer } from './indexer.ts';
 import { IndexSync } from './index-sync.ts';
+import { getStrings } from './i18n.ts';
 import { syncSearchConfig } from './sync-snapshot.ts';
 
 const ENGINE_SETTINGS = [
-  'engine', 'localModelId', 'localModelDir', 'localMirror', 'localMaxSeqLength', 'ollamaUrl', 'ollamaModel',
+  'engine', 'localModelId', 'localModelDir', 'localMaxSeqLength', 'ollamaUrl', 'ollamaModel',
   'openaiBaseUrl', 'openaiApiKey', 'openaiModel', 'openaiDimensions', 'openaiBatchSize',
 ] as const satisfies readonly (keyof PluginConfig)[];
+const STARTUP_SCAN_DELAY_MS = 3500;
 
 interface SearchOptions {
   mode?: SearchMode;
   filterItemIDs?: Set<number> | null;
   topK?: number;
   signal?: AbortSignal;
+}
+
+interface PendingOllamaModel {
+  settings: string;
+  retryDelayMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+  probe?: Promise<void>;
+}
+
+interface VerifiedOllamaModel {
+  provider: EmbeddingProvider;
+  profile: EmbeddingProfile;
 }
 
 function passagePageKey(chunk: IndexedChunkRecord): string {
@@ -70,8 +84,14 @@ export class VectorizeService {
   private initialized = false;
   private shuttingDown = false;
   private maintenance = Promise.resolve();
+  private indexReadBarrier = Promise.resolve();
   private indexGeneration = 0;
   private initPromise: Promise<void> | null = null;
+  private pendingOllama: PendingOllamaModel | null = null;
+  private startupScanAt = 0;
+  private modelDownload: {
+    controller: AbortController; done: Promise<void>; settings: string; startedActive: boolean;
+  } | null = null;
 
   constructor(options: { rootURI: string; dataDir: string }) {
     this.config = readPluginConfig();
@@ -84,12 +104,19 @@ export class VectorizeService {
       store: this.store,
       getConfig: () => this.config,
       getProgress: () => this.indexer.getProgress(),
+      isWaitingForOllama: () => this.pendingOllama !== null,
       createProvider: (config) => this.providerManager.createProvider(config),
       onUpdate: () => {
         this.indexGeneration++;
         this.notifyIndexUpdated();
       },
-      onLocalAvailable: () => this.indexer.scheduleStartupScan(100),
+      onLocalAvailable: () => {
+        if (this.config.engine === 'ollama') {
+          void this.scheduleOllamaStartupScan(100).catch((error) => Zotero.logError(error));
+        } else {
+          this.indexer.scheduleStartupScan(100);
+        }
+      },
     });
     this.indexer = new BackgroundIndexer({
       getConfig: () => this.getConfig(),
@@ -149,11 +176,23 @@ export class VectorizeService {
     if (this.initPromise) return this.initPromise;
 
     this.initPromise = (async () => {
+      const config = this.config;
+      const ollama = config.engine === 'ollama';
+      const early = { profile: null as EmbeddingProfile | null };
+      // Use a fast Ollama reply if it arrives during SQLite setup. A slow reply never delays the text index.
+      const firstProbe = ollama ? this.identifyOllamaModel(config).then((model) => {
+        early.profile = model?.profile ?? null;
+        return model;
+      }) : undefined;
       await this.store.open();
-      const provider = await this.getProvider();
-      const profile = await resolveEmbeddingProfile(this.config, provider);
+      const profile = ollama ? early.profile : await resolveEmbeddingProfile(config, await this.getProvider());
       if (profile) await this.store.activateProfile(profile);
       await this.store.loadIntoSearchIndex(this.searchIndex);
+      if (ollama) this.startupScanAt = Date.now() + STARTUP_SCAN_DELAY_MS;
+      const pending = ollama && !profile && !this.shuttingDown
+        ? { settings: embeddingSettings(config), retryDelayMs: 5000 }
+        : null;
+      this.pendingOllama = pending;
 
       this.stopConfigObserver = observeConfigChanges((next) => {
         const engine = Object.fromEntries(ENGINE_SETTINGS.map((key) => [key, this.config[key]]));
@@ -168,8 +207,13 @@ export class VectorizeService {
       } catch {
         Zotero.debug?.('Zotero Vectorize could not start optional index sync');
       }
-      if (!await this.hasLegacyIndexForActiveModel()) this.indexer.scheduleStartupScan(3500);
+      if (ollama) {
+        await this.scheduleOllamaStartupScan();
+      } else if (!await this.hasLegacyIndexForActiveModel()) {
+        this.indexer.scheduleStartupScan(STARTUP_SCAN_DELAY_MS);
+      }
       this.initialized = true;
+      if (pending) this.pollOllama(pending, firstProbe);
       this.notifyIndexUpdated();
     })();
 
@@ -183,6 +227,9 @@ export class VectorizeService {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.stopOllamaProbe();
+    const download = this.modelDownload;
+    download?.controller.abort();
     await this.initPromise?.catch(() => {});
     this.indexSync.dispose();
     if (this.stopConfigObserver) {
@@ -190,6 +237,7 @@ export class VectorizeService {
       this.stopConfigObserver = null;
     }
     await this.maintenance;
+    await download?.done.catch(() => {});
     await this.indexer.dispose();
     await this.providerManager.dispose();
     await this.store.close();
@@ -201,9 +249,16 @@ export class VectorizeService {
 
   async getEngineStatus(): Promise<EngineHealthStatus> {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     const provider = await this.getProvider();
-    return provider.getStatus();
+    const status = await provider.getStatus();
+    if (status.engine === 'ollama' && this.pendingOllama) {
+      return {
+        ...status, ready: false, neuralAvailable: false,
+        statusMessage: getStrings(this.config).ollamaWaitingForModel(status.model),
+      };
+    }
+    return status;
   }
 
   async getSearchEngineStatus(): Promise<EngineHealthStatus> {
@@ -218,6 +273,20 @@ export class VectorizeService {
   }
 
   async testConnection(draft?: PluginConfig): Promise<{ ok: boolean; dimensions: number; message: string }> {
+    if (this.config.engine === 'ollama' && (!draft || embeddingSettings(draft) === embeddingSettings(this.config))) {
+      await this.init();
+    }
+    const pending = this.pendingOllama;
+    if (pending && (!draft || embeddingSettings(draft) === pending.settings)) {
+      await this.verifyPendingOllama();
+      if (this.pendingOllama === pending) {
+        return {
+          ok: false, dimensions: 0,
+          message: getStrings(this.config).ollamaWaitingForModel(this.config.ollamaModel),
+        };
+      }
+    }
+    if (this.shuttingDown) throw new Error('Zotero Vectorize is shutting down');
     if (!draft) return (await this.getProvider()).testConnection();
     const provider = this.providerManager.createProvider(draft);
     try {
@@ -232,42 +301,144 @@ export class VectorizeService {
     return provider.listModels();
   }
 
-  async downloadLocalModel(onProgress?: (p: DownloadProgressInfo) => void, draft?: PluginConfig): Promise<void> {
-    const target = draft ?? this.config;
-    if (draft && embeddingSettings(draft) !== embeddingSettings(this.config)) {
-      const provider = this.providerManager.createProvider(draft);
-      try {
-        if (!(provider instanceof LocalOnnxProvider)) throw new Error('Active engine is not Local ONNX');
-        await provider.downloadModel(onProgress);
-      } finally {
-        await provider.dispose();
-      }
-      return;
-    }
-
-    await this.init();
-
-    await this.withIndexMaintenance(async () => {
-      const provider = await this.getProvider();
-      if (!(provider instanceof LocalOnnxProvider)) throw new Error('Active engine is not Local ONNX');
-      await provider.downloadModel(onProgress);
-      const profile = await resolveEmbeddingProfile(target, provider, (await provider.getStatus()).dimensions);
-      await this.store.activateProfile(profile);
-      await this.reloadIndex();
-    });
-    this.indexer.requestModelBackfill(await this.getProvider());
-    this.indexSync.onConfigChanged();
+  private stopOllamaProbe(): void {
+    const pending = this.pendingOllama;
+    this.pendingOllama = null;
+    if (pending?.timer !== undefined) clearTimeout(pending.timer);
   }
 
-  private withIndexMaintenance<T>(operation: () => Promise<T>, affectsActiveIndex = () => true): Promise<T> {
+  private async identifyOllamaModel(config: PluginConfig): Promise<VerifiedOllamaModel | null> {
+    try {
+      const provider = await this.providerManager.getProvider(config);
+      const profile = await resolveEmbeddingProfile(config, provider);
+      return profile ? { provider, profile } : null;
+    } catch (error) {
+      if (!this.shuttingDown) Zotero.logError(error);
+      return null;
+    }
+  }
+
+  private async scheduleOllamaStartupScan(minimumDelay = 0, provider?: EmbeddingProvider): Promise<void> {
+    const settings = embeddingSettings(this.config);
+    if (await this.hasLegacyIndexForActiveModel() || this.shuttingDown || settings !== embeddingSettings(this.config)) return;
+    this.indexer.scheduleStartupScan(Math.max(minimumDelay, this.startupScanAt - Date.now()), provider);
+  }
+
+  private pollOllama(pending: PendingOllamaModel, firstProbe?: Promise<VerifiedOllamaModel | null>): void {
+    void this.verifyPendingOllama(firstProbe)?.then(() => {
+      if (this.pendingOllama !== pending || this.shuttingDown || this.store.activeProfile) return;
+      pending.timer = setTimeout(() => {
+        pending.timer = undefined;
+        this.pollOllama(pending);
+      }, pending.retryDelayMs);
+      pending.retryDelayMs = Math.min(pending.retryDelayMs * 2, 60_000);
+    });
+  }
+
+  private verifyPendingOllama(firstProbe?: Promise<VerifiedOllamaModel | null>): Promise<void> | undefined {
+    const pending = this.pendingOllama;
+    if (!pending || this.shuttingDown) return;
+    if (pending.probe) return pending.probe;
+
+    const config = this.config;
+    const stillPending = () => !this.shuttingDown && this.pendingOllama === pending &&
+      this.store.activeProfile === null && embeddingSettings(this.config) === pending.settings;
+    pending.probe = (async () => {
+      const verified = await (firstProbe ?? this.identifyOllamaModel(config));
+      if (!verified || !stillPending()) return;
+      const { profile, provider } = verified;
+      await this.withIndexMaintenance(async () => {
+        if (!stillPending()) return;
+        const { items, chunks } = await this.store.loadAll(profile.id);
+        if (!stillPending()) return;
+        await this.store.activateProfile(profile);
+        this.searchIndex.loadAll(items, chunks);
+        this.queryVectorCache.clear();
+        this.stopOllamaProbe();
+        this.notifyIndexUpdated();
+        if (this.shuttingDown) return;
+        this.indexSync.onOllamaAvailable();
+        await this.scheduleOllamaStartupScan(0, provider);
+      }, stillPending, { keepReadsDuringDrain: true });
+    })().catch((error: unknown) => {
+      if (!this.shuttingDown) Zotero.logError(error);
+    }).finally(() => {
+      pending.probe = undefined;
+    });
+    return pending.probe;
+  }
+
+  async downloadLocalModel(onProgress?: (p: DownloadProgressInfo) => void, draft?: PluginConfig): Promise<void> {
+    if (this.shuttingDown) throw new Error('Zotero Vectorize is shutting down');
+    if (this.modelDownload) throw new Error('A model download is already in progress');
+    const target = { ...(draft ?? this.config) };
+    if (target.engine !== 'local-onnx') throw new Error('Selected engine is not Local ONNX');
+    const controller = createModelDownloadController();
+    const done = this.runModelDownload(target, controller, onProgress).finally(() => {
+      this.modelDownload = null;
+    });
+    const settings = embeddingSettings(target);
+    this.modelDownload = { controller, done, settings, startedActive: settings === embeddingSettings(this.config) };
+    return done;
+  }
+
+  private async runModelDownload(
+    target: PluginConfig, controller: AbortController, onProgress?: (p: DownloadProgressInfo) => void
+  ): Promise<void> {
+    const targetsActiveModel = () => embeddingSettings(target) === embeddingSettings(this.config);
+    await this.init();
+    const { signal } = controller;
+    signal.throwIfAborted();
+    const provider = this.providerManager.createProvider(target);
+    let adopted = false;
+    try {
+      if (!(provider instanceof LocalOnnxProvider)) throw new Error('Selected engine is not Local ONNX');
+      await provider.prepareModelDownload(target.localMirror, onProgress, controller);
+      const profile = await resolveEmbeddingProfile(target, provider, (await provider.getStatus()).dimensions);
+      signal.throwIfAborted();
+      if (!profile) throw new Error('Could not identify the downloaded model');
+      await this.withIndexMaintenance(async () => {
+        signal.throwIfAborted();
+        if (!targetsActiveModel()) {
+          await provider.commitModelDownload(signal);
+          return;
+        }
+        const { items, chunks } = await this.store.loadAll(profile.id);
+        await provider.commitModelDownload(signal, () => this.store.activateProfile(profile));
+        await this.providerManager.activateProvider(this.config, provider);
+        adopted = true;
+        this.searchIndex.loadAll(items, chunks);
+        this.queryVectorCache.clear();
+        this.notifyIndexUpdated();
+      }, () => !signal.aborted && targetsActiveModel());
+      if (adopted && !signal.aborted && targetsActiveModel()) {
+        this.indexer.requestModelBackfill(provider);
+        this.indexSync.onConfigChanged();
+      }
+    } finally {
+      if (!adopted) await provider.dispose();
+    }
+  }
+
+  private withIndexMaintenance<T>(
+    operation: () => Promise<T>,
+    affectsActiveIndex = () => true,
+    { keepReadsDuringDrain = false } = {}
+  ): Promise<T> {
     const run = this.maintenance.then(() => {
       if (!affectsActiveIndex()) return operation();
       return this.indexer.withWritesSuspended(async () => {
+        if (keepReadsDuringDrain) {
+          // Reads can use the old index while an in-flight PDF or SQLite write drains.
+          this.indexReadBarrier = Promise.all([this.indexReadBarrier, settled]).then(() => undefined);
+        }
         this.indexGeneration++;
         return operation();
       });
     });
-    this.maintenance = run.then(() => undefined, () => undefined);
+    const settled = run.then(() => undefined, () => undefined);
+    this.maintenance = settled;
+    if (!keepReadsDuringDrain) this.indexReadBarrier = settled;
     return run;
   }
 
@@ -286,7 +457,9 @@ export class VectorizeService {
       if (!status.ok) throw new Error(status.message);
       const profile = await resolveEmbeddingProfile(draft, provider, status.dimensions);
       if (!profile) throw new Error('Could not identify the selected embedding model');
+      if (this.shuttingDown) throw new Error('Zotero Vectorize is shutting down');
       await this.withIndexMaintenance(async () => {
+        if (this.shuttingDown) throw new Error('Zotero Vectorize is shutting down');
         const previous = this.store.activeProfile?.id;
         const saved = writePluginConfig(changes);
         try {
@@ -296,7 +469,10 @@ export class VectorizeService {
           writePluginConfig(this.config);
           throw error;
         }
-        this.config = saved;
+        this.config = { ...this.config, ...changes };
+        this.stopOllamaProbe();
+        const download = this.modelDownload;
+        if (download?.startedActive && download.settings !== embeddingSettings(this.config)) download.controller.abort();
         await this.providerManager.dispose();
         await this.reloadIndex();
       });
@@ -309,13 +485,17 @@ export class VectorizeService {
 
   async listEmbeddingProfiles() {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     return this.store.listProfiles();
   }
 
   private async hasLegacyIndexForActiveModel(): Promise<boolean> {
     const profiles = await this.store.listProfiles();
     const active = profiles.find((entry) => entry.active);
+    if (!active && this.pendingOllama) {
+      return profiles.some((entry) => entry.provenance === 'legacy' && entry.engine === 'ollama' &&
+        entry.model === this.config.ollamaModel.trim());
+    }
     return Boolean(active && !active.items && !active.chunks && profiles.some((entry) =>
       entry.provenance === 'legacy' && entry.engine === active.engine && entry.model === active.model));
   }
@@ -348,6 +528,7 @@ export class VectorizeService {
     engineLabel: string;
     errorNote?: string;
   }> {
+    const generation = this.indexGeneration;
     const provider = sharedProvider ?? await this.providerManager.getProvider(config);
     signal?.throwIfAborted();
     const status = await provider.getStatus();
@@ -372,7 +553,7 @@ export class VectorizeService {
     try {
       const vec = await provider.embedQuery(query);
       const fp = provider.getModelFingerprint(vec.length);
-      if (!sharedProvider && config === this.config && !signal?.aborted) {
+      if (!sharedProvider && config === this.config && generation === this.indexGeneration && !signal?.aborted) {
         if (this.queryVectorCache.size >= 64) {
           const firstKey = this.queryVectorCache.keys().next().value;
           if (firstKey !== undefined) this.queryVectorCache.delete(firstKey);
@@ -419,10 +600,11 @@ export class VectorizeService {
 
   async search(query: string, options?: SearchOptions): Promise<SearchResponse> {
     await this.init();
-    await this.maintenance;
-    const generation = this.indexGeneration;
     options?.signal?.throwIfAborted();
     const clean = (query || '').trim();
+    await this.indexReadBarrier;
+    const generation = this.indexGeneration;
+    options?.signal?.throwIfAborted();
     const shared = this.indexSync.active;
     let response: SearchResponse | undefined;
     if (shared) {
@@ -504,12 +686,14 @@ export class VectorizeService {
 
   async startIndexing(forceRebuild = false): Promise<void> {
     await this.init();
+    await this.verifyPendingOllama();
     await this.maintenance;
     return this.indexer.startLibraryScan(forceRebuild);
   }
 
   async indexItems(itemIDs: number[], force = true): Promise<void> {
     await this.init();
+    await this.verifyPendingOllama();
     await this.maintenance;
     return this.indexer.indexItemOrAttachmentIds(itemIDs, force);
   }
@@ -524,13 +708,13 @@ export class VectorizeService {
 
   async getStats(activeModel?: Pick<EngineHealthStatus, 'modelFingerprint' | 'dimensions'>): Promise<StoreStats> {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     return this.store.getStats(activeModel);
   }
 
   async getSearchCoverage(): Promise<Pick<StoreStats, 'indexedItems' | 'indexedChunks'>> {
     await this.init();
-    await this.maintenance;
+    await this.indexReadBarrier;
     const shared = this.indexSync.active;
     if (!shared) return this.getStats();
     // The summary includes searchable PDF passages even when the default mode is metadata-only.

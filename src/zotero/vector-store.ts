@@ -649,20 +649,37 @@ export class VectorStore {
               current.fileHash !== state.fileHash || current.mtime !== state.mtime ||
               current.chunkingKey !== state.chunkingKey) return;
         } else {
-          const old = await conn.queryAsync<{ chunk_id: string; item_id: number; text: string }>(
-            `SELECT chunk_id, item_id, text FROM fulltext_chunks WHERE attachment_id = ?
+          const old = await conn.queryAsync<{
+            chunk_id: string; item_id: number; item_key: string; attachment_id: number; attachment_key: string; text: string;
+          }>(
+            `SELECT chunk_id, item_id, item_key, attachment_id, attachment_key, text FROM fulltext_chunks WHERE attachment_id = ?
              OR (item_id = ? AND attachment_key = ?)`, [attachmentID, parentItemID, state.attachmentKey]
           );
-          const next = new Map(chunks.map((chunk) => [chunk.chunkId, chunk.text]));
+          const next = new Map(chunks.map((chunk) => [chunk.chunkId, chunk]));
+          const affectedAttachments = new Set([attachmentID]);
+          let sharedChunksChanged = old.length !== next.size;
           for (const row of old) {
+            const replacement = next.get(row.chunk_id);
+            affectedAttachments.add(row.attachment_id);
             if (row.item_id !== parentItemID) previousParents.add(row.item_id);
-            if (next.get(row.chunk_id) !== row.text || row.item_id !== parentItemID) {
+            if (replacement?.text !== row.text || row.item_id !== parentItemID) {
+              sharedChunksChanged = true;
               await conn.queryAsync('DELETE FROM fulltext_chunks WHERE chunk_id = ?', [row.chunk_id]);
-            } else if (force && profile) {
-              await conn.queryAsync('DELETE FROM passage_embeddings WHERE profile_id = ? AND chunk_id = ?', [profile.id, row.chunk_id]);
+            } else {
+              if (row.item_key !== replacement.itemKey || row.attachment_id !== replacement.attachmentID ||
+                  row.attachment_key !== replacement.attachmentKey) sharedChunksChanged = true;
+              if (force && profile) {
+                await conn.queryAsync('DELETE FROM passage_embeddings WHERE profile_id = ? AND chunk_id = ?', [profile.id, row.chunk_id]);
+              }
             }
           }
-          await conn.queryAsync('DELETE FROM attachment_embeddings WHERE attachment_id = ?', [attachmentID]);
+          if (sharedChunksChanged) {
+            for (const id of affectedAttachments) {
+              await conn.queryAsync('DELETE FROM attachment_embeddings WHERE attachment_id = ?', [id]);
+            }
+          } else if (profile) {
+            await conn.queryAsync('DELETE FROM attachment_embeddings WHERE attachment_id = ? AND profile_id = ?', [attachmentID, profile.id]);
+          }
           await upsert(conn, 'attachment_state', ATTACHMENT_COLUMNS, ['attachment_id'], [
             attachmentID, state.attachmentKey, parentItemID, state.fileHash, state.mtime,
             state.status === 'pending' ? 'indexed' : state.status, state.chunkCount, state.errorMessage || '',

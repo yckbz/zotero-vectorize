@@ -182,6 +182,46 @@ test('Local full scans commit metadata before full-text inference and keep PDF i
   assert.equal((await svc.getStats()).vectorizedChunks, 18);
 });
 
+test('forced rebuilding preserves saved attachment states until shared passages actually change', async (t) => {
+  const { svc, items, events } = await setup(t, 'openai');
+  await svc.startIndexing();
+  const configA = svc.getConfig();
+  const saved = svc.store.activeProfile.id;
+  await svc.applyEmbeddingConfig({ ...configA, openaiBaseUrl: 'https://b.invalid/v1' }, false);
+  await svc.startIndexing();
+  const savedStates = () => {
+    const db = new DatabaseSync(svc.store.getDbPath(), { readOnly: true });
+    try {
+      return db.prepare(
+        'SELECT attachment_id AS id, status FROM attachment_embeddings WHERE profile_id = ? ORDER BY attachment_id'
+      ).all(saved);
+    } finally {
+      db.close();
+    }
+  };
+  await svc.startIndexing(true);
+  assert.deepEqual(savedStates().map(({ id, status }) => [id, status]), [[101, 'indexed'], [102, 'indexed']]);
+
+  const getFullText = Zotero.PDFWorker.getFullText;
+  t.mock.method(Zotero.PDFWorker, 'getFullText', async (id) => {
+    const prior = await getFullText(id);
+    return id !== 101 ? prior : {
+      text: prior.text + '\fA new passage on page ten.',
+      extractedPages: 10, totalPages: 10,
+    };
+  });
+  items.get(101).attachmentHash = 'fixture-added-page';
+  await svc.indexItems([1]);
+  assert.deepEqual(savedStates().map(({ id, status }) => [id, status]), [[102, 'indexed']]);
+  assert.equal((await svc.listEmbeddingProfiles()).find(({ id }) => id === saved).chunks, 18);
+
+  events.length = 0;
+  await svc.applyEmbeddingConfig(configA, false);
+  await svc.startIndexing();
+  assert.deepEqual(events, [{ origin: configA.openaiBaseUrl, texts: ['A new passage on page ten.'] }]);
+  assert.deepEqual(savedStates().map(({ id, status }) => [id, status]), [[101, 'indexed'], [102, 'indexed']]);
+});
+
 test('An old SQLite index keeps its vectors inactive until the matching model is confirmed', async (t) => {
   const { svc, root, events } = await setup(t, 'openai');
   await svc.startIndexing();

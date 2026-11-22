@@ -20,6 +20,7 @@ async function setup(t) {
   const { VectorizeService } = await importTs('src/zotero/service.ts');
   const { jumpToSearchHit } = await importTs('src/zotero/navigation.ts');
   const { OpenAICompatProvider } = await importTs('src/engines/openai.ts');
+  const { OllamaEmbeddingProvider } = await importTs('src/engines/ollama.ts');
   const remote = new Map();
   let nextKey = 0;
   const allocateKey = () => 'PART' + String(++nextKey).padStart(4, '0');
@@ -338,8 +339,13 @@ async function setup(t) {
       const service = new VectorizeService({ dataDir: dir, rootURI: 'file:///sync-test/' });
       if (flags.partBytes) service.indexSync.partBytes = () => flags.partBytes;
       live.add(service);
+      const createProvider = service.providerManager.createProvider.bind(service.providerManager);
       service.providerManager.createProvider = (config) => {
         const { engine } = config;
+        if (engine === 'local-onnx' && flags.useLocalOnnx) return createProvider(config);
+        if (engine === 'ollama' && flags.ollamaHttp) {
+          return new OllamaEmbeddingProvider({ baseUrl: config.ollamaUrl, model: config.ollamaModel, http: flags.ollamaHttp });
+        }
         if (engine === 'openai' && flags.useCloudHttp) {
           return new OpenAICompatProvider({
             baseUrl: config.openaiBaseUrl, apiKey: config.openaiApiKey,
@@ -381,6 +387,7 @@ async function setup(t) {
           dispose: async () => {},
         };
       };
+      flags.beforeInit?.(service);
       await service.init();
       return service;
     }
@@ -703,6 +710,469 @@ test('offline sync, corrupted publications, account changes and model drift pres
   service.indexSync.setRole('off');
   assert.equal(service.getConfig().openaiApiKey, 'local-secret');
 });
+
+test('a ready Ollama profile loads once and keeps the startup scan delay', async (t) => {
+  const { createDevice } = await setup(t);
+  const device = await createDevice('device', 0, 'off', 'ollama');
+  device.flags.revision = 'a'.repeat(64);
+  device.prefs.set(PREFIX + 'autoIndexOnStartup', true);
+  const loads = [];
+  let scan;
+  let reads = 0;
+  device.flags.onReadRevision = () => { reads++; };
+  device.flags.beforeInit = (service) => {
+    const loadAll = service.store.loadAll.bind(service.store);
+    t.mock.method(service.store, 'loadAll', (id) => {
+      loads.push(id ?? service.store.activeProfile?.id);
+      return loadAll(id);
+    });
+    scan = t.mock.method(service.indexer, 'startLibraryScan', async () => {});
+  };
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const service = await device.start();
+  assert.ok(service.store.activeProfile);
+  assert.deepEqual(loads, [service.store.activeProfile.id]);
+  assert.equal(reads, 1);
+  assert.equal(service.pendingOllama, null);
+  assert.equal((await service.getEngineStatus()).neuralAvailable, true);
+  t.mock.timers.tick(3499);
+  assert.equal(scan.mock.callCount(), 0);
+  t.mock.timers.tick(1);
+  assert.equal(scan.mock.callCount(), 1);
+});
+
+test('Ollama recovery during startup preserves the remaining scan delay', async (t) => {
+  const { createDevice } = await setup(t);
+  const device = await createDevice('device', 0, 'off', 'ollama');
+  device.prefs.set(PREFIX + 'autoIndexOnStartup', true);
+  const reply = Promise.withResolvers();
+  device.flags.ollamaHttp = async () => reply.promise;
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const service = await device.start();
+  const scan = t.mock.method(service.indexer, 'startLibraryScan', async () => {});
+  assert.equal(service.store.activeProfile, null);
+  t.mock.timers.tick(500);
+  reply.resolve({ status: 200, json: { models: [{ name: 'bge-m3:latest', digest: 'a'.repeat(64) }] } });
+  await service.pendingOllama.probe;
+  assert.ok(service.store.activeProfile);
+  t.mock.timers.tick(2999);
+  assert.equal(scan.mock.callCount(), 0);
+  t.mock.timers.tick(1);
+  assert.equal(scan.mock.callCount(), 1);
+});
+
+test('late Ollama startup reuses SQLite vectors and resumes WebDAV publication in the same session',
+  { timeout: 5000 }, async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const device = await createDevice('publisher', 0, 'off', 'ollama');
+  const digest = 'a'.repeat(64);
+  device.prefs.set(PREFIX + 'ollamaModel', 'test-embedding');
+  let online = true;
+  let offlineProbe;
+  let tags = 0;
+  let documentEmbeddings = 0;
+  device.flags.ollamaHttp = async (method, url, request) => {
+    assert.doesNotMatch(url, /\/api\/embeddings$/);
+    if (method === 'GET') tags++;
+    if (!online) {
+      await offlineProbe?.promise;
+      throw new Error('Ollama is offline');
+    }
+    if (method === 'GET') return { status: 200, json: { models: [{ name: 'test-embedding:latest', digest }] } };
+    const { input } = JSON.parse(request.body);
+    const inputs = Array.isArray(input) ? input : [input];
+    documentEmbeddings += inputs.filter((text) => text !== 'hydrogen' && text !== 'semantic search health check').length;
+    return { status: 200, json: { embeddings: inputs.map(() => [1, 0]) } };
+  };
+
+  let service = await device.start();
+  await service.startIndexing();
+  const saved = (await service.listEmbeddingProfiles()).find(({ active }) => active);
+  assert.ok(saved.items && saved.chunks);
+  const seenEmbeddings = documentEmbeddings;
+  service.indexSync.setRole('publish');
+  await service.indexSync.syncNow();
+  assert.equal(service.indexSync.getStatus().phase, 'ready');
+  const previousManifest = transport.manifest;
+  await device.shutdown(service);
+
+  online = false;
+  offlineProbe = Promise.withResolvers();
+  service = await device.start();
+  const status = await service.getEngineStatus();
+  assert.equal(status.neuralAvailable, false);
+  assert.match(status.statusMessage, /Waiting for Ollama/);
+  assert.equal(service.store.activeProfile, null);
+  assert.deepEqual(await service.listEmbeddingProfiles(), [{ ...saved, active: false }]);
+  const offline = await service.search('hydrogen');
+  assert.ok(offline.hits.length);
+  assert.equal(offline.diagnostics.vectorSearchUsed, false);
+  assert.equal(service.pendingOllama.retryDelayMs, 5000);
+  offlineProbe.resolve();
+  await service.pendingOllama.probe;
+  const offlineTags = tags;
+  const retryTimer = service.pendingOllama.timer;
+  await service.search('hydrogen');
+  await service.search('hydrogen diffusion');
+  assert.equal(tags, offlineTags);
+  assert.equal(service.pendingOllama.timer, retryTimer);
+  await service.indexSync.syncNow();
+  assert.equal(service.indexSync.getStatus().phase, 'waiting');
+  assert.deepEqual(transport.manifest, previousManifest);
+
+  online = true;
+  const beforeRecovery = tags;
+  const [connection] = await Promise.all([
+    service.testConnection({ ...service.getConfig() }), service.startIndexing(),
+  ]);
+  assert.equal(tags - beforeRecovery, 1);
+  const search = await service.search('hydrogen');
+  assert.equal(search.diagnostics.vectorSearchUsed, true);
+  assert.equal(connection.ok, true);
+  assert.equal((await service.getEngineStatus()).neuralAvailable, true);
+  assert.deepEqual(await service.listEmbeddingProfiles(), [saved]);
+  assert.equal(documentEmbeddings, seenEmbeddings);
+
+  service.updateConfig({ hybridSemanticWeight: 0.25 });
+  await service.indexSync.syncNow();
+  assert.equal(service.indexSync.getStatus().phase, 'ready');
+  assert.equal(transport.manifest.snapshot.revision, digest);
+  assert.ok(transport.manifest.snapshot.generation > previousManifest.snapshot.generation);
+});
+
+test('shared tag notifications update paper metadata and retain PDF chunks until the attachment is removed', async (t) => {
+  const { createDevice } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'off');
+  publisher.items.get(1).getTags = () => [{ tag: 'transport' }];
+  const source = await publisher.start();
+  await source.startIndexing();
+  source.indexSync.setRole('publish');
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const paper = receiver.items.get(101);
+  paper.getTags = () => [{ tag: 'transport' }];
+  const service = await receiver.start();
+  await service.indexSync.syncNow();
+  const { index } = service.indexSync.active;
+  const { notify } = receiver.observers.get('zotero-vectorize-shared-index');
+  const chunks = index.getItemChunks(101);
+  assert.ok(chunks.length);
+  assert.ok(index.getItemById(101).vector);
+
+  const initialRevision = service.indexSync.libraryRevision;
+  notify('remove', 'item-tag', ['102-8']);
+  assert.deepEqual(index.getItemChunks(101), chunks);
+  assert.equal(service.indexSync.libraryRevision, initialRevision);
+  paper.getTags = () => [];
+  notify('remove', 'item-tag', ['101-7']);
+  notify('delete', 'item-tag', ['101-7']);
+  assert.deepEqual(index.getItemById(101).tags, []);
+  assert.equal(index.getItemById(101).vector, null);
+  assert.deepEqual(index.getItemChunks(101), chunks);
+
+  receiver.items.delete(102);
+  notify('delete', 'item', [102]);
+  assert.ok(index.getItemById(101));
+  assert.deepEqual(index.getItemChunks(101), []);
+});
+
+test('a receiver can search an independent shared index during local Ollama verification', async (t) => {
+  const { createDevice } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'off');
+  const source = await publisher.start();
+  await source.startIndexing();
+  source.indexSync.setRole('publish');
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'off', 'ollama');
+  const revision = Promise.withResolvers();
+  let requests = 0;
+  receiver.flags.ollamaHttp = async () => { requests++; return revision.promise; };
+  const destination = await receiver.start();
+  destination.indexSync.setRole('receive');
+  await destination.indexSync.syncNow();
+  const original = destination.indexSync.active;
+  assert.equal(original.manifest.engine, 'local-onnx');
+  assert.ok((await destination.search('hydrogen')).diagnostics.vectorSearchUsed);
+  assert.equal(requests, 1);
+
+  const schedule = t.mock.method(destination.indexSync, 'schedule');
+  revision.resolve({ status: 200, json: { models: [{ name: 'bge-m3:latest', digest: 'a'.repeat(64) }] } });
+  await destination.pendingOllama.probe;
+  assert.equal(destination.store.activeProfile.engine, 'ollama');
+  assert.equal(destination.indexSync.active, original);
+  assert.equal(schedule.mock.callCount(), 0);
+});
+
+test('a queued Ollama activation cannot overwrite a model switched under index maintenance', async (t) => {
+  const { createDevice } = await setup(t);
+  const device = await createDevice('device', 0, 'off', 'ollama');
+  device.flags.revision = null;
+  const service = await device.start();
+  await service.pendingOllama.probe;
+
+  const probeStarted = Promise.withResolvers();
+  const revision = Promise.withResolvers();
+  (await service.getProvider()).getModelRevision = () => {
+    probeStarted.resolve();
+    return revision.promise;
+  };
+  const verification = service.verifyPendingOllama();
+  await probeStarted.promise;
+
+  const unblock = Promise.withResolvers();
+  const waiting = service.withIndexMaintenance(() => unblock.promise);
+  const queue = service.maintenance;
+  const switching = service.applyEmbeddingConfig({ ...service.getConfig(), engine: 'openai' }, false);
+  await new Promise(setImmediate);
+  assert.notEqual(service.maintenance, queue);
+  const queuedSwitch = service.maintenance;
+
+  revision.resolve('b'.repeat(64));
+  await new Promise(setImmediate);
+  assert.notEqual(service.maintenance, queuedSwitch);
+  unblock.resolve();
+  await Promise.all([waiting, switching, verification]);
+
+  assert.equal(service.store.activeProfile.engine, 'openai');
+  assert.ok((await service.listEmbeddingProfiles()).every(({ engine }) => engine === 'openai'));
+});
+
+for (const shared of [false, true]) {
+  test(`Ollama recovery keeps ${shared ? 'shared ONNX' : 'local lexical'} search available while a PDF read drains`,
+    { timeout: 5000 }, async (t) => {
+    const { createDevice } = await setup(t);
+    if (shared) {
+      const publisher = await createDevice('publisher', 0, 'off');
+      const source = await publisher.start();
+      await source.startIndexing();
+      source.indexSync.setRole('publish');
+      await source.indexSync.syncNow();
+      assert.equal(source.indexSync.getStatus().phase, 'ready');
+      await publisher.shutdown(source);
+    }
+
+    const device = await createDevice('device', shared ? 100 : 0, 'off', 'ollama');
+    let online = false;
+    device.flags.ollamaHttp = async (method) => {
+      assert.equal(method, 'GET');
+      if (!online) throw new Error('Ollama is offline');
+      return { status: 200, json: { models: [{ name: 'bge-m3:latest', digest: 'a'.repeat(64) }] } };
+    };
+    const service = await device.start();
+    await service.pendingOllama.probe;
+    if (shared) {
+      service.indexSync.setRole('receive');
+      await service.indexSync.syncNow();
+      assert.equal(service.indexSync.active.manifest.engine, 'local-onnx');
+      // The receiving device still indexes its private group library.
+      device.items.get(103).getAttachments = () => [200];
+      device.items.set(200, {
+        ...device.items.get(102), id: 200, parentItemID: 103, libraryID: 2, key: 'GROUPPDF',
+        getFilePathAsync: async () => device.pdfFile, attachmentHash: digest(pdfBytes),
+        attachmentModificationTime: 789,
+      });
+      await fs.writeFile(device.pdfFile, pdfBytes);
+    } else {
+      await service.startIndexing();
+      await fs.writeFile(device.pdfFile, Buffer.from('Updated fixture PDF'));
+    }
+
+    const reading = Promise.withResolvers();
+    const extracted = Promise.withResolvers();
+    t.mock.method(device.zotero.PDFWorker, 'getFullText', async (id) => {
+      assert.equal(id, shared ? 200 : 2);
+      reading.resolve();
+      return extracted.promise;
+    });
+    const draining = Promise.withResolvers();
+    const suspend = service.indexer.withWritesSuspended.bind(service.indexer);
+    t.mock.method(service.indexer, 'withWritesSuspended', (operation) => {
+      draining.resolve();
+      return suspend(operation);
+    });
+    const loading = Promise.withResolvers();
+    const loaded = Promise.withResolvers();
+    const loadAll = service.store.loadAll.bind(service.store);
+    t.mock.method(service.store, 'loadAll', async (profileId) => {
+      loading.resolve();
+      await loaded.promise;
+      return loadAll(profileId);
+    });
+
+    const scan = service.indexer.startLibraryScan(false, true);
+    let recovery;
+    let searchDuringCommit;
+    let timer;
+    const finishPdf = () => extracted.resolve({
+      text: 'Hydrogen diffusion in a fixture PDF.', extractedPages: 1, totalPages: 1,
+    });
+    try {
+      await reading.promise;
+      online = true;
+      recovery = service.verifyPendingOllama();
+      await draining.promise;
+
+      const [search, status] = await Promise.race([
+        Promise.all([service.search('hydrogen'), service.getEngineStatus()]),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Reads are waiting for the PDF extraction')), 2000);
+        }),
+      ]);
+      assert.ok(search.hits.length);
+      assert.equal(search.diagnostics.vectorSearchUsed, shared);
+      assert.equal(status.neuralAvailable, false);
+      assert.equal(service.store.activeProfile, null);
+
+      finishPdf();
+      await loading.promise;
+      let returned = false;
+      searchDuringCommit = service.search('hydrogen').then((response) => {
+        returned = true;
+        return response;
+      });
+      await new Promise(setImmediate);
+      assert.equal(returned, false, 'Search must wait for the actual Profile change');
+    } finally {
+      clearTimeout(timer);
+      finishPdf();
+      loaded.resolve();
+      await Promise.all([scan, recovery, searchDuringCommit]);
+    }
+    assert.equal(service.store.activeProfile.engine, 'ollama');
+  });
+}
+
+test('Ollama readiness retries automatically without starting a scan when startup indexing is off', async (t) => {
+  const { createDevice } = await setup(t);
+  const device = await createDevice('device', 0, 'off', 'ollama');
+  device.flags.revision = null;
+  let probes = 0;
+  device.flags.onReadRevision = () => { probes++; };
+
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const service = await device.start();
+  await service.pendingOllama.probe;
+  assert.equal(probes, 1);
+  await new Promise(setImmediate);
+  const firstRetry = service.pendingOllama.timer;
+  assert.ok(firstRetry);
+  await service.testConnection();
+  assert.equal(probes, 2);
+  assert.equal(service.pendingOllama.timer, firstRetry);
+  t.mock.timers.tick(4999);
+  assert.equal(probes, 2);
+  t.mock.timers.tick(1);
+  await service.pendingOllama.probe;
+  assert.equal(probes, 3);
+  assert.equal(service.store.activeProfile, null);
+
+  device.flags.revision = 'a'.repeat(64);
+  t.mock.timers.tick(9999);
+  assert.equal(probes, 3);
+  t.mock.timers.tick(1);
+  await service.pendingOllama.probe;
+  t.mock.timers.tick(1);
+  assert.equal(probes, 4);
+  assert.equal(service.store.activeProfile.engine, 'ollama');
+  assert.equal(service.getIndexProgress().phase, 'idle');
+  t.mock.timers.tick(60_000);
+  assert.equal(probes, 4);
+});
+
+async function testLocalDownload(t, draftDownload, switchModel = false) {
+  const { createDevice } = await setup(t);
+  const device = await createDevice('device', 0, 'off');
+  device.flags.useLocalOnnx = true;
+  const { Services, Worker } = globalThis;
+  t.after(() => { globalThis.Services = Services; globalThis.Worker = Worker; });
+  globalThis.IOUtils.readUTF8 = (file) => fs.readFile(file, 'utf8');
+  globalThis.Worker = class {
+    addEventListener(type, callback) {
+      if (type === 'message') this.reply = callback;
+    }
+    postMessage({ id, type, payload }) {
+      const result = type === 'init' ? { dimensions: 2 } :
+        { vectors: payload.texts.map(() => new Float32Array([1, 0])) };
+      queueMicrotask(() => this.reply({ data: { id, ok: true, result } }));
+    }
+    terminate() {}
+  };
+
+  const urls = [];
+  const activeRequest = Promise.withResolvers();
+  let stall = false;
+  const fetchModelAsset = async (url, { signal }) => {
+    urls.push(new URL(url));
+    if (!stall || new URL(url).pathname.endsWith('/tokenizer.json')) return new Response('{}');
+    activeRequest.resolve(signal);
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  };
+  globalThis.Services = { appShell: { hiddenDOMWindow: { fetch: fetchModelAsset, AbortController, crypto } } };
+
+  const service = await device.start();
+  if (!draftDownload && !switchModel) {
+    const activation = t.mock.method(service.store, 'activateProfile', async () => {
+      throw new Error('fixture Profile commit failed');
+    });
+    await assert.rejects(service.downloadLocalModel(), /Profile commit failed/);
+    activation.mock.restore();
+    assert.equal(service.store.activeProfile, null);
+    assert.deepEqual(await fs.readdir((await service.getProvider()).getModelDir()), []);
+    urls.length = 0;
+  }
+  await service.downloadLocalModel(undefined, { ...service.getConfig(), localMirror: 'hf-mirror' });
+  const provider = await service.getProvider();
+  assert.equal(urls.length, 3);
+  assert.ok(urls.every(({ hostname }) => hostname === 'hf-mirror.com'));
+  assert.equal(service.store.activeProfile.engine, 'local-onnx');
+  const profileID = service.store.activeProfile.id;
+  service.updateConfig({ localMirror: 'hf-mirror' });
+  assert.equal(device.prefs.get(PREFIX + 'localMirror'), 'hf-mirror');
+  assert.equal(await service.getProvider(), provider);
+  assert.equal(service.store.activeProfile.id, profileID);
+  await service.startIndexing();
+
+  const modelDir = draftDownload ? path.join(device.dir, 'draft-model') : provider.getModelDir();
+  const draft = draftDownload ? { ...service.getConfig(), localModelDir: modelDir } : undefined;
+  const asset = draftDownload ? 'tokenizer.json' : 'config.json';
+  if (draftDownload) await fs.mkdir(modelDir);
+  else await fs.rm(path.join(modelDir, asset));
+  await fs.writeFile(path.join(modelDir, asset + '.part'), 'stale');
+  stall = true;
+  const pending = service.downloadLocalModel(undefined, draft);
+  const interrupted = assert.rejects(pending, { name: 'AbortError' });
+  const signal = await activeRequest.promise;
+  assert.equal((await service.getEngineStatus()).ready, true);
+  assert.ok((await service.search('hydrogen')).hits.length);
+  assert.ok((await service.getStats()).indexedItems);
+  assert.equal((await service.listEmbeddingProfiles()).find(({ active }) => active).id, profileID);
+  if (draftDownload) assert.equal(await IOUtils.exists(path.join(modelDir, 'tokenizer.json')), false);
+  if (switchModel) {
+    await assert.rejects(service.applyEmbeddingConfig({
+      ...service.getConfig(), localModelDir: path.join(device.dir, 'missing'),
+    }, false), /model files missing/);
+    assert.equal(signal.aborted, false);
+    await service.applyEmbeddingConfig({ ...service.getConfig(), engine: 'openai' }, false);
+    assert.equal(service.store.activeProfile.engine, 'openai');
+  } else await device.shutdown(service);
+  await interrupted;
+  assert.equal(signal.aborted, true);
+  assert.equal(urls.length, draftDownload ? 5 : 4);
+  assert.deepEqual((await fs.readdir(modelDir)).sort(), draftDownload ? [] : ['model_quantized.onnx', 'tokenizer.json']);
+}
+
+test('an active model download uses the requested mirror and is canceled at shutdown',
+  { timeout: 5000 }, (t) => testLocalDownload(t, false));
+test('a draft model download leaves the active engine usable and is canceled at shutdown',
+  { timeout: 5000 }, (t) => testLocalDownload(t, true));
+test('a successful engine switch cancels an active download and a failed switch keeps it running',
+  { timeout: 5000 }, (t) => testLocalDownload(t, false, true));
 
 test('an Ollama digest change disables shared neural results without affecting a local engine', async (t) => {
   const { createDevice } = await setup(t);

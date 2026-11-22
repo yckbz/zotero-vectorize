@@ -4,6 +4,7 @@ import type { SyncPhase } from './index-sync.ts';
 
 export type LocaleStrings = {
   brandTitle: string;
+  ollamaWaitingForModel: (model: string) => string;
   brandSubtitle: string;
   modeHybrid: string;
   modeMetadata: string;
@@ -155,6 +156,7 @@ export type LocaleStrings = {
 
 const ZH_CN: LocaleStrings = {
   brandTitle: 'Zotero Vectorize',
+  ollamaWaitingForModel: (model) => `正在等待 Ollama 验证模型 ${model}`,
   brandSubtitle: '语义与全文瞬时召回',
   modeHybrid: '混合',
   modeMetadata: '元数据',
@@ -317,6 +319,7 @@ const ZH_CN: LocaleStrings = {
 
 const EN_US: LocaleStrings = {
   brandTitle: 'Zotero Vectorize',
+  ollamaWaitingForModel: (model) => `Waiting for Ollama to verify ${model}`,
   brandSubtitle: 'Semantic & Fulltext Recall',
   modeHybrid: 'Hybrid',
   modeMetadata: 'Metadata',

@@ -16,7 +16,8 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   private readonly baseUrl: string;
   private readonly http: HttpRequestFn;
   private detectedDim: number;
-  private modelRevision?: Promise<string | null>;
+  private modelRevision?: string;
+  private revisionRequest?: Promise<string | null>;
   private useLegacyApi = false;
 
   constructor(options: {
@@ -47,12 +48,20 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   }
 
   getModelRevision(refresh = false): Promise<string | null> {
-    if (refresh) this.modelRevision = undefined;
-    this.modelRevision ??= this.getInstalledModels().then((models) => {
+    if (this.revisionRequest) return this.revisionRequest;
+    if (!refresh && this.modelRevision) return Promise.resolve(this.modelRevision);
+
+    this.revisionRequest = this.getInstalledModels().then((models) => {
       const canonical = (name: string) => name.split('/').at(-1)?.includes(':') ? name : `${name}:latest`;
-      return models.find((model) => canonical(model.name || model.model || '') === canonical(this.model))?.digest ?? null;
-    }, () => null);
-    return this.modelRevision;
+      const digest = models.find((model) => canonical(model.name || model.model || '') === canonical(this.model))?.digest;
+      return typeof digest === 'string' ? digest.trim() || null : null;
+    }).catch(() => null).then((revision) => {
+      this.modelRevision = revision ?? undefined;
+      return revision;
+    }).finally(() => {
+      this.revisionRequest = undefined;
+    });
+    return this.revisionRequest;
   }
 
   private async embedWithModernApi(inputs: string[]): Promise<Float32Array[]> {

@@ -187,14 +187,15 @@ export class BackgroundIndexer {
     );
   }
 
-  scheduleStartupScan(delayMs = 3500): void {
+  scheduleStartupScan(delayMs = 3500, backfillProvider?: EmbeddingProvider): void {
     if (this.startupTimer) clearTimeout(this.startupTimer);
     this.startupTimer = setTimeout(() => {
       this.startupTimer = null;
       if (this.disposed) return;
       const cfg = this.deps.getConfig();
       if (cfg.autoIndexOnStartup) {
-        void this.startLibraryScan(false, true);
+        if (backfillProvider) this.requestModelBackfill(backfillProvider);
+        else void this.startLibraryScan(false, true);
       }
     }, delayMs);
   }

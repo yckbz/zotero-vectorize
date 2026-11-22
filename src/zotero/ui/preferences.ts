@@ -435,16 +435,16 @@ class VectorizePreferencesController {
       ]);
 
       const mirrorSelect = el(doc, 'select', { className: 'zv-input' }, [
-        el(doc, 'option', { value: 'huggingface', selected: draft.localMirror === 'huggingface' }, [
+        el(doc, 'option', { value: 'huggingface' }, [
           'HuggingFace Official (huggingface.co)',
         ]),
-        el(doc, 'option', { value: 'hf-mirror', selected: draft.localMirror === 'hf-mirror' }, [
+        el(doc, 'option', { value: 'hf-mirror' }, [
           'HF-Mirror (hf-mirror.com · 国内加速)',
         ]),
       ]) as HTMLSelectElement;
-      mirrorSelect.value = draft.localMirror;
+      mirrorSelect.value = cfg.localMirror;
       mirrorSelect.addEventListener('change', () => {
-        draft.localMirror = mirrorSelect.value as HfMirrorMode;
+        mirrorSelect.value = svc.updateConfig({ localMirror: mirrorSelect.value as HfMirrorMode }).localMirror;
       });
 
       const dirInput = el(doc, 'input', {
@@ -479,7 +479,7 @@ class VectorizePreferencesController {
           await svc.downloadLocalModel((p) => {
             this.downloadProgressText = `${p.file} · ${p.percent}%`;
             dlBtn.textContent = this.downloadProgressText;
-          }, { ...draft });
+          }, { ...draft, localMirror: svc.getConfig().localMirror });
           this.downloadProgressText = '';
           this.setFeedback(s.prefMsgModelReady(draft.localModelId), 'ok');
           await this.refreshStatsAndStatus();

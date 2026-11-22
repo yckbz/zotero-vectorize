@@ -31,7 +31,7 @@ export type SyncRole = 'off' | 'publish' | 'receive';
 export type SyncPhase = 'off' | 'waiting' | 'working' | 'ready' | 'webdav' | 'model' | 'cloud' | 'conflict' |
   'upgradePublisher' | 'upgradeReceiver' | 'error';
 const DEVICE_MODEL_SETTINGS = {
-  'local-onnx': ['localModelDir', 'localMirror'],
+  'local-onnx': ['localModelDir'],
   ollama: ['ollamaUrl'],
   openai: ['openaiBaseUrl', 'openaiModel', 'openaiDimensions', 'openaiApiKey'],
 } as const satisfies Record<EngineType, readonly (keyof PluginConfig)[]>;
@@ -48,6 +48,7 @@ interface IndexSyncDeps {
   store: VectorStore;
   getConfig(): PluginConfig;
   getProgress(): IndexProgress;
+  isWaitingForOllama(): boolean;
   createProvider(config: PluginConfig): EmbeddingProvider;
   onUpdate(): void;
   onLocalAvailable(): void;
@@ -217,6 +218,10 @@ export class IndexSync {
     }
   }
 
+  onOllamaAvailable(): void {
+    if (this.role === 'receive' && (!this.active || this.phase === 'model')) this.schedule(0);
+  }
+
   private releaseLocalIndexing(): void {
     if (this.waitingForFirstSnapshot && !this.active) this.deps.onLocalAvailable();
     this.waitingForFirstSnapshot = false;
@@ -234,18 +239,28 @@ export class IndexSync {
 
   private invalidate(event: string, type: string, ids: Array<number | string>): void {
     const received = this.active;
-    if (type === 'item' && !['add', 'modify', 'delete', 'trash'].includes(event)) return;
+    const itemEvent = type === 'item';
+    if (itemEvent && !['add', 'modify', 'delete', 'trash'].includes(event)) return;
+    const idsToCheck = new Set(ids.map((id) => Number(itemEvent ? id : String(id).split('-')[0])));
+    if (!itemEvent) {
+      for (const id of idsToCheck) {
+        if (!isIndexableRegularItem(Zotero.Items.get(id))) idsToCheck.delete(id);
+      }
+    }
+    if (!idsToCheck.size) return;
     this.libraryRevision++;
     this.needsReconcile = true;
     if (!received) return;
-    const idsToCheck = new Set(ids.map((id) => Number(type === 'item-tag' ? String(id).split('-')[0] : id)));
     let changed = false;
-    const affected = received.index.getAllItems().filter((item) => idsToCheck.has(item.itemID));
-    for (const item of affected) {
-      const live = Zotero.Items.get(item.itemID);
-      if (!live || live.deleted || live.key !== item.itemKey || event === 'trash' || event === 'delete') {
-        received.index.removeItem(item.itemID);
-        changed = true;
+    for (const id of idsToCheck) {
+      const item = received.index.getItemById(id);
+      if (!item) continue;
+      const live = Zotero.Items.get(id);
+      if (!live || live.deleted || live.key !== item.itemKey || (itemEvent && (event === 'trash' || event === 'delete'))) {
+        if (itemEvent) {
+          received.index.removeItem(id);
+          changed = true;
+        }
       } else {
         const { canonicalText: _text, dateModified: _date, ...metadata } = extractItemMetadata(live);
         if (metadata.metadataHash !== item.metadataHash) {
@@ -254,11 +269,13 @@ export class IndexSync {
         }
       }
     }
-    const chunkParents = new Set(received.index.getAllChunks().filter((chunk) => idsToCheck.has(chunk.attachmentID))
-      .map((chunk) => chunk.itemID));
-    for (const id of chunkParents) {
-      received.index.replaceItemChunks(id, received.index.getItemChunks(id).filter((chunk) => !idsToCheck.has(chunk.attachmentID)));
-      changed = true;
+    if (itemEvent) {
+      const chunkParents = new Set(received.index.getAllChunks().filter((chunk) => idsToCheck.has(chunk.attachmentID))
+        .map((chunk) => chunk.itemID));
+      for (const id of chunkParents) {
+        received.index.replaceItemChunks(id, received.index.getItemChunks(id).filter((chunk) => !idsToCheck.has(chunk.attachmentID)));
+        changed = true;
+      }
     }
     // Resolve keys again after item and file sync have finished.
     if (changed) {
@@ -420,7 +437,7 @@ export class IndexSync {
     const config = this.deps.getConfig();
     const settings = publicationSettings(config);
     const profile = this.deps.store.activeProfile;
-    if (!profile) throw new SyncIssue('model');
+    if (!profile) throw new SyncIssue(this.deps.isWaitingForOllama() ? 'waiting' : 'model');
     const provider = this.deps.createProvider(config);
     let model: SnapshotModel;
     try {
