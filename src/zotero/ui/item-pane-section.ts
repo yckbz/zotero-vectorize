@@ -1,5 +1,6 @@
 import type { VectorizeService } from '../service.ts';
 import { PLUGIN_ID } from '../config.ts';
+import { isIndexableRegularItem } from '../extractor.ts';
 import { getStrings } from '../i18n.ts';
 import { selectItemInLibrary } from '../navigation.ts';
 import { el } from './render-utils.ts';
@@ -51,7 +52,7 @@ export function registerSimilarPapersSection(rootURI: string, service: Vectorize
       },
       onItemChange: ({ item, setEnabled }) => {
         try {
-          const enabled = Boolean(item && !item.deleted && item.isRegularItem?.());
+          const enabled = isIndexableRegularItem(item);
           setEnabled(enabled);
           return enabled;
         } catch {
@@ -62,7 +63,7 @@ export function registerSimilarPapersSection(rootURI: string, service: Vectorize
       onRender: ({ doc, body, item }) => {
         if (!body) return;
         body.textContent = '';
-        if (!item || !item.isRegularItem?.()) return;
+        if (!isIndexableRegularItem(item)) return;
 
         const s = getStrings(service.getConfig());
         const box = el(doc, 'div', { className: 'zv-item-pane-box' });

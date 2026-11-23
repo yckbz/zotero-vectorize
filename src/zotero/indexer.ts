@@ -417,7 +417,10 @@ export class BackgroundIndexer {
         if (isIndexableRegularItem(item)) {
           resolvedRegularIds.add(item.id);
         } else if (item.isAttachment?.() && typeof item.parentItemID === 'number' && item.parentItemID > 0) {
-          resolvedRegularIds.add(item.parentItemID);
+          const parent = await Zotero.Items.getAsync(item.parentItemID).catch(() => null);
+          if (isIndexableRegularItem(parent) && (!automatic || this.deps.shouldAutoIndex?.(parent.libraryID) !== false)) {
+            resolvedRegularIds.add(parent.id);
+          }
         }
       } catch {
         // Ignore deleted/missing item

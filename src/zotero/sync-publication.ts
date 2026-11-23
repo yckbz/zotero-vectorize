@@ -6,6 +6,7 @@ import {
 } from './sync-snapshot.ts';
 
 export const MAX_MANIFEST_BYTES = 256 * 1024;
+export const CURRENT_SYNC_VERSION = 4;
 const partFields = {
   bytes: z.number().check(z.int(), z.gte(1), z.lte(MAX_PART_BYTES)),
   digest: md5Digest,
@@ -19,15 +20,21 @@ const legacyManifestSchema = z.strictObject({
 });
 const rangeFields = { ...partFields, end: z.nullable(rangeKey), content: contentDigest };
 const maximum = z.number().check(z.int(), z.gte(1), z.lte(MAX_PART_BYTES));
-const manifestSchema = z.strictObject({
+const rangeManifestFields = {
   type: z.literal('zotero-vectorize-index-manifest'),
-  version: z.literal(3),
   snapshot: syncHeader,
   partBytes: maximum,
   parts: parts(z.strictObject({ ...rangeFields, key: zoteroKey })),
-});
-const draftSchema = z.strictObject({
+};
+const v3ManifestSchema = z.strictObject({
+  ...rangeManifestFields,
   version: z.literal(3),
+});
+const manifestSchema = z.strictObject({
+  ...rangeManifestFields,
+  version: z.literal(4),
+});
+const rangeDraftFields = {
   snapshot: syncHeader,
   partBytes: maximum,
   parts: parts(z.strictObject({ ...rangeFields, key: z.optional(zoteroKey) })),
@@ -36,6 +43,14 @@ const draftSchema = z.strictObject({
     digest: md5Digest,
     parts: parts(z.strictObject({ key: zoteroKey, content: z.optional(contentDigest) })),
   })),
+};
+const v3DraftSchema = z.strictObject({
+  ...rangeDraftFields,
+  version: z.literal(3),
+});
+const draftSchema = z.strictObject({
+  ...rangeDraftFields,
+  version: z.literal(4),
 });
 const legacyDraftSchema = z.strictObject({
   snapshot: syncHeader,
@@ -49,8 +64,10 @@ const legacyDraftSchema = z.strictObject({
 });
 
 export type SyncManifest = z.infer<typeof manifestSchema>;
+export type V3SyncManifest = z.infer<typeof v3ManifestSchema>;
 export type LegacySyncManifest = z.infer<typeof legacyManifestSchema>;
 export type SyncDraft = z.infer<typeof draftSchema>;
+export type V3SyncDraft = z.infer<typeof v3DraftSchema>;
 export type LegacySyncDraft = Omit<z.infer<typeof legacyDraftSchema>, 'previous' | 'stamp'> &
   { version: 2; previous: SyncDraft['previous'] };
 
@@ -100,21 +117,33 @@ export async function readSyncManifest(path: string): Promise<SyncManifest> {
       value.type === 'zotero-vectorize-index-manifest' && 'version' in value &&
       typeof value.version === 'number' && Number.isSafeInteger(value.version)) {
     if (value.version === 2) legacyManifest(value);
-    if (value.version >= 2 && value.version !== 3) throw new SyncProtocolVersionError(value.version);
+    if (value.version === 3) v3Manifest(value);
+    if (value.version >= 2 && value.version !== CURRENT_SYNC_VERSION) throw new SyncProtocolVersionError(value.version);
   }
   const manifest = manifestSchema.parse(value);
   validateParts(manifest.parts, manifest.partBytes);
   return manifest;
 }
 
-export async function readCachedManifest(path: string) {
+export async function readCachedManifest(path: string): Promise<SyncManifest | V3SyncManifest | LegacySyncManifest> {
   const value = await readManifestJSON(path);
   const latest = manifestSchema.safeParse(value);
   if (latest.success) {
     validateParts(latest.data.parts, latest.data.partBytes);
     return latest.data;
   }
+  const v3 = v3ManifestSchema.safeParse(value);
+  if (v3.success) {
+    validateParts(v3.data.parts, v3.data.partBytes);
+    return v3.data;
+  }
   return legacyManifest(value);
+}
+
+function v3Manifest(value: unknown): V3SyncManifest {
+  const previous = v3ManifestSchema.parse(value);
+  validateParts(previous.parts, previous.partBytes);
+  return previous;
 }
 
 function legacyManifest(value: unknown): LegacySyncManifest {
@@ -124,7 +153,19 @@ function legacyManifest(value: unknown): LegacySyncManifest {
   return legacy;
 }
 
-export async function readSyncDraft(path: string): Promise<SyncDraft | LegacySyncDraft> {
+function validateRangeDraft<T extends SyncDraft | V3SyncDraft>(draft: T): T {
+  validateParts(draft.parts, draft.partBytes);
+  if (draft.previous && draft.previous.generation >= draft.snapshot.generation) {
+    throw new Error('Invalid pending shared index generation');
+  }
+  const base = new Map(draft.previous?.parts.map((part) => [part.key, part.content]));
+  if (draft.parts.some((part) => part.key && base.get(part.key) !== part.content)) {
+    throw new Error('Invalid reused shared index part');
+  }
+  return draft;
+}
+
+export async function readSyncDraft(path: string): Promise<SyncDraft | V3SyncDraft | LegacySyncDraft> {
   const value = await readManifestJSON(path);
   if (typeof value === 'object' && value !== null && !('version' in value)) {
     const { snapshot, parts, previous } = legacyDraftSchema.parse(value);
@@ -136,16 +177,10 @@ export async function readSyncDraft(path: string): Promise<SyncDraft | LegacySyn
       generation: previous.generation, digest: previous.digest, parts: previous.keys.map((key) => ({ key })),
     } };
   }
-  const draft = draftSchema.parse(value);
-  validateParts(draft.parts, draft.partBytes);
-  if (draft.previous && draft.previous.generation >= draft.snapshot.generation) {
-    throw new Error('Invalid pending shared index generation');
+  if (typeof value === 'object' && value !== null && 'version' in value && value.version === 3) {
+    return validateRangeDraft(v3DraftSchema.parse(value));
   }
-  const base = new Map(draft.previous?.parts.map((part) => [part.key, part.content]));
-  if (draft.parts.some((part) => part.key && base.get(part.key) !== part.content)) {
-    throw new Error('Invalid reused shared index part');
-  }
-  return draft;
+  return validateRangeDraft(draftSchema.parse(value));
 }
 
 export async function readPublishedHead(

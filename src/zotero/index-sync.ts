@@ -4,22 +4,26 @@ import type { EngineType, IndexProgress, PluginConfig } from '../types/vectorize
 import type { ZoteroItem } from '../types/zotero.d.ts';
 import { PREF_BRANCH } from './config.ts';
 import { embeddingSettings, resolveEmbeddingProfile } from './embedding-profile.ts';
-import { extractItemMetadata, isIndexableRegularItem } from './extractor.ts';
+import {
+  extractItemMetadata, isIndexableRegularItem, isSyncContainerItem, SYNC_CONTAINER_ABSTRACT,
+  SYNC_CONTAINER_EXTRA_MARKER, SYNC_CONTAINER_ITEM_TYPE, SYNC_CONTAINER_TITLE,
+} from './extractor.ts';
 import {
   cloudEndpointDigest, LEGACY_MAX_BYTES, MIB, packVector, partFilename, prepareSyncParts, readFirstSyncRecord, readSyncSnapshot,
   SHARD_FILENAME, snapshotSize, syncHeader, syncSearchConfig,
   type RangePart, type ReceivedSnapshot, type SyncHeader, type SyncRecord,
 } from './sync-snapshot.ts';
 import {
-  acceptedPublication, fileDigest, matchesUnconfirmedManifest, MAX_MANIFEST_BYTES, openWebDavProbe,
+  acceptedPublication, CURRENT_SYNC_VERSION, fileDigest, matchesUnconfirmedManifest, MAX_MANIFEST_BYTES, openWebDavProbe,
   readCachedManifest, readPublishedHead, readSyncDraft,
   readSyncManifest, SyncProtocolVersionError, verifyPart, writeManifestFile,
   type AcceptedPublication, type LegacySyncDraft, type LegacySyncManifest, type SyncDraft, type SyncManifest,
+  type V3SyncDraft, type V3SyncManifest,
 } from './sync-publication.ts';
 import type { VectorStore } from './vector-store.ts';
 
 declare const __ZV_TEST_SYNC_PART_BYTES__: number;
-const TITLE = 'Zotero Vectorize Shared Index';
+const TITLE = SYNC_CONTAINER_TITLE;
 const FILENAME = 'zotero-vectorize.zvindex';
 const PART_TITLE = TITLE + ' Part';
 const ROLE = PREF_BRANCH + 'syncRole';
@@ -57,8 +61,8 @@ interface IndexSyncDeps {
 type RemoteFileProbe = (item: ZoteroItem, digest: string) => Promise<boolean>;
 type PublicationFile = { item: ZoteroItem; bytes: number; digest: string; content?: string };
 type PublishedHead = Awaited<ReturnType<typeof readPublishedHead>>;
-type Draft = SyncDraft | LegacySyncDraft;
-type PublishedManifest = SyncManifest | LegacySyncManifest;
+type Draft = SyncDraft | V3SyncDraft | LegacySyncDraft;
+type PublishedManifest = SyncManifest | V3SyncManifest | LegacySyncManifest;
 
 class SyncIssue extends Error {
   constructor(readonly phase: Exclude<SyncPhase, 'off' | 'working' | 'ready' | 'error'>) { super(phase); }
@@ -232,8 +236,13 @@ export class IndexSync {
     return ids.some((id) => {
       const item = Zotero.Items.get(Number(type === 'item-tag' ? String(id).split('-')[0] : id));
       if (!item) return type === 'item' && ['delete', 'trash'].includes(event);
-      return item.libraryID === Zotero.Libraries.userLibraryID &&
-        (item.isPDFAttachment() || item.isRegularItem?.() === true);
+      if (item.libraryID !== Zotero.Libraries.userLibraryID) return false;
+      if (item.isPDFAttachment()) {
+        const parent = typeof item.parentItemID === 'number' && item.parentItemID > 0
+          ? Zotero.Items.get(item.parentItemID) : null;
+        return !parent || !isSyncContainerItem(parent, true);
+      }
+      return item.isRegularItem?.() === true && !item.isFeedItem && !isSyncContainerItem(item, true);
     });
   }
 
@@ -368,12 +377,62 @@ export class IndexSync {
     return PathUtils.join(this.deps.store.getStoreDir(), 'shared-index-' + account);
   }
 
-  private async attachment(libraryID: number): Promise<ZoteroItem | undefined> {
-    const matches = (await Zotero.Items.getAll(libraryID, true, false)).filter((item) =>
-      !item.deleted && item.libraryID === libraryID && !item.parentItemID && item.isStoredFileAttachment?.() &&
-      item.getField('title') === TITLE && item.attachmentFilename === FILENAME);
-    if (matches.length > 1) throw new SyncIssue('conflict');
-    return matches[0];
+  private async getContainerAttachments(container: ZoteroItem): Promise<ZoteroItem[]> {
+    const ids = container.getAttachments?.(false) ?? [];
+    if (!ids.length) return [];
+    const loaded = await Zotero.Items.getAsync(ids);
+    const list: ZoteroItem[] = Array.isArray(loaded) ? loaded : loaded ? [loaded] : [];
+    return list.filter((item) => item && !item.deleted && item.libraryID === container.libraryID &&
+      item.parentItemID === container.id);
+  }
+
+  private isManifestAttachment(item: ZoteroItem, libraryID: number): boolean {
+    return !item.deleted && item.libraryID === libraryID && !!item.isStoredFileAttachment?.() &&
+      item.getField('title') === TITLE && item.attachmentFilename === FILENAME;
+  }
+
+  private async locateCarrier(libraryID: number): Promise<{
+    container: ZoteroItem | undefined;
+    carrier: ZoteroItem | undefined;
+    inContainer: boolean;
+  }> {
+    const topLevel = await Zotero.Items.getAll(libraryID, true, false);
+    const containers = topLevel.filter((item) => item.libraryID === libraryID && isSyncContainerItem(item));
+    if (containers.length > 1) throw new SyncIssue('conflict');
+    const container = containers[0];
+    const topCarriers = topLevel.filter((item) => !item.parentItemID && this.isManifestAttachment(item, libraryID));
+    const childCarriers = container
+      ? (await this.getContainerAttachments(container)).filter((item) => this.isManifestAttachment(item, libraryID))
+      : [];
+    if (topCarriers.length + childCarriers.length > 1) throw new SyncIssue('conflict');
+    if (childCarriers.length === 1) return { container, carrier: childCarriers[0], inContainer: true };
+    if (topCarriers.length === 1) return { container, carrier: topCarriers[0], inContainer: false };
+    return { container, carrier: undefined, inContainer: false };
+  }
+
+  private async ensureContainer(context: Context, epoch: number): Promise<{ container: ZoteroItem; created: boolean }> {
+    const { container } = await this.locateCarrier(context.libraryID);
+    if (!this.current(epoch, context)) throw new SyncIssue('waiting');
+    if (container) return { container, created: false };
+    if (!Zotero.Item) throw new SyncIssue('webdav');
+    const created = new Zotero.Item(SYNC_CONTAINER_ITEM_TYPE);
+    created.libraryID = context.libraryID;
+    created.setField?.('title', SYNC_CONTAINER_TITLE);
+    created.setField?.('extra', SYNC_CONTAINER_EXTRA_MARKER);
+    created.setField?.('abstractNote', SYNC_CONTAINER_ABSTRACT);
+    if (!created.saveTx) throw new SyncIssue('webdav');
+    await created.saveTx();
+    return { container: created, created: true };
+  }
+
+  private async moveToContainer(item: ZoteroItem, containerID: number): Promise<boolean> {
+    if (item.parentItemID === containerID) return false;
+    if (item.parentItemID) throw new SyncIssue('conflict');
+    if (!item.saveTx) throw new SyncIssue('webdav');
+    item.parentID = containerID;
+    if (item.parentItemID !== containerID) item.parentItemID = containerID;
+    await item.saveTx();
+    return true;
   }
 
   private pathFor(item: ZoteroItem): string {
@@ -391,7 +450,7 @@ export class IndexSync {
     const dir = PathUtils.join(this.deps.store.getStoreDir(), 'publish-' + context.account);
     const draftPath = PathUtils.join(dir, 'draft.json');
     const draft = await IOUtils.exists(draftPath) ? await readSyncDraft(draftPath) : undefined;
-    const item = await this.attachment(context.libraryID);
+    const { container, carrier: item, inContainer } = await this.locateCarrier(context.libraryID);
     if (!this.current(epoch, context)) return;
     const binding = Zotero.Prefs.get(BINDING, true);
     const publisher = Zotero.Prefs.get(PUBLISHER, true) || Zotero.Utilities.randomString?.(24);
@@ -415,13 +474,15 @@ export class IndexSync {
       }
       const candidate = head?.snapshot.generation === draft.snapshot.generation ? head : undefined;
       if (candidate && !this.matchesDraft(candidate, draft)) throw new SyncIssue('conflict');
-      if (draft.version === 2 || !await this.canResumeShards(context, draft, candidate)) {
-        if (await this.recoverDraft(context, epoch, dir, draft, item, head, candidate)) {
+      const allowLegacyShards = !inContainer || head?.version !== CURRENT_SYNC_VERSION;
+      if (draft.version !== CURRENT_SYNC_VERSION ||
+          !await this.canResumeShards(context, draft, candidate, container?.id, allowLegacyShards)) {
+        if (await this.recoverDraft(context, epoch, dir, draft, item, head, candidate, container)) {
           await this.publish(context, epoch, manual, Math.max(generationFloor, draft.snapshot.generation));
         }
         return;
       }
-      if (await this.finishPublication(context, epoch, dir, draft, candidate?.version === 3 ? candidate : undefined)) {
+      if (await this.finishPublication(context, epoch, dir, draft, candidate?.version === CURRENT_SYNC_VERSION ? candidate : undefined)) {
         // A preference change that triggered this run still needs a fresh publication check.
         await this.publish(context, epoch, manual);
       }
@@ -465,12 +526,14 @@ export class IndexSync {
     const store = this.deps.store;
     const profileId = profile.id;
     const maxPartBytes = this.partBytes();
-    const previousParts = head?.version === 3 ? head.parts : [];
+    const previousParts = head?.version === 3 || head?.version === CURRENT_SYNC_VERSION ? head.parts : [];
+    const allowLegacyReuse = head?.version === 3 || !inContainer;
     const reuse: (RangePart & { key?: string })[] = [];
     for (const part of previousParts) {
       const file = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, part.key);
       if (!this.current(epoch, context)) return;
-      if (this.isStoredPart(file, context.libraryID, SHARD_FILENAME)) {
+      if ((allowLegacyReuse && this.isStoredPartInContainerOrLegacy(file, context.libraryID, SHARD_FILENAME, container?.id)) ||
+          (container !== undefined && this.isStoredPart(file, context.libraryID, SHARD_FILENAME, container.id))) {
         this.isSynced(file, part.digest);
         reuse.push(part);
       } else {
@@ -479,9 +542,10 @@ export class IndexSync {
     }
     const libraryRevision = this.libraryRevision;
     const token = JSON.stringify([context.account, this.storeRevision, libraryRevision, settings, profileId, model, maxPartBytes]);
-    if (!manual && item && head?.version === 3 && reuse.every((part) => part.key) &&
+    if (!manual && item && inContainer && container && head?.version === CURRENT_SYNC_VERSION &&
+        reuse.every((part) => part.key) &&
         this.checkedSource?.digest === head.digest && this.checkedSource.token === token) {
-      await this.checkPublishedFiles(context, epoch, item, head, manual);
+      await this.checkPublishedFiles(context, epoch, container, item, head, manual);
       return;
     }
 
@@ -537,7 +601,8 @@ export class IndexSync {
             }
           }
         }
-        const parts = await prepareSyncParts(dir, records(this), maxPartBytes, reuse);
+        const previousPartBytes = head?.version === 3 || head?.version === CURRENT_SYNC_VERSION ? head.partBytes : undefined;
+        const parts = await prepareSyncParts(dir, records(this), maxPartBytes, reuse, previousPartBytes);
         if (!hasVector && !(sameModel && previous.dimensions === dimensions)) return;
         return { snapshot, parts };
       });
@@ -554,19 +619,19 @@ export class IndexSync {
         return;
       }
       const { snapshot, parts } = result;
-      if (item && head?.version === 3 && head.partBytes === maxPartBytes &&
+      if (item && inContainer && container && head?.version === CURRENT_SYNC_VERSION && head.partBytes === maxPartBytes &&
           JSON.stringify({ ...head.snapshot, generation: 0 }) === JSON.stringify({ ...snapshot, generation: 0 }) &&
           parts.length === previousParts.length && parts.every((part, i) =>
             part.key === previousParts[i].key && part.end === previousParts[i].end)) {
         this.checkedSource = { token, digest: head.digest };
-        await this.checkPublishedFiles(context, epoch, item, head, manual);
+        await this.checkPublishedFiles(context, epoch, container, item, head, manual);
         return;
       }
       if (!item) {
         if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
         await this.runNativeSync(context);
         if (!this.current(epoch, context)) return;
-        if (await this.attachment(context.libraryID)) throw new SyncIssue('conflict');
+        if ((await this.locateCarrier(context.libraryID)).carrier) throw new SyncIssue('conflict');
       } else if (await fileDigest(this.pathFor(item)) !== head?.digest) {
         throw new SyncIssue('conflict');
       }
@@ -575,7 +640,7 @@ export class IndexSync {
         generation: head.snapshot.generation, digest: head.digest,
         parts: head.parts.map((part) => ({ key: part.key, content: 'content' in part ? part.content : undefined })),
       } : null;
-      const pending: SyncDraft = { version: 3, snapshot, partBytes: maxPartBytes, parts, previous: base };
+      const pending: SyncDraft = { version: CURRENT_SYNC_VERSION, snapshot, partBytes: maxPartBytes, parts, previous: base };
       Zotero.Prefs.set(PUBLISHER, publisher, true);
       await writeManifestFile(draftPath, pending);
       prepared = true;
@@ -597,17 +662,30 @@ export class IndexSync {
     return `${PART_TITLE} ${publisher} ${generation} ${index + 1}`;
   }
 
-  private isStoredPart(item: ZoteroItem | false | undefined, libraryID: number, filename: string): item is ZoteroItem {
-    return !!item && !item.deleted && item.libraryID === libraryID && !item.parentItemID &&
+  private isStoredPart(
+    item: ZoteroItem | false | undefined, libraryID: number, filename: string, parentID: number | null,
+  ): item is ZoteroItem {
+    return !!item && !item.deleted && item.libraryID === libraryID &&
+      (parentID === null ? !item.parentItemID : item.parentItemID === parentID) &&
       !!item.isStoredFileAttachment?.() && item.attachmentFilename === filename;
   }
 
-  private isPart(item: ZoteroItem | false, libraryID: number, title: string, filename: string): item is ZoteroItem {
-    return this.isStoredPart(item, libraryID, filename) && item.getField('title') === title;
+  private isStoredPartInContainerOrLegacy(
+    item: ZoteroItem | false | undefined, libraryID: number, filename: string, containerID?: number,
+  ): item is ZoteroItem {
+    return (containerID !== undefined && this.isStoredPart(item, libraryID, filename, containerID)) ||
+      this.isStoredPart(item, libraryID, filename, null);
+  }
+
+  private isPart(
+    item: ZoteroItem | false, libraryID: number, title: string, filename: string, parentID: number | null,
+  ): item is ZoteroItem {
+    return this.isStoredPart(item, libraryID, filename, parentID) && item.getField('title') === title;
   }
 
   private async checkPublishedFiles(
-    context: Context, epoch: number, item: ZoteroItem, head: SyncManifest & { digest: string }, manual: boolean,
+    context: Context, epoch: number, container: ZoteroItem, item: ZoteroItem,
+    head: SyncManifest & { digest: string }, manual: boolean,
   ): Promise<void> {
     const sync = Zotero.Sync!;
     if (manual && item.attachmentSyncState !== sync.Storage.Local.SYNC_STATE_IN_SYNC) await this.runNativeSync(context);
@@ -620,7 +698,7 @@ export class IndexSync {
     for (const part of head.parts) {
       if (!this.current(epoch, context)) return;
       const file = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, part.key);
-      if (!this.isStoredPart(file, context.libraryID, SHARD_FILENAME)) {
+      if (!this.isStoredPart(file, context.libraryID, SHARD_FILENAME, container.id)) {
         this.checkedSource = null;
         this.schedule(300);
         throw new SyncIssue('waiting');
@@ -689,26 +767,33 @@ export class IndexSync {
     if (head.version !== draft.version || JSON.stringify(head.snapshot) !== JSON.stringify(draft.snapshot) ||
         head.parts.length !== draft.parts.length) return false;
     if (!draft.parts.every((part, i) => head.parts[i].bytes === part.bytes && head.parts[i].digest === part.digest)) return false;
-    if (draft.version !== 3 || head.version !== 3) return true;
+    if (draft.version === 2 || head.version === 2) return true;
     return head.partBytes === draft.partBytes && draft.parts.every((part, i) => {
       const current = head.parts[i];
       return part.content === current.content && part.end === current.end && (!part.key || part.key === current.key);
     });
   }
 
-  private async canResumeShards(context: Context, draft: SyncDraft, candidate: PublishedHead | undefined): Promise<boolean> {
-    for (const part of candidate?.version === 3 ? candidate.parts : draft.parts) {
+  private async canResumeShards(
+    context: Context, draft: SyncDraft, candidate: PublishedHead | undefined, containerID?: number, allowLegacy = false,
+  ): Promise<boolean> {
+    for (const part of candidate?.version === CURRENT_SYNC_VERSION ? candidate.parts : draft.parts) {
       if (!part.key) continue;
       const file = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, part.key);
-      if (!this.isStoredPart(file, context.libraryID, SHARD_FILENAME)) return false;
-      this.isSynced(file, part.digest);
+      if (allowLegacy) {
+        if (!this.isStoredPartInContainerOrLegacy(file, context.libraryID, SHARD_FILENAME, containerID)) return false;
+        this.isSynced(file, part.digest);
+      } else {
+        if (containerID === undefined || !this.isStoredPart(file, context.libraryID, SHARD_FILENAME, containerID)) return false;
+        this.isSynced(file, part.digest);
+      }
     }
     return true;
   }
 
   private async recoverDraft(
     context: Context, epoch: number, dir: string, draft: Draft, carrier: ZoteroItem | undefined,
-    head: PublishedHead | undefined, candidate: PublishedHead | undefined,
+    head: PublishedHead | undefined, candidate: PublishedHead | undefined, container?: ZoteroItem,
   ): Promise<boolean> {
     if (!this.current(epoch, context)) return false;
     const probe = await this.remoteProbe();
@@ -716,7 +801,8 @@ export class IndexSync {
       const inspect = await this.inspectRemoteFile();
       const state = await inspect(carrier, candidate.digest);
       if (!this.current(epoch, context)) return false;
-      const legacyPending = draft.version === 2 && candidate.version === 2 && state !== 'present';
+      const legacyPending = (draft.version === 2 || draft.version === 3) &&
+        (candidate.version === 2 || candidate.version === 3) && state !== 'present';
       if (legacyPending && state === 'conflict' &&
           (!draft.previous || await inspect(carrier, draft.previous.digest) !== 'present')) throw new SyncIssue('conflict');
       if (state === 'present' || (legacyPending && await this.legacyPartsAvailable(context, epoch, candidate, probe))) {
@@ -732,7 +818,7 @@ export class IndexSync {
           throw new SyncIssue('conflict');
         });
         if (!await this.retirePrevious(context, epoch, carrier, candidate.digest, probe, candidate.parts,
-          draft.snapshot.publisher, draft.previous)) return false;
+          draft.snapshot.publisher, draft.previous, container?.id)) return false;
         await IOUtils.remove(dir, { recursive: true });
         return this.current(epoch, context);
       }
@@ -770,9 +856,15 @@ export class IndexSync {
     }));
     const abandoned: number[] = [];
     if (pending.size) {
-      for (const file of await Zotero.Items.getAll(context.libraryID, true, false)) {
+      const candidates: ZoteroItem[] = [];
+      if (container) candidates.push(...await this.getContainerAttachments(container));
+      for (const top of await Zotero.Items.getAll(context.libraryID, true, false)) {
+        if (!top.parentItemID && top.isStoredFileAttachment?.()) candidates.push(top);
+      }
+      for (const file of candidates) {
         const owned = pending.get(file.getField('title'));
-        if (!owned || referenced.has(file.key) || !this.isStoredPart(file, context.libraryID, owned.filename) ||
+        if (!owned || referenced.has(file.key) ||
+            !this.isStoredPartInContainerOrLegacy(file, context.libraryID, owned.filename, container?.id) ||
             file.attachmentSyncState === Zotero.Sync!.Storage.Local.SYNC_STATE_IN_CONFLICT) continue;
         if (await verifyPart(this.pathFor(file), owned.part).then(() => true, () => false)) abandoned.push(file.id);
       }
@@ -791,7 +883,7 @@ export class IndexSync {
       if (!this.current(epoch, context)) return false;
       await this.runNativeSync(context);
       if (!this.current(epoch, context)) return false;
-      if (await this.attachment(context.libraryID)) {
+      if ((await this.locateCarrier(context.libraryID)).carrier) {
         this.schedule(300);
         throw new SyncIssue('waiting');
       }
@@ -804,16 +896,22 @@ export class IndexSync {
   }
 
   private async legacyPartsAvailable(
-    context: Context, epoch: number, head: LegacySyncManifest, probe: RemoteFileProbe,
+    context: Context, epoch: number, head: LegacySyncManifest | V3SyncManifest, probe: RemoteFileProbe,
   ): Promise<boolean> {
     // The carrier may already be queued to upload. Check each prerequisite before running native sync.
     for (const [i, part] of head.parts.entries()) {
       if (!this.current(epoch, context)) return false;
       const file = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, part.key);
-      if (!this.isPart(file, context.libraryID, this.legacyPartTitle(head.snapshot.publisher, head.snapshot.generation, i),
-        partFilename(i))) return false;
-      this.isSynced(file, part.digest);
-      if (!await probe(file, part.digest)) return false;
+      if (head.version === 2) {
+        if (!this.isPart(file, context.libraryID, this.legacyPartTitle(head.snapshot.publisher, head.snapshot.generation, i),
+          partFilename(i), null)) return false;
+        this.isSynced(file, part.digest);
+        if (!await probe(file, part.digest)) return false;
+      } else {
+        if (!this.isStoredPart(file, context.libraryID, SHARD_FILENAME, null)) return false;
+        this.isSynced(file, part.digest);
+        if (!await probe(file, part.digest)) return false;
+      }
     }
     return this.current(epoch, context);
   }
@@ -848,22 +946,25 @@ export class IndexSync {
     const { snapshot, parts, previous, partBytes } = draft;
     const { publisher } = snapshot;
     const probe = await this.remoteProbe();
-    const baseCarrier = previous && await this.attachment(context.libraryID);
+    const baseLocation = previous ? await this.locateCarrier(context.libraryID) : undefined;
+    const baseCarrier = baseLocation?.carrier;
     // A draft can outlive changes to the carrier from another Zotero sync.
-    if (baseCarrier && await fileDigest(this.pathFor(baseCarrier)) === previous.digest &&
+    if (previous && baseCarrier && await fileDigest(this.pathFor(baseCarrier)) === previous.digest &&
         !await probe(baseCarrier, previous.digest)) throw new SyncIssue('webdav');
+    const { container, created: createdContainer } = await this.ensureContainer(context, epoch);
+    if (!this.current(epoch, context)) return false;
     const importFile = async (file: string, title: string) => {
       if (!Zotero.Attachments.importFromFile) throw new SyncIssue('webdav');
       return Zotero.Attachments.importFromFile({
-        file, libraryID: context.libraryID, title, contentType: 'application/octet-stream',
+        file, libraryID: context.libraryID, parentItemID: container.id, title, contentType: 'application/octet-stream',
       });
     };
 
     const titles = new Set(candidate ? [] : parts.filter((part) => !part.key).map((part) => this.shardTitle(publisher, part.content)));
     const byTitle = new Map<string, ZoteroItem[]>();
     if (titles.size) {
-      for (const item of await Zotero.Items.getAll(context.libraryID, true, false)) {
-        if (!this.isStoredPart(item, context.libraryID, SHARD_FILENAME)) continue;
+      for (const item of await this.getContainerAttachments(container)) {
+        if (!this.isStoredPart(item, context.libraryID, SHARD_FILENAME, container.id)) continue;
         const title = item.getField('title');
         if (!titles.has(title)) continue;
         const entries = byTitle.get(title) ?? [];
@@ -872,14 +973,22 @@ export class IndexSync {
       }
     }
     const attachments: ZoteroItem[] = [];
+    let reparentedShards = false;
     for (const [i, part] of parts.entries()) {
       if (!this.current(epoch, context)) return false;
       const title = this.shardTitle(publisher, part.content);
       const key = candidate?.parts[i].key ?? part.key;
       let item = key ? await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, key) : undefined;
-      if (key && !this.isStoredPart(item, context.libraryID, SHARD_FILENAME)) {
-        this.schedule(300);
-        throw new SyncIssue('waiting');
+      if (key) {
+        if (this.isStoredPart(item, context.libraryID, SHARD_FILENAME, container.id)) {
+          // Already inside the sync container.
+        } else if (this.isStoredPart(item, context.libraryID, SHARD_FILENAME, null)) {
+          if (!this.isSynced(item, part.digest)) await verifyPart(this.pathFor(item), part);
+          if (await this.moveToContainer(item, container.id)) reparentedShards = true;
+        } else {
+          this.schedule(300);
+          throw new SyncIssue('waiting');
+        }
       }
       if (!key) {
         for (const file of byTitle.get(title) ?? []) {
@@ -901,25 +1010,28 @@ export class IndexSync {
     }
     if (!this.current(epoch, context)) return false;
     if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
-    if (attachments.some((item, i) => !this.isSynced(item, parts[i].digest))) {
+    const migratingCarrier = Boolean(baseLocation?.carrier && !baseLocation.inContainer);
+    if (createdContainer || reparentedShards || migratingCarrier ||
+        attachments.some((item, i) => !this.isSynced(item, parts[i].digest))) {
       await this.runNativeSync(context);
       if (!this.current(epoch, context)) return false;
       if (attachments.some((item, i) => !this.isSynced(item, parts[i].digest))) throw new SyncIssue('waiting');
     }
     const manifest: SyncManifest = {
-      type: 'zotero-vectorize-index-manifest', version: 3, snapshot, partBytes,
+      type: 'zotero-vectorize-index-manifest', version: CURRENT_SYNC_VERSION, snapshot, partBytes,
       parts: parts.map((part, i) => ({ ...part, key: attachments[i].key })),
     };
     const stage = PathUtils.join(dir, FILENAME);
     await writeManifestFile(stage, manifest);
     const digest = await fileDigest(stage);
-    let carrier = await this.attachment(context.libraryID);
+    let { carrier } = await this.locateCarrier(context.libraryID);
     if (!this.current(epoch, context)) return false;
     if (!await this.ensureRemoteParts(context, epoch, probe, parts.map((part, i) => ({ ...part, item: attachments[i] })))) {
       return false;
     }
     if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
     const binding = Zotero.Prefs.get(BINDING, true);
+    let reparentedCarrier = false;
     const release = sync.Runner.delayIndefinite();
     try {
       if (carrier) {
@@ -942,6 +1054,10 @@ export class IndexSync {
           }
         }
         if (!this.current(epoch, context)) return false;
+        if (carrier.parentItemID !== container.id) {
+          if (await this.moveToContainer(carrier, container.id)) reparentedCarrier = true;
+        }
+        if (!this.current(epoch, context)) return false;
         if (!this.isSynced(carrier, digest)) await sync.Storage.Local.updateSyncStates([carrier], 'to_upload');
       } else {
         if (binding || previous) throw new SyncIssue('conflict');
@@ -953,10 +1069,12 @@ export class IndexSync {
     }
     if (!this.current(epoch, context)) return false;
     if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
-    if (!this.isSynced(carrier, digest)) await this.runNativeSync(context);
+    if (!this.isSynced(carrier, digest) || reparentedCarrier) await this.runNativeSync(context);
     if (!this.current(epoch, context)) return false;
 
-    if (!await this.retirePrevious(context, epoch, carrier, digest, probe, manifest.parts, publisher, previous)) return false;
+    if (!await this.retirePrevious(context, epoch, carrier, digest, probe, manifest.parts, publisher, previous, container.id)) {
+      return false;
+    }
     await IOUtils.remove(dir, { recursive: true, ignoreAbsent: true });
     return this.current(epoch, context) && digest;
   }
@@ -964,6 +1082,7 @@ export class IndexSync {
   private async retirePrevious(
     context: Context, epoch: number, carrier: ZoteroItem, digest: string, probe: RemoteFileProbe,
     current: readonly PublishedManifest['parts'][number][], publisher: string, previous: SyncDraft['previous'],
+    containerID?: number,
   ): Promise<boolean> {
     const referenced = new Set(current.map((part) => part.key));
     const retired: number[] = [];
@@ -973,7 +1092,9 @@ export class IndexSync {
       needsRetirementSync = true;
       const item = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, key);
       const title = content ? this.shardTitle(publisher, content) : this.legacyPartTitle(publisher, previous!.generation, i);
-      if (this.isPart(item, context.libraryID, title, content ? SHARD_FILENAME : partFilename(i))) {
+      const filename = content ? SHARD_FILENAME : partFilename(i);
+      if (this.isStoredPartInContainerOrLegacy(item, context.libraryID, filename, containerID) &&
+          item.getField('title') === title) {
         retired.push(item.id);
       }
     }
@@ -995,7 +1116,7 @@ export class IndexSync {
         if (await fileDigest(this.pathFor(item)) !== digest) throw new SyncIssue('conflict');
         if (!this.isSynced(item, digest)) throw new SyncIssue('waiting');
         if (!await probe(item, digest)) throw new SyncIssue('webdav');
-      } else if (await this.attachment(context.libraryID)) {
+      } else if ((await this.locateCarrier(context.libraryID)).carrier) {
         throw new SyncIssue('conflict');
       }
       if (!this.current(epoch, context)) return false;
@@ -1030,8 +1151,9 @@ export class IndexSync {
       // Seed the durable identity for existing installations before reading potentially missing parts.
       if (!previous) this.rememberPublication(manifest.snapshot, digest);
       const parts = this.cacheParts(dir, digest);
-      const paths = manifest.version === 3
-        ? manifest.parts.map((part) => this.cachedPart(dir, part))
+      const rangeManifest = manifest.version === 3 || manifest.version === CURRENT_SYNC_VERSION ? manifest : null;
+      const paths = rangeManifest
+        ? rangeManifest.parts.map((part) => this.cachedPart(dir, part))
         : manifest.parts.map((_part, i) => PathUtils.join(parts, partFilename(i)));
       for (const [i, file] of paths.entries()) {
         if (!this.current(epoch, context)) return;
@@ -1039,7 +1161,7 @@ export class IndexSync {
       }
       await this.accept(manifest.snapshot, paths, context, epoch, digest, async () => {
         this.rememberPublication(manifest.snapshot, digest);
-      }, manifest.version === 3 ? manifest.parts : undefined);
+      }, rangeManifest?.parts, undefined, manifest.version === CURRENT_SYNC_VERSION);
     } else {
       // Preserve the last locally accepted snapshot through the beta protocol upgrade.
       const previous = dir + '.zvindex';
@@ -1049,7 +1171,7 @@ export class IndexSync {
       this.checkPublication(manifest, context, digest);
       await this.accept(manifest, [previous], context, epoch, digest, async () => {
         this.rememberPublication(manifest, digest);
-      }, undefined, LEGACY_MAX_BYTES);
+      }, undefined, LEGACY_MAX_BYTES, false);
     }
   }
 
@@ -1068,7 +1190,7 @@ export class IndexSync {
   }
 
   private async receive(context: Context, epoch: number): Promise<void> {
-    const item = await this.attachment(context.libraryID);
+    const { container, carrier: item, inContainer } = await this.locateCarrier(context.libraryID);
     if (!this.current(epoch, context)) return;
     if (!item) {
       this.releaseLocalIndexing();
@@ -1082,7 +1204,8 @@ export class IndexSync {
     const result = await sync.Runner.downloadFile(item);
     if (!this.current(epoch, context)) return;
     if (result === false || !await IOUtils.exists(dest)) throw new SyncIssue('webdav');
-    if (this.active?.currentProtocol && item.attachmentSyncedHash === this.active.digest && !this.needsReconcile) {
+    if (this.active?.currentProtocol && inContainer && container &&
+        item.attachmentSyncedHash === this.active.digest && !this.needsReconcile) {
       this.setPhase('ready');
       return;
     }
@@ -1097,12 +1220,13 @@ export class IndexSync {
       const digest = await fileDigest(stage);
       if (item.attachmentSyncedHash && digest !== item.attachmentSyncedHash) throw new Error('Shared index checksum changed');
       const manifest = await readSyncManifest(stage);
+      if (!container || !inContainer) throw new SyncIssue('conflict');
       this.checkPublication(manifest.snapshot, context, digest);
       observedDigest = digest;
       const paths = manifest.parts.map((part) => this.cachedPart(dir, part));
       const accepted = await readCachedManifest(cache).catch(() => null);
       const keep = new Set(paths);
-      if (accepted?.version === 3) {
+      if (accepted?.version === 3 || accepted?.version === CURRENT_SYNC_VERSION) {
         for (const part of accepted.parts) keep.add(this.cachedPart(dir, part));
       }
       if (accepted || (!this.active && !await IOUtils.exists(cache))) await this.pruneParts(dir, keep, false);
@@ -1113,7 +1237,7 @@ export class IndexSync {
         if (!verified) {
           const file = await Zotero.Items.getByLibraryAndKeyAsync(context.libraryID, part.key);
           if (!file || file.deleted) throw new SyncIssue('waiting');
-          if (!this.isStoredPart(file, context.libraryID, SHARD_FILENAME) ||
+          if (!this.isStoredPart(file, context.libraryID, SHARD_FILENAME, container.id) ||
               file.attachmentSyncState === sync.Storage.Local.SYNC_STATE_IN_CONFLICT) throw new SyncIssue('conflict');
           const source = this.pathFor(file);
           if (!await verifyPart(source, part).then(() => true, () => false)) {
@@ -1141,7 +1265,7 @@ export class IndexSync {
         if (!this.current(epoch, context)) return;
         await IOUtils.move(stage, cache);
         this.rememberPublication(manifest.snapshot, digest);
-      }, manifest.parts);
+      }, manifest.parts, undefined, true);
       if (this.current(epoch, context)) {
         const ready = this.active?.digest === digest && !this.needsReconcile;
         if (ready) {
@@ -1152,7 +1276,7 @@ export class IndexSync {
       }
     } catch (error) {
       if (error instanceof SyncProtocolVersionError) {
-        throw new SyncIssue(error.version < 3 ? 'upgradePublisher' : 'upgradeReceiver');
+        throw new SyncIssue(error.version < CURRENT_SYNC_VERSION ? 'upgradePublisher' : 'upgradeReceiver');
       }
       // The publisher can retire a part while we are reading a superseded manifest.
       if (observedDigest && error instanceof SyncIssue && ['waiting', 'webdav'].includes(error.phase) &&
@@ -1195,7 +1319,7 @@ export class IndexSync {
 
   private async accept(
     manifest: SyncHeader, paths: readonly string[], context: Context, epoch: number, digest: string,
-    commit?: () => Promise<void>, ranges?: readonly RangePart[], maxPartBytes?: number,
+    commit?: () => Promise<void>, ranges?: readonly RangePart[], maxPartBytes?: number, currentProtocol = false,
   ): Promise<void> {
     const libraryRevision = this.libraryRevision;
     const config = syncSearchConfig(manifest, this.deps.getConfig());
@@ -1230,7 +1354,7 @@ export class IndexSync {
       }
       adopted = true;
       this.needsReconcile = false;
-      this.setReceived({ ...received, provider, digest, currentProtocol: ranges !== undefined });
+      this.setReceived({ ...received, provider, digest, currentProtocol });
       this.releaseLocalIndexing();
     } finally {
       if (!adopted) void provider.dispose().catch(() => {});

@@ -698,6 +698,15 @@ test('registerSimilarPapersSection renders .zv-item-pane-box and .zv-similar-car
     assert.equal(okAtt, false);
     assert.equal(enabledState, false);
 
+    // Shared-index sync container item disables section
+    const syncContainer = {
+      id: 103, deleted: false, isRegularItem: () => true,
+      getField: (field) => field === 'extra' ? 'Zotero-Vectorize-Sync: container-v1' : 'Zotero Vectorize Shared Index',
+    };
+    const okContainer = registeredOpts.onItemChange({ item: syncContainer, setEnabled: (v) => { enabledState = v; } });
+    assert.equal(okContainer, false);
+    assert.equal(enabledState, false);
+
     unregister();
     assert.equal(unregisteredId, 'sec-1');
   } finally {
