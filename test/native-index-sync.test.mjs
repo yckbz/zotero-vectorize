@@ -2741,3 +2741,116 @@ test('container tolerates user rename, extra notes, and stray PDFs, while reject
   assert.equal(source.indexSync.getStatus().phase, 'conflict');
   assert.equal(transport.uploads, uploadsBefore);
 });
+
+test('small fragmented shards coalesce while preserving healthy shards, and larger part sizes compact shards', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 512;
+  // Seed enough papers across sorted keys so the snapshot spans 4+ shards at 512B.
+  const keys = Array.from({ length: 28 }, (_, i) => 'K' + String(i).padStart(7, '0'));
+  for (const [i, key] of keys.entries()) {
+    publisher.items.set(20 + i, publisher.makePaper(20 + i, key, 1, `Paper ${i} about diffusion`));
+  }
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const initial = transport.manifest;
+  assert.ok(initial.parts.length >= 4, `expected at least 4 initial shards, got ${initial.parts.length}`);
+
+  // Keep the leading full shard intact while shrinking multiple middle/trailing shards into small fragments.
+  const keepIndices = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 14, 21, 27]);
+  for (const [i] of keys.entries()) {
+    if (!keepIndices.has(i)) publisher.items.get(20 + i).deleted = true;
+  }
+  transport.partUploads.length = 0;
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const afterDelete = transport.manifest;
+  assert.ok(afterDelete.parts.length < initial.parts.length,
+    `expected fragmented shards to coalesce (${afterDelete.parts.length} < ${initial.parts.length})`);
+  // The untouched leading shard must be reused without re-upload.
+  assert.equal(afterDelete.parts[0].key, initial.parts[0].key);
+  assert.ok(!transport.partUploads.includes(initial.parts[0].key));
+
+  // A config-only update right after coalescing must be stable (no ping-pong re-sharding or uploads).
+  transport.partUploads.length = 0;
+  source.updateConfig({ hybridSemanticWeight: 0.4 });
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.deepEqual(transport.manifest.parts, afterDelete.parts);
+  assert.deepEqual(transport.partUploads, []);
+
+  // Increasing partBytes compacts multiple smaller shards into fewer larger shards.
+  publisher.flags.partBytes = 256;
+  source.indexSync.partBytes = () => publisher.flags.partBytes;
+  await source.indexSync.syncNow();
+  const fine = transport.manifest;
+  assert.ok(fine.parts.length >= 4, `expected at least 4 shards at 256B, got ${fine.parts.length}`);
+
+  publisher.flags.partBytes = 4096;
+  source.indexSync.partBytes = () => publisher.flags.partBytes;
+  transport.erased.length = 0;
+  await source.indexSync.syncNow();
+  const compacted = transport.manifest;
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(compacted.parts.length, 1, 'Increasing part size should compact small shards into one shard');
+  assert.equal(transport.erased.length, fine.parts.length, 'Superseded small shards must be retired');
+  await publisher.shutdown(source);
+
+  // Receiver syncs the compacted generation and resolves live papers cleanly.
+  const receiver = await createDevice('receiver', 100, 'receive');
+  for (const [i, key] of keys.entries()) {
+    if (!keepIndices.has(i)) continue;
+    receiver.items.set(200 + i, receiver.makePaper(200 + i, key, 1, `Paper ${i} about diffusion`));
+  }
+  const destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.active?.manifest.generation, compacted.snapshot.generation);
+  assert.ok(destination.indexSync.active?.index.getItemById(200));
+  assert.ok(destination.indexSync.active?.index.getItemById(227));
+});
+
+test('prepareSyncParts merges adjacent small shards between large shards without churning large neighbors', async (t) => {
+  await setup(t);
+  globalThis.Zotero = { Utilities: { Internal: { md5Async: async (file) => digest(await fs.readFile(file)) } } };
+  const { prepareSyncParts } = await importTs('src/zotero/sync-snapshot.ts');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zv-coalesce-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const makeRec = (idx) => ['item', 'A' + String(idx).padStart(7, '0'), '0'.repeat(16), null];
+  const makeStream = async function* (indices) {
+    for (const i of indices) yield makeRec(i);
+  };
+  // Build 2 large outer shards (each ~294 bytes at 400B limit) and 3 tiny middle shards (each ~49 bytes <= 100B).
+  const firstRun = await prepareSyncParts(path.join(dir, 'g1'), makeStream([1, 2, 3, 4, 5, 6]), 400, []);
+  assert.equal(firstRun.length, 1);
+  // Seed explicit fragmented previous ranges: [large(1..5), tiny(6), tiny(7), tiny(8), large(9..13)].
+  const all = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+  const fragSeed = [
+    { end: 'A0000006', bytes: 245, content: '0'.repeat(64), digest: '0'.repeat(32) },
+    { end: 'A0000007', bytes: 49, content: '1'.repeat(64), digest: '1'.repeat(32) },
+    { end: 'A0000008', bytes: 49, content: '2'.repeat(64), digest: '2'.repeat(32) },
+    { end: 'A0000009', bytes: 49, content: '3'.repeat(64), digest: '3'.repeat(32) },
+    { end: null, bytes: 245, content: '4'.repeat(64), digest: '4'.repeat(32) },
+  ];
+  // Compute real contents for the two outer large shards so they can be reused by key.
+  const outerLeft = (await prepareSyncParts(path.join(dir, 'l'), makeStream([1, 2, 3, 4, 5]), 400, []))[0];
+  const outerRight = (await prepareSyncParts(path.join(dir, 'r'), makeStream([9, 10, 11, 12, 13]), 400, []))[0];
+  const previous = [
+    { ...outerLeft, end: 'A0000006', key: 'LEFT0001' },
+    { ...fragSeed[1], key: 'TINY0001' },
+    { ...fragSeed[2], key: 'TINY0002' },
+    { ...fragSeed[3], key: 'TINY0003' },
+    { ...outerRight, end: null, key: 'RGHT0001' },
+  ];
+
+  const coalesced = await prepareSyncParts(path.join(dir, 'g2'), makeStream(all), 400, previous, 400);
+  assert.equal(coalesced.length, 3, 'Three tiny middle shards should coalesce into one shard between two preserved large shards');
+  assert.equal(coalesced[0].key, 'LEFT0001');
+  assert.equal(coalesced[1].key, undefined);
+  assert.equal(coalesced[2].key, 'RGHT0001');
+  assert.equal(coalesced[0].end, 'A0000006');
+  assert.equal(coalesced[1].end, 'A0000009');
+  assert.equal(coalesced[2].end, null);
+});

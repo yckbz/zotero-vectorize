@@ -154,9 +154,43 @@ export async function readFirstSyncRecord(path: string, maxLine?: number): Promi
   throw new Error('Shared index header is missing');
 }
 
+interface PlannedRange {
+  end: string | null;
+  bytes: number;
+  coalesceable: boolean;
+}
+
+function planSyncRanges(
+  previous: readonly (RangePart & { key?: string })[],
+  maxPartBytes: number,
+  previousPartBytes?: number,
+): PlannedRange[] {
+  if (previous.length <= 1) {
+    return previous.map((part) => ({ end: part.end, bytes: part.bytes, coalesceable: false }));
+  }
+  const grown = previousPartBytes !== undefined && previousPartBytes < maxPartBytes;
+  const smallLimit = grown
+    ? Math.min(previousPartBytes, Math.floor((maxPartBytes * 3) / 4))
+    : Math.floor(maxPartBytes / 4);
+  const mergeCap = grown ? maxPartBytes : Math.floor((maxPartBytes * 3) / 4);
+  const planned: PlannedRange[] = [];
+  for (const part of previous) {
+    const small = part.bytes <= smallLimit;
+    const prev = planned[planned.length - 1];
+    if (prev && prev.end !== null && prev.coalesceable && small && prev.bytes + part.bytes <= mergeCap) {
+      prev.bytes += part.bytes;
+      prev.end = part.end;
+    } else {
+      planned.push({ end: part.end, bytes: part.bytes, coalesceable: small });
+    }
+  }
+  return planned;
+}
+
 export async function prepareSyncParts(
   dir: string, records: AsyncIterable<SyncRecord>, maxPartBytes: number,
   previous: readonly (RangePart & { key?: string })[],
+  previousPartBytes?: number,
 ): Promise<(RangePart & { key?: string })[]> {
   if (!Number.isSafeInteger(maxPartBytes) || maxPartBytes < 1 || maxPartBytes > MAX_PART_BYTES) {
     throw new Error('Invalid shared index part size');
@@ -165,12 +199,31 @@ export async function prepareSyncParts(
   const buffer = new Uint8Array(maxPartBytes);
   const parts: (RangePart & { key?: string })[] = [];
   const byContent = new Map(previous.filter((part) => part.key).map((part) => [part.content, part]));
+  const planned = planSyncRanges(previous, maxPartBytes, previousPartBytes);
+  const streamSmallLimit = Math.floor(maxPartBytes / 4);
+  const streamMergeCap = Math.floor((maxPartBytes * 3) / 4);
   let used = 0;
   let total = 0;
   let range = 0;
   let last = '';
   let parent: string | undefined;
   let attachment: string | undefined;
+
+  const writeStagedPart = async (
+    data: Uint8Array<ArrayBuffer>, end: string | null,
+  ): Promise<RangePart & { key?: string }> => {
+    const content = await sha256(data);
+    const old = byContent.get(content);
+    if (old && old.bytes === data.length) {
+      return { ...old, end };
+    }
+    const stage = PathUtils.join(dir, content);
+    await IOUtils.makeDirectory(stage, { ignoreExisting: true });
+    const path = PathUtils.join(stage, SHARD_FILENAME);
+    await IOUtils.write(path, data);
+    const digest = md5Digest.parse(await Zotero.Utilities.Internal.md5Async(path));
+    return { end, bytes: data.length, content, digest };
+  };
 
   const finishPart = async (end: string | null) => {
     if (!used) {
@@ -179,19 +232,7 @@ export async function prepareSyncParts(
       return;
     }
     if (parts.length >= MAX_PARTS) throw new Error('Shared index exceeds the part count limit');
-    const data = buffer.subarray(0, used);
-    const content = await sha256(data);
-    const old = byContent.get(content);
-    if (old && old.bytes === used) {
-      parts.push({ ...old, end });
-    } else {
-      const stage = PathUtils.join(dir, content);
-      await IOUtils.makeDirectory(stage, { ignoreExisting: true });
-      const path = PathUtils.join(stage, SHARD_FILENAME);
-      await IOUtils.write(path, data);
-      const digest = md5Digest.parse(await Zotero.Utilities.Internal.md5Async(path));
-      parts.push({ end, bytes: used, content, digest });
-    }
+    parts.push(await writeStagedPart(buffer.subarray(0, used), end));
     used = 0;
   };
 
@@ -210,10 +251,16 @@ export async function prepareSyncParts(
     const bytes = encoder.encode(line + '\n');
     if (bytes.length > maxPartBytes) throw new Error('Shared index record exceeds the part size');
     if (total + bytes.length > MAX_SNAPSHOT_BYTES) throw new Error('Shared index exceeds the file size limit');
-    let end = previous[range]?.end;
-    while (end && key >= end) {
-      await finishPart(end);
-      end = previous[++range]?.end;
+    let current = planned[range];
+    while (current?.end && key >= current.end) {
+      const next = planned[range + 1];
+      if (used > 0 && next && used <= streamSmallLimit && next.bytes <= streamSmallLimit &&
+          used + next.bytes <= streamMergeCap) {
+        current = planned[++range];
+        continue;
+      }
+      await finishPart(current.end);
+      current = planned[++range];
     }
     if (used + bytes.length > maxPartBytes) await finishPart(key);
     buffer.set(bytes, used);
@@ -221,7 +268,48 @@ export async function prepareSyncParts(
     total += bytes.length;
   }
   await finishPart(null);
-  return parts;
+
+  // Coalesce any consecutive newly-written small shards produced by deletions or splits in the same generation.
+  const compacted: (RangePart & { key?: string })[] = [];
+  for (let i = 0; i < parts.length; ) {
+    const start = parts[i];
+    if (start.key || start.bytes > streamSmallLimit) {
+      compacted.push(start);
+      i++;
+      continue;
+    }
+    let j = i + 1;
+    let runBytes = start.bytes;
+    while (j < parts.length && !parts[j].key && parts[j].bytes <= streamSmallLimit &&
+        runBytes + parts[j].bytes <= streamMergeCap) {
+      runBytes += parts[j].bytes;
+      j++;
+    }
+    if (j === i + 1) {
+      compacted.push(start);
+      i++;
+      continue;
+    }
+    let offset = 0;
+    const removedDirs: string[] = [];
+    for (let k = i; k < j; k++) {
+      const pieceDir = PathUtils.join(dir, parts[k].content);
+      const chunk = await IOUtils.read(PathUtils.join(pieceDir, SHARD_FILENAME), { maxBytes: parts[k].bytes + 1 });
+      if (chunk.length !== parts[k].bytes) throw new Error('Staged shared index part size changed');
+      buffer.set(chunk, offset);
+      offset += chunk.length;
+      removedDirs.push(pieceDir);
+    }
+    const merged = await writeStagedPart(buffer.subarray(0, offset), parts[j - 1].end);
+    for (const pieceDir of removedDirs) {
+      if (PathUtils.filename(pieceDir) !== merged.content) {
+        await IOUtils.remove(pieceDir, { recursive: true, ignoreAbsent: true });
+      }
+    }
+    compacted.push(merged);
+    i = j;
+  }
+  return compacted;
 }
 
 export interface ReceivedSnapshot {

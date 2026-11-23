@@ -601,7 +601,8 @@ export class IndexSync {
             }
           }
         }
-        const parts = await prepareSyncParts(dir, records(this), maxPartBytes, reuse);
+        const previousPartBytes = head?.version === 3 || head?.version === CURRENT_SYNC_VERSION ? head.partBytes : undefined;
+        const parts = await prepareSyncParts(dir, records(this), maxPartBytes, reuse, previousPartBytes);
         if (!hasVector && !(sameModel && previous.dimensions === dimensions)) return;
         return { snapshot, parts };
       });
