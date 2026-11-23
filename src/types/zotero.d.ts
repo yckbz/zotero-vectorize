@@ -117,6 +117,7 @@ export interface ZoteroItem {
   itemType: string;
   deleted: boolean;
   isFeedItem?: boolean;
+  parentID?: number | false;
   parentItemID?: number | false;
   parentItem?: ZoteroItem | null;
   attachmentContentType?: string;
@@ -131,6 +132,7 @@ export interface ZoteroItem {
   isPDFAttachment(): boolean;
   isStoredFileAttachment?(): boolean;
   addTag?(tag: string): void;
+  setField?(field: string, value: string): void;
   saveTx?(): Promise<number | false>;
   getField(field: string, unformatted?: boolean, includeBaseMapped?: boolean): string;
   getCreators(): Array<{ firstName?: string; lastName?: string; name?: string; creatorTypeID?: number }>;
@@ -181,6 +183,7 @@ export interface ZoteroNamespace {
   Collections: {
     getByLibrary(libraryID: number, recursive?: boolean): ZoteroCollection[];
   };
+  Item?: new (itemType: string) => ZoteroItem;
   Items: {
     get(ids: number): ZoteroItem | false;
     get(ids: number[]): ZoteroItem[];
@@ -194,7 +197,13 @@ export interface ZoteroNamespace {
   Attachments: {
     LINK_MODE_LINKED_FILE: number;
     getStorageDirectory(item: ZoteroItem): { path: string };
-    importFromFile?(options: { file: string; libraryID: number; title: string; contentType: string }): Promise<ZoteroItem>;
+    importFromFile?(options: {
+      file: string;
+      libraryID: number;
+      parentItemID?: number;
+      title: string;
+      contentType: string;
+    }): Promise<ZoteroItem>;
   };
   Sync?: {
     Runner: {

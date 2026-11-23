@@ -12,6 +12,7 @@ const PREFIX = 'extensions.zotero-vectorize.';
 const MODEL_REVISION = 'a'.repeat(32) + ':' + 'b'.repeat(32);
 const SHARED_FILE = 'zotero-vectorize.zvindex';
 const TITLE = 'Zotero Vectorize Shared Index';
+const CONTAINER_EXTRA = 'Zotero-Vectorize-Sync: container-v1';
 const digest = (data) => createHash('md5').update(data).digest('hex');
 const pdfBytes = Buffer.from('unchanged synthetic PDF');
 
@@ -22,10 +23,23 @@ async function setup(t) {
   const { OpenAICompatProvider } = await importTs('src/engines/openai.ts');
   const { OllamaEmbeddingProvider } = await importTs('src/engines/ollama.ts');
   const remote = new Map();
+  const containers = new Map();
   let nextKey = 0;
+  let nextContainerKey = 0;
   const allocateKey = () => 'PART' + String(++nextKey).padStart(4, '0');
+  const allocateContainerKey = () => 'CONT' + String(++nextContainerKey).padStart(4, '0');
+  const ensureRemoteContainer = () => {
+    const existing = [...containers.keys()][0];
+    if (existing) return existing;
+    const key = allocateContainerKey();
+    containers.set(key, {
+      key, itemType: 'document', libraryID: 1,
+      fields: { title: TITLE, extra: CONTAINER_EXTRA, abstractNote: 'Shared index container' },
+    });
+    return key;
+  };
   const transport = {
-    remote, offline: false, errors: 0, uploads: 0, downloads: 0, syncs: 0,
+    remote, containers, offline: false, errors: 0, uploads: 0, downloads: 0, syncs: 0,
     partUploads: [], partDownloads: [], erased: [], missingMetadata: new Set(), missingFiles: new Set(),
     missingProps: new Set(), remoteHashes: new Map(), probes: [], forcedUploads: [],
     get manifest() {
@@ -33,7 +47,9 @@ async function setup(t) {
       return head ? JSON.parse(String(head.bytes)) : null;
     },
     set manifest(data) {
-      remote.set('INDEX001', { title: TITLE, filename: SHARED_FILE, bytes: Buffer.from(JSON.stringify(data) + '\n') });
+      const existing = remote.get('INDEX001');
+      const parentKey = existing?.parentKey ?? (data?.version >= 4 ? ensureRemoteContainer() : undefined);
+      remote.set('INDEX001', { title: TITLE, filename: SHARED_FILE, parentKey, bytes: Buffer.from(JSON.stringify(data) + '\n') });
     },
     get bytes() {
       const manifest = this.manifest;
@@ -50,10 +66,16 @@ async function setup(t) {
       const payload = Buffer.from(lines.join('\n') + '\n');
       const content = createHash('sha256').update(payload).digest('hex');
       const key = allocateKey();
+      const parentKey = ensureRemoteContainer();
       remote.set(key, { title: `${TITLE} Part ${snapshot.publisher} ${content}`,
-        filename: 'zotero-vectorize-shard.zvpart', bytes: payload });
-      this.manifest = { type: 'zotero-vectorize-index-manifest', version: 3, snapshot, partBytes: 32 * 1024 * 1024,
-        parts: [{ key, bytes: payload.length, digest: digest(payload), content, end: null }] };
+        filename: 'zotero-vectorize-shard.zvpart', parentKey, bytes: payload });
+      remote.set('INDEX001', {
+        title: TITLE, filename: SHARED_FILE, parentKey,
+        bytes: Buffer.from(JSON.stringify({
+          type: 'zotero-vectorize-index-manifest', version: 4, snapshot, partBytes: 32 * 1024 * 1024,
+          parts: [{ key, bytes: payload.length, digest: digest(payload), content, end: null }],
+        }) + '\n'),
+      });
     },
   };
   const live = new Set();
@@ -178,12 +200,53 @@ async function setup(t) {
 
     const observers = new Map();
     let nextItemId = 4 + shift;
-    const makeAttachment = (key, attachmentFilename, title) => ({
-      id: nextItemId++, key, libraryID: 1, itemType: 'attachment', attachmentFilename,
-      attachmentSyncState: 0,
-      isRegularItem: () => false, isAttachment: () => true, isPDFAttachment: () => false, isStoredFileAttachment: () => true,
-      getField: (field) => field === 'title' ? title : '',
-    });
+    const isEffectivelyDeleted = (item) => {
+      if (!item || item.deleted) return true;
+      if (item.parentItemID) {
+        const parent = items.get(item.parentItemID);
+        if (parent?.deleted) return true;
+      }
+      return false;
+    };
+    const makeContainer = (key, fields = {}, itemType = 'document', libraryID = 1) => {
+      const fieldMap = new Map(Object.entries(fields));
+      const container = {
+        id: 0, key: key || '', libraryID, itemType, deleted: false,
+        setField: (field, value) => fieldMap.set(field, String(value ?? '')),
+        getField: (field) => fieldMap.get(field) ?? '',
+        getDisplayTitle: () => fieldMap.get('title') ?? '',
+        isRegularItem: () => true, isAttachment: () => false, isPDFAttachment: () => false, isStoredFileAttachment: () => false,
+        getCreators: () => [], getTags: () => [], getCollections: () => [],
+        getAttachments: (includeTrashed = false) => [...items.values()]
+          .filter((child) => child.isAttachment?.() && child.parentItemID === container.id && (includeTrashed || !isEffectivelyDeleted(child)))
+          .map((child) => child.id),
+        saveTx: async () => {
+          if (!container.id) container.id = nextItemId++;
+          if (!container.key) container.key = allocateContainerKey();
+          items.set(container.id, container);
+          return container.id;
+        },
+      };
+      return container;
+    };
+    class MockZoteroItem {
+      constructor(itemType) {
+        return makeContainer('', {}, itemType, 1);
+      }
+    }
+    const makeAttachment = (key, attachmentFilename, title, parentItemID = false) => {
+      const att = {
+        id: nextItemId++, key, libraryID: 1, itemType: 'attachment', attachmentFilename,
+        attachmentSyncState: 0,
+        parentItemID: parentItemID || false,
+        get parentID() { return this.parentItemID; },
+        set parentID(value) { this.parentItemID = value || false; },
+        isRegularItem: () => false, isAttachment: () => true, isPDFAttachment: () => false, isStoredFileAttachment: () => true,
+        getField: (field) => field === 'title' ? title : '',
+        saveTx: async () => att.id,
+      };
+      return att;
+    };
     const carrier = makeAttachment('INDEX001', SHARED_FILE, TITLE);
     const eraseQueue = new Set();
     const attachmentPath = (item) => path.join(storage(item.key), item.attachmentFilename);
@@ -206,18 +269,21 @@ async function setup(t) {
     }
     const zotero = {
       DBConnection: SqliteConnection,
+      Item: MockZoteroItem,
       Users: { getCurrentUserID: () => flags.account },
       Prefs: { get: (key) => prefs.get(key), set: (key, value) => prefs.set(key, value),
         registerObserver: () => Symbol(), unregisterObserver() {} },
       Libraries: { userLibraryID: 1, getAll: () => [{ libraryID: 1, libraryType: 'user' }, { libraryID: 2, libraryType: 'group' }] },
       Items: {
         get: (id) => items.get(id),
-        getAsync: async (id) => items.get(id),
-        getAll: async (libraryID) => [...items.values()].filter((item) => item.libraryID === libraryID && !item.deleted),
+        getAsync: async (ids) => Array.isArray(ids) ? ids.map((id) => items.get(id)).filter(Boolean) : items.get(ids),
+        getAll: async (libraryID, onlyTopLevel = false, includeDeleted = false) => [...items.values()].filter((item) =>
+          item.libraryID === libraryID && (includeDeleted || !isEffectivelyDeleted(item)) && (!onlyTopLevel || !item.parentItemID)),
         getByLibraryAndKeyAsync: async (libraryID, key) => [...items.values()].find((item) => item.libraryID === libraryID && item.key === key),
         erase: async (ids) => {
           for (const id of ids) {
             const item = items.get(id);
+            if (!item) continue;
             eraseQueue.add(item.key);
             items.delete(id);
             await fs.rm(storage(item.key), { recursive: true, force: true });
@@ -226,10 +292,16 @@ async function setup(t) {
       },
       Attachments: {
         getStorageDirectory: (item) => ({ path: storage(item.key) }),
-        importFromFile: async ({ file, libraryID, title }) => {
+        importFromFile: async ({ file, libraryID, parentItemID, title }) => {
           assert.equal(libraryID, 1);
           const filename = path.basename(file);
-          const item = filename === SHARED_FILE ? carrier : makeAttachment(allocateKey(), filename, title);
+          let item;
+          if (filename === SHARED_FILE) {
+            item = carrier;
+            item.parentItemID = parentItemID || false;
+          } else {
+            item = makeAttachment(allocateKey(), filename, title, parentItemID || false);
+          }
           await fs.mkdir(storage(item.key), { recursive: true });
           await fs.copyFile(file, attachmentPath(item));
           items.set(item.id, item);
@@ -276,6 +348,25 @@ async function setup(t) {
               onError(new Error('offline'));
             } else if (!shift) {
               for (const item of items.values()) {
+                if (item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA)) {
+                  if (item.deleted) {
+                    containers.delete(item.key);
+                  } else {
+                    containers.set(item.key, {
+                      key: item.key, itemType: item.itemType, libraryID: item.libraryID,
+                      fields: { title: item.getField('title'), extra: item.getField('extra'), abstractNote: item.getField('abstractNote') },
+                    });
+                  }
+                }
+              }
+              for (const item of items.values()) {
+                if (!item.isAttachment?.() || item.isPDFAttachment?.()) continue;
+                const parentKey = item.parentItemID ? items.get(item.parentItemID)?.key : undefined;
+                if (remote.has(item.key)) {
+                  const existing = remote.get(item.key);
+                  existing.parentKey = parentKey;
+                  existing.title = item.getField('title');
+                }
                 if (![0, 3].includes(item.attachmentSyncState)) continue;
                 try {
                   await transport.beforeUpload?.(item);
@@ -284,7 +375,7 @@ async function setup(t) {
                   return;
                 }
                 const bytes = await fs.readFile(attachmentPath(item));
-                remote.set(item.key, { title: item.getField('title'), filename: item.attachmentFilename, bytes });
+                remote.set(item.key, { title: item.getField('title'), filename: item.attachmentFilename, parentKey, bytes });
                 transport.missingFiles.delete(item.key);
                 transport.missingProps.delete(item.key);
                 transport.remoteHashes.delete(item.key);
@@ -301,13 +392,32 @@ async function setup(t) {
                   return;
                 }
                 remote.delete(key);
+                containers.delete(key);
                 eraseQueue.delete(key);
                 transport.erased.push(key);
               }
             } else {
+              for (const [key, data] of containers) {
+                if (transport.missingMetadata.has(key)) continue;
+                let existing = [...items.values()].find((item) => item.key === key);
+                if (!existing) {
+                  existing = makeContainer(key, data.fields, data.itemType, data.libraryID);
+                  await existing.saveTx();
+                } else {
+                  for (const [field, value] of Object.entries(data.fields)) existing.setField?.(field, value);
+                }
+              }
               for (const [key, file] of remote) {
-                if (transport.missingMetadata.has(key) || [...items.values()].some((item) => item.key === key)) continue;
-                const item = key === carrier.key ? carrier : makeAttachment(key, file.filename, file.title);
+                if (transport.missingMetadata.has(key)) continue;
+                const parent = file.parentKey ? [...items.values()].find((item) => item.key === file.parentKey) : undefined;
+                const parentItemID = parent?.id || false;
+                const existing = [...items.values()].find((item) => item.key === key);
+                if (existing) {
+                  existing.parentItemID = parentItemID;
+                  continue;
+                }
+                const item = key === carrier.key ? carrier : makeAttachment(key, file.filename, file.title, parentItemID);
+                item.parentItemID = parentItemID;
                 items.set(item.id, item);
               }
             }
@@ -1675,7 +1785,13 @@ test('a beta publisher upgrades its bound attachment while a beta receiver can s
 
   const carrier = transport.remote.get('INDEX001');
   carrier.bytes = legacy;
+  carrier.parentKey = undefined;
   original.parts.forEach(({ key }) => transport.remote.delete(key));
+  transport.containers.clear();
+  for (const [id, item] of [...publisher.items.entries()]) {
+    if (item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA)) publisher.items.delete(id);
+  }
+  publisher.carrier.parentItemID = false;
   await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), legacy);
   publisher.carrier.attachmentSyncedHash = digest(legacy);
 
@@ -1718,15 +1834,24 @@ async function seedV2Head(publisher, transport) {
   const legacyBytes = transport.bytes;
   const filename = 'zotero-vectorize-part-1.zvpart';
   const title = `${TITLE} Part ${snapshot.publisher} ${snapshot.generation} 1`;
-  transport.remote.set(key, { title, filename, bytes: legacyBytes });
+  transport.containers.clear();
+  for (const [id, item] of [...publisher.items.entries()]) {
+    if (item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA)) publisher.items.delete(id);
+  }
+  transport.remote.set(key, { title, filename, parentKey: undefined, bytes: legacyBytes });
   const attachment = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, key);
+  attachment.parentItemID = false;
   attachment.attachmentFilename = filename;
   attachment.getField = (field) => field === 'title' ? title : '';
   await fs.writeFile(path.join(publisher.dir, 'storage', key, filename), legacyBytes);
-  transport.manifest = {
-    type: 'zotero-vectorize-index-manifest', version: 2, snapshot,
-    parts: [{ key, bytes: legacyBytes.length, digest: digest(legacyBytes) }],
-  };
+  publisher.carrier.parentItemID = false;
+  transport.remote.set('INDEX001', {
+    title: TITLE, filename: SHARED_FILE, parentKey: undefined,
+    bytes: Buffer.from(JSON.stringify({
+      type: 'zotero-vectorize-index-manifest', version: 2, snapshot,
+      parts: [{ key, bytes: legacyBytes.length, digest: digest(legacyBytes) }],
+    }) + '\n'),
+  });
   const head = transport.remote.get('INDEX001').bytes;
   publisher.carrier.attachmentSyncedHash = digest(head);
   await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), head);
@@ -1761,12 +1886,13 @@ test('v2 ownership and offline cache survive a coordinated cutover and the old p
   await receiver.shutdown(destination);
 
   source = await publisher.start();
-  transport.beforeErase = () => assert.equal(transport.manifest.version, 3);
+  transport.beforeErase = () => assert.equal(transport.manifest.version, 4);
   await source.indexSync.syncNow();
   assert.equal(source.indexSync.getStatus().phase, 'ready');
-  assert.equal(transport.manifest.version, 3);
+  assert.equal(transport.manifest.version, 4);
   assert.deepEqual(transport.erased, [key]);
   assert.equal(publisher.items.get(4), publisher.carrier);
+  assert.ok(publisher.carrier.parentItemID);
   await publisher.shutdown(source);
 
   destination = await receiver.start();
@@ -1791,7 +1917,8 @@ test('a fresh receiver distinguishes old and new sync formats from malformed man
   const destination = await receiver.start();
   for (const [manifest, phase] of [
     [legacy, 'upgradePublisher'],
-    [{ ...latest, version: 4 }, 'upgradeReceiver'],
+    [{ ...latest, version: 3 }, 'upgradePublisher'],
+    [{ ...latest, version: 5 }, 'upgradeReceiver'],
     [{ ...legacy, parts: [] }, 'error'],
   ]) {
     transport.manifest = manifest;
@@ -1889,9 +2016,9 @@ test('a v2 draft is reconciled before publishing v3 across interruption stages',
       }
       await source.indexSync.syncNow();
       assert.equal(source.indexSync.getStatus().phase, 'ready');
-      assert.equal(transport.manifest.version, 3);
+      assert.equal(transport.manifest.version, 4);
       assert.ok(transport.manifest.snapshot.generation > next.generation);
-      assert.deepEqual(uploads, ['carrier pending', 'carrier ZIP without metadata'].includes(step) ? [2, 3] : [3]);
+      assert.deepEqual(uploads, ['carrier pending', 'carrier ZIP without metadata'].includes(step) ? [2, 4] : [4]);
       assert.ok(!transport.remote.has(partItem.key));
       assert.ok(!transport.remote.has(key));
       await assert.rejects(fs.stat(draftPath), { code: 'ENOENT' });
@@ -2333,4 +2460,284 @@ test('one check resumes an acknowledged draft and publishes the newly selected p
   assert.deepEqual(transport.manifest.parts, first.parts);
   await source.indexSync.syncNow();
   assert.equal(transport.uploads, 2);
+});
+
+test('all sync files live under one document container and are excluded from indexing, notifications, and search', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 256;
+  publisher.prefs.set(PREFIX + 'autoIndexOnChange', true);
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(transport.manifest.version, 4);
+  assert.ok(transport.manifest.parts.length >= 2);
+
+  const pubTop = await publisher.zotero.Items.getAll(1, true, false);
+  const pubContainers = pubTop.filter((item) => item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA));
+  assert.equal(pubContainers.length, 1);
+  const [container] = pubContainers;
+  assert.equal(container.itemType, 'document');
+  assert.equal(container.getField('title'), TITLE);
+  assert.ok(container.getField('abstractNote').includes('Zotero Vectorize'));
+  assert.deepEqual(pubTop.filter((item) => item.isAttachment?.()), [], 'No standalone sync attachments at top level');
+  const childIDs = new Set(container.getAttachments(false));
+  assert.equal(childIDs.size, 1 + transport.manifest.parts.length);
+  assert.ok(childIDs.has(publisher.carrier.id));
+  for (const part of transport.manifest.parts) {
+    const file = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, part.key);
+    assert.equal(file.parentItemID, container.id);
+    assert.ok(childIDs.has(file.id));
+  }
+
+  // Indexing the whole library or explicitly indexing the container and its attachments must ignore the container.
+  const callsBefore = publisher.events.calls.length;
+  await source.startIndexing();
+  await source.indexItems([container.id, publisher.carrier.id, ...childIDs], true);
+  assert.equal(source.searchIndex.getItemById(container.id), undefined);
+  assert.equal((await source.getStats()).indexedItems, 2);
+  assert.equal(publisher.events.calls.length, callsBefore);
+  assert.equal((await source.search(TITLE)).hits.some((hit) => hit.itemID === container.id), false);
+
+  // Notifier events for the container or its child shards must not wake indexing or schedule re-publication.
+  const shardId = [...childIDs].find((id) => id !== publisher.carrier.id);
+  const revBefore = source.indexSync.libraryRevision;
+  for (const { notify } of publisher.observers.values()) {
+    notify('modify', 'item', [container.id, shardId]);
+  }
+  assert.equal(source.indexSync.libraryRevision, revBefore);
+  await source.indexer.indexItemOrAttachmentIds([container.id, shardId], false, true);
+  assert.equal(source.searchIndex.getItemById(container.id), undefined);
+  await publisher.shutdown(source);
+
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  const recTop = await receiver.zotero.Items.getAll(1, true, false);
+  const recContainers = recTop.filter((item) => item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA));
+  assert.equal(recContainers.length, 1);
+  assert.deepEqual(recTop.filter((item) => item.isAttachment?.()), [], 'Receiver must not have standalone sync attachments');
+  assert.equal(recContainers[0].getAttachments(false).length, 1 + transport.manifest.parts.length);
+  assert.equal((await destination.search(TITLE)).hits.some((hit) => hit.itemID === recContainers[0].id), false);
+});
+
+test('v3 to v4 in-place migration moves existing shards into one container with zero WebDAV shard re-transfers', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 256;
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const seeded = transport.manifest;
+  assert.ok(seeded.parts.length >= 2);
+  await publisher.shutdown(source);
+
+  // Downgrade local & remote state to a confirmed v3 standalone layout (no container, top-level manifest & shards).
+  transport.containers.clear();
+  for (const [id, item] of [...publisher.items.entries()]) {
+    if (item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA)) publisher.items.delete(id);
+  }
+  const v3Manifest = { ...seeded, version: 3 };
+  const v3HeadBytes = Buffer.from(JSON.stringify(v3Manifest) + '\n');
+  publisher.carrier.parentItemID = false;
+  publisher.carrier.attachmentSyncedHash = digest(v3HeadBytes);
+  await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), v3HeadBytes);
+  transport.remote.set('INDEX001', { title: TITLE, filename: SHARED_FILE, parentKey: undefined, bytes: v3HeadBytes });
+  for (const part of v3Manifest.parts) {
+    const file = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, part.key);
+    file.parentItemID = false;
+    transport.remote.get(part.key).parentKey = undefined;
+  }
+
+  // Seed receiver with an offline v3 cache containing the same shards.
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const cacheDir = path.join(receiver.dir, 'zotero-vectorize', 'shared-index-101');
+  const shardsDir = path.join(cacheDir, 'shards');
+  await fs.mkdir(shardsDir, { recursive: true });
+  await fs.writeFile(path.join(cacheDir, 'current.zvmanifest'), v3HeadBytes);
+  for (const part of v3Manifest.parts) {
+    await fs.writeFile(path.join(shardsDir, `${part.key}-${part.content}.zvpart`), transport.remote.get(part.key).bytes);
+  }
+
+  // Before publisher upgrades, receiver stays searchable offline and reports upgradePublisher online.
+  transport.offline = true;
+  let destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.active?.manifest.generation, v3Manifest.snapshot.generation);
+  assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+  transport.offline = false;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'upgradePublisher');
+  assert.equal(destination.indexSync.active?.manifest.generation, v3Manifest.snapshot.generation);
+  await receiver.shutdown(destination);
+
+  // Publisher migrates v3 -> v4 in-place without re-uploading any shard bytes to WebDAV.
+  transport.partUploads.length = 0;
+  source = await publisher.start();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(transport.manifest.version, 4);
+  assert.deepEqual(transport.partUploads, [], 'Unchanged v3 shards must not be re-uploaded to WebDAV');
+  assert.deepEqual(transport.manifest.parts.map((part) => part.key), v3Manifest.parts.map((part) => part.key));
+  const pubTop = await publisher.zotero.Items.getAll(1, true, false);
+  assert.deepEqual(pubTop.filter((item) => item.isAttachment?.()), []);
+  const [container] = pubTop.filter((item) => item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA));
+  assert.ok(container);
+  assert.equal(publisher.carrier.parentItemID, container.id);
+  await publisher.shutdown(source);
+
+  // Receiver upgrades to v4 and reuses its cached shards with zero WebDAV shard downloads.
+  transport.partDownloads.length = 0;
+  destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  assert.equal(destination.indexSync.active?.manifest.generation, transport.manifest.snapshot.generation);
+  assert.deepEqual(transport.partDownloads, [], 'Receiver should reuse cached v3 shards with zero WebDAV downloads');
+  assert.equal((await destination.search('diffusion')).hits[0]?.itemID, 101);
+});
+
+test('interrupted v3 draft and interrupted v3-to-v4 mid-reparenting recover cleanly', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 256;
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const base = transport.manifest;
+  assert.ok(base.parts.length >= 2);
+  await publisher.shutdown(source);
+
+  // Create a v3 standalone state with an interrupted v3 draft whose candidate was never uploaded.
+  transport.containers.clear();
+  for (const [id, item] of [...publisher.items.entries()]) {
+    if (item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA)) publisher.items.delete(id);
+  }
+  const v3Head = { ...base, version: 3 };
+  const v3HeadBytes = Buffer.from(JSON.stringify(v3Head) + '\n');
+  publisher.carrier.parentItemID = false;
+  publisher.carrier.attachmentSyncedHash = digest(v3HeadBytes);
+  await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), v3HeadBytes);
+  transport.remote.set('INDEX001', { title: TITLE, filename: SHARED_FILE, parentKey: undefined, bytes: v3HeadBytes });
+  for (const part of v3Head.parts) {
+    const file = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, part.key);
+    file.parentItemID = false;
+    transport.remote.get(part.key).parentKey = undefined;
+  }
+  const draftDir = path.join(publisher.dir, 'zotero-vectorize', 'publish-101');
+  await fs.mkdir(draftDir, { recursive: true });
+  const abandonedPayload = Buffer.from('["item","ZZZZZZZZ","' + '0'.repeat(16) + '",null]\n');
+  const abandonedContent = createHash('sha256').update(abandonedPayload).digest('hex');
+  const abandonedStage = path.join(draftDir, 'zotero-vectorize-shard.zvpart');
+  await fs.writeFile(abandonedStage, abandonedPayload);
+  const abandonedItem = await publisher.zotero.Attachments.importFromFile({
+    file: abandonedStage, libraryID: 1,
+    title: `${TITLE} Part ${v3Head.snapshot.publisher} ${abandonedContent}`,
+  });
+  await publisher.zotero.Sync.Runner.sync({ libraries: [1] });
+  await fs.writeFile(path.join(draftDir, 'draft.json'), JSON.stringify({
+    version: 3,
+    snapshot: { ...v3Head.snapshot, generation: v3Head.snapshot.generation + 1 },
+    partBytes: v3Head.partBytes,
+    parts: [{ bytes: abandonedPayload.length, digest: digest(abandonedPayload), content: abandonedContent, end: null }],
+    previous: {
+      generation: v3Head.snapshot.generation, digest: digest(v3HeadBytes),
+      parts: v3Head.parts.map(({ key, content }) => ({ key, content })),
+    },
+  }));
+
+  // Simulate interruption after container creation & partial reparenting on the subsequent v4 migration.
+  let interruptedOnce = false;
+  transport.beforeUpload = (item) => {
+    if (!interruptedOnce && item === publisher.carrier) {
+      interruptedOnce = true;
+      throw new Error('Interrupted during v3->v4 carrier migration');
+    }
+  };
+  source = await publisher.start();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.ok(!transport.remote.has(abandonedItem.key), 'Abandoned v3 draft shard must be erased');
+  await publisher.shutdown(source);
+
+  // Move one shard back to top-level to simulate crashing halfway through reparenting.
+  const secondShard = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, v3Head.parts[1].key);
+  secondShard.parentItemID = false;
+  transport.beforeUpload = undefined;
+  transport.partUploads.length = 0;
+  source = await publisher.start();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(transport.manifest.version, 4);
+  assert.deepEqual(transport.partUploads, []);
+  const pubTop = await publisher.zotero.Items.getAll(1, true, false);
+  const pubContainers = pubTop.filter((item) => item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA));
+  assert.equal(pubContainers.length, 1);
+  assert.equal(secondShard.parentItemID, pubContainers[0].id);
+  assert.equal(publisher.carrier.parentItemID, pubContainers[0].id);
+});
+
+test('container tolerates user rename, extra notes, and stray PDFs, while rejecting duplicates and trashed container', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 256;
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+
+  const [container] = (await publisher.zotero.Items.getAll(1, true, false))
+    .filter((item) => item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA));
+  // User renames container and Better BibTeX appends a citation key line to extra.
+  container.setField('title', 'My Archived Vector Index');
+  container.setField('extra', `Citation Key: zv_2026\n${CONTAINER_EXTRA}\nCustomNote: keep`);
+  // User accidentally drags a normal PDF into the container.
+  const strayPdf = {
+    id: 900, key: 'STRAYPDF', libraryID: 1, parentItemID: container.id, itemType: 'attachment',
+    attachmentFilename: 'notes.pdf', attachmentSyncState: 2,
+    isRegularItem: () => false, isAttachment: () => true, isPDFAttachment: () => true, isStoredFileAttachment: () => true,
+    getDisplayTitle: () => 'Stray PDF', getField: (field) => field === 'title' ? 'Stray PDF' : '',
+    getFilePathAsync: async () => false,
+  };
+  publisher.items.set(strayPdf.id, strayPdf);
+  await source.startIndexing();
+  assert.equal(source.searchIndex.getItemById(container.id), undefined);
+  source.updateConfig({ hybridSemanticWeight: 0.4 });
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.ok(publisher.items.has(strayPdf.id), 'Sync must never erase unrelated user attachments in the container');
+
+  // Receiver rejects a v4 shard that was moved outside the container.
+  const receiver = await createDevice('receiver', 100, 'receive');
+  const destination = await receiver.start();
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'ready');
+  const [recContainer] = (await receiver.zotero.Items.getAll(1, true, false))
+    .filter((item) => item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA));
+  // Trashing the container on receiver hides children and preserves the accepted cache.
+  recContainer.deleted = true;
+  await destination.indexSync.syncNow();
+  assert.equal(destination.indexSync.getStatus().phase, 'waiting');
+  assert.ok(destination.indexSync.active, 'Receiver keeps accepted index searchable if container disappears');
+  recContainer.deleted = false;
+  await receiver.shutdown(destination);
+
+  // Duplicate containers trigger conflict cleanly without modifying remote.
+  const duplicate = new publisher.zotero.Item('document');
+  duplicate.libraryID = 1;
+  duplicate.setField('title', TITLE);
+  duplicate.setField('extra', CONTAINER_EXTRA);
+  await duplicate.saveTx();
+  const uploadsBefore = transport.uploads;
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.equal(transport.uploads, uploadsBefore);
+  publisher.items.delete(duplicate.id);
+
+  // Trashing the container on publisher (with binding still set) triggers conflict instead of silent overwrite.
+  container.deleted = true;
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'conflict');
+  assert.equal(transport.uploads, uploadsBefore);
 });
