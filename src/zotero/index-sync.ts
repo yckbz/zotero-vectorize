@@ -240,9 +240,9 @@ export class IndexSync {
       if (item.isPDFAttachment()) {
         const parent = typeof item.parentItemID === 'number' && item.parentItemID > 0
           ? Zotero.Items.get(item.parentItemID) : null;
-        return !parent || isIndexableRegularItem(parent);
+        return !parent || !isSyncContainerItem(parent, true);
       }
-      return isIndexableRegularItem(item);
+      return item.isRegularItem?.() === true && !item.isFeedItem && !isSyncContainerItem(item, true);
     });
   }
 
@@ -946,7 +946,8 @@ export class IndexSync {
     const { snapshot, parts, previous, partBytes } = draft;
     const { publisher } = snapshot;
     const probe = await this.remoteProbe();
-    const baseCarrier = previous ? (await this.locateCarrier(context.libraryID)).carrier : undefined;
+    const baseLocation = previous ? await this.locateCarrier(context.libraryID) : undefined;
+    const baseCarrier = baseLocation?.carrier;
     // A draft can outlive changes to the carrier from another Zotero sync.
     if (previous && baseCarrier && await fileDigest(this.pathFor(baseCarrier)) === previous.digest &&
         !await probe(baseCarrier, previous.digest)) throw new SyncIssue('webdav');
@@ -1009,7 +1010,9 @@ export class IndexSync {
     }
     if (!this.current(epoch, context)) return false;
     if (sync.Runner.syncInProgress) throw new SyncIssue('waiting');
-    if (createdContainer || reparentedShards || attachments.some((item, i) => !this.isSynced(item, parts[i].digest))) {
+    const migratingCarrier = Boolean(baseLocation?.carrier && !baseLocation.inContainer);
+    if (createdContainer || reparentedShards || migratingCarrier ||
+        attachments.some((item, i) => !this.isSynced(item, parts[i].digest))) {
       await this.runNativeSync(context);
       if (!this.current(epoch, context)) return false;
       if (attachments.some((item, i) => !this.isSynced(item, parts[i].digest))) throw new SyncIssue('waiting');

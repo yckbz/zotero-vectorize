@@ -2854,3 +2854,98 @@ test('prepareSyncParts merges adjacent small shards between large shards without
   assert.equal(coalesced[1].end, 'A0000009');
   assert.equal(coalesced[2].end, null);
 });
+
+test('trashing a regular item with autoIndexOnChange off invalidates the published snapshot, while trashing the container does not', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.prefs.set(PREFIX + 'autoIndexOnChange', false);
+  const source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  const published = transport.manifest;
+  assert.ok(published.parts.length >= 1);
+
+  const [container] = (await publisher.zotero.Items.getAll(1, true, false))
+    .filter((item) => item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA));
+  const revBeforeContainerTrash = source.indexSync.libraryRevision;
+  container.deleted = true;
+  for (const { notify } of publisher.observers.values()) notify('trash', 'item', [container.id]);
+  assert.equal(source.indexSync.libraryRevision, revBeforeContainerTrash,
+    'Trashing the sync container itself must not bump libraryRevision');
+  container.deleted = false;
+
+  // Move the published regular paper to Trash (item stays in Zotero.Items with deleted === true).
+  const paper = publisher.items.get(1);
+  paper.deleted = true;
+  const revBeforePaperTrash = source.indexSync.libraryRevision;
+  for (const { notify } of publisher.observers.values()) notify('trash', 'item', [paper.id]);
+  assert.equal(source.indexSync.libraryRevision, revBeforePaperTrash + 1,
+    'Trashing an ordinary regular item must invalidate checkedSource even when autoIndexOnChange is off');
+
+  // An automatic sync run(false) must not take the unchanged fast path and must remove the trashed item.
+  await source.indexSync.run(false);
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.ok(transport.manifest.snapshot.generation > published.snapshot.generation);
+  assert.deepEqual(transport.manifest.parts, []);
+});
+
+test('v3-to-v4 migration still syncs container metadata before uploading carrier after a failed pre-manifest sync', async (t) => {
+  const { createDevice, transport } = await setup(t);
+  const publisher = await createDevice('publisher', 0, 'publish');
+  publisher.flags.partBytes = 256;
+  let source = await publisher.start();
+  await source.startIndexing();
+  await source.indexSync.syncNow();
+  const seeded = transport.manifest;
+  await publisher.shutdown(source);
+
+  // Downgrade to a confirmed v3 standalone state.
+  transport.containers.clear();
+  for (const [id, item] of [...publisher.items.entries()]) {
+    if (item.isRegularItem?.() && item.getField('extra').includes(CONTAINER_EXTRA)) publisher.items.delete(id);
+  }
+  const v3Manifest = { ...seeded, version: 3 };
+  const v3HeadBytes = Buffer.from(JSON.stringify(v3Manifest) + '\n');
+  publisher.carrier.parentItemID = false;
+  publisher.carrier.attachmentSyncedHash = digest(v3HeadBytes);
+  await fs.writeFile(path.join(publisher.dir, 'storage', 'INDEX001', SHARED_FILE), v3HeadBytes);
+  transport.remote.set('INDEX001', { title: TITLE, filename: SHARED_FILE, parentKey: undefined, bytes: v3HeadBytes });
+  for (const part of v3Manifest.parts) {
+    const file = await publisher.zotero.Items.getByLibraryAndKeyAsync(1, part.key);
+    file.parentItemID = false;
+    transport.remote.get(part.key).parentKey = undefined;
+  }
+
+  // Fail the first sync right after local container creation + shard reparenting (offline during pre-manifest sync).
+  const nativeSync = publisher.zotero.Sync.Runner.sync;
+  let failOnce = true;
+  publisher.zotero.Sync.Runner.sync = async (opts) => {
+    if (failOnce) {
+      failOnce = false;
+      opts.onError?.(new Error('offline during container metadata sync'));
+      return;
+    }
+    return nativeSync(opts);
+  };
+  source = await publisher.start();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'webdav');
+  assert.equal(transport.containers.size, 0, 'Container metadata has not been synced remotely yet');
+  await publisher.shutdown(source);
+
+  // On retry, container & reparented shard metadata must be synced BEFORE carrier is uploaded.
+  publisher.zotero.Sync.Runner.sync = nativeSync;
+  let containerSyncedBeforeCarrierUpload = false;
+  transport.beforeUpload = (item) => {
+    if (item === publisher.carrier) {
+      containerSyncedBeforeCarrierUpload = transport.containers.size === 1 &&
+        v3Manifest.parts.every(({ key }) => Boolean(transport.remote.get(key)?.parentKey));
+    }
+  };
+  source = await publisher.start();
+  await source.indexSync.syncNow();
+  assert.equal(source.indexSync.getStatus().phase, 'ready');
+  assert.equal(containerSyncedBeforeCarrierUpload, true);
+  assert.equal(transport.manifest.version, 4);
+});

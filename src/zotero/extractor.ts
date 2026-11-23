@@ -48,8 +48,11 @@ export const SYNC_CONTAINER_EXTRA_MARKER = 'Zotero-Vectorize-Sync: container-v1'
 export const SYNC_CONTAINER_ABSTRACT =
   'Managed automatically by Zotero Vectorize to store WebDAV-synced semantic search index files as attachments. You may move this item into any collection, but please do not delete it. / 由 Zotero Vectorize 插件自动维护，用于通过 WebDAV 同步语义搜索向量分片。可移入任意分类整理，请勿删除。';
 
-export function isSyncContainerItem(item: ZoteroItem | null | false | undefined): item is ZoteroItem {
-  if (!item || item.deleted) return false;
+export function isSyncContainerItem(
+  item: ZoteroItem | null | false | undefined,
+  includeDeleted = false,
+): item is ZoteroItem {
+  if (!item || (!includeDeleted && item.deleted)) return false;
   if (item.isFeedItem) return false;
   if (typeof item.isRegularItem === 'function' && !item.isRegularItem()) return false;
   const extra = safeField(item, 'extra');
