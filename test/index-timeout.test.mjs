@@ -670,3 +670,156 @@ test('PDF indexing, busy-worker waits, and cancellation work without a global Ab
   assert.equal(await fixture.vectorizedPassages(11), 1);
   assert.equal(fixture.errors.length, 0);
 });
+
+test('Cancelling while an in-flight PDF stays stuck protects subsequent scans even without queue inspection or AbortController', async (t) => {
+  const originalAbortController = globalThis.AbortController;
+  delete globalThis.AbortController;
+  t.after(() => { globalThis.AbortController = originalAbortController; });
+
+  let release;
+  const forever = new Promise((resolve) => { release = resolve; });
+  t.after(() => release?.());
+  const fixture = await createFixture(t, (id) => id === 20 && forever, { exposeQueue: false });
+  const service = await fixture.open();
+  service.indexer.readTimeoutMs = 80;
+
+  // Cancel while PDF 20 is stuck in-flight; returns promptly without recording a strike.
+  const scan1 = service.startIndexing();
+  await waitFor(() => fixture.requested.get(20) === 1, 'PDF 20 did not start');
+  const t0 = Date.now();
+  await service.indexer.cancel();
+  await scan1;
+  assert.ok(Date.now() - t0 < 50, 'cancel() should return promptly even when readTimeoutMs is longer');
+  assert.equal(await service.store.getReadTimeout(20), null);
+
+  // Subsequent scan sees pendingCancelledReads, avoids submitting behind the stuck job, and records no strikes.
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'incomplete');
+  assert.match(service.getIndexProgress().lastError, /busy with other PDF tasks/);
+  assert.equal(fixture.requested.get(20), 1);
+  assert.equal(fixture.requested.get(21), undefined);
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.equal(await service.store.getReadTimeout(21), null);
+  assert.equal(fixture.errors.length, 0);
+});
+
+test('Cancelling, clearing, or shutting down during an in-flight PDF read returns promptly without recording timeout strikes', async (t) => {
+  let release;
+  let hold = new Promise((resolve) => { release = resolve; });
+  t.after(() => release?.());
+  let calls = 0;
+  const fixture = await createFixture(t, (id, maxPages) => {
+    if (id !== 20) return null;
+    calls++;
+    if (calls === 1) {
+      // Return leading blank pages if released so we can verify a cancelled read never starts binary search.
+      return hold.then(() => ({
+        text: 'Passage after leading blank pages about phonon transport.',
+        extractedPages: 4,
+        totalPages: 4,
+      }));
+    }
+    return { text: maxPages >= 4 ? 'Passage after leading blank pages about phonon transport.' : '', extractedPages: maxPages ?? 1, totalPages: 4 };
+  });
+
+  // 1. clearIndex() during an in-flight stuck PDF finishes promptly instead of waiting for readTimeoutMs.
+  let service = await fixture.open();
+  service.indexer.readTimeoutMs = 600;
+  const scan1 = service.startIndexing();
+  await waitFor(() => fixture.requested.get(20) === 1, 'PDF 20 read did not start');
+  const clearStart = Date.now();
+  await service.clearIndex();
+  const clearElapsed = Date.now() - clearStart;
+  await scan1;
+  assert.ok(clearElapsed < 250, `clearIndex() blocked for ${clearElapsed}ms instead of aborting promptly`);
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.equal(service.indexer.stalledRead, null);
+  assert.equal(fixture.errors.length, 0);
+
+  // When the cancelled PDF job later finishes, it does not start follow-up binary-search calls or leave stale state.
+  release();
+  await wait(30);
+  assert.equal(calls, 1, 'cancelled extraction must not issue follow-up blank-page binary-search calls');
+  assert.equal(await service.store.getReadTimeout(20), null);
+
+  // 2. shutdown() during an in-flight stuck PDF finishes promptly and never persists a timeout strike.
+  hold = new Promise((resolve) => { release = resolve; });
+  calls = 0;
+  service = await fixture.restart();
+  service.indexer.readTimeoutMs = 600;
+  const dbPath = service.store.getDbPath();
+  const scan2 = service.startIndexing();
+  await waitFor(() => fixture.requested.get(20) === 2, 'second PDF 20 read did not start');
+  const shutdownStart = Date.now();
+  await service.shutdown();
+  const shutdownElapsed = Date.now() - shutdownStart;
+  await scan2;
+  assert.ok(shutdownElapsed < 250, `shutdown() blocked for ${shutdownElapsed}ms instead of aborting promptly`);
+  assert.equal(fixture.errors.length, 0);
+  release();
+
+  // Reopen the same store and verify zero strikes were persisted during shutdown.
+  hold = Promise.resolve();
+  service = await fixture.open();
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.equal(service.store.getDbPath(), dbPath);
+});
+
+test('A scan started right after cancelling an in-flight PDF waits for the worker cleanly, even without queue inspection', async (t) => {
+  for (const exposeQueue of [true, false]) {
+    let release;
+    let delay = new Promise((resolve) => { release = resolve; });
+    t.after(() => release?.());
+    const fixture = await createFixture(t, (id) => id === 20 && delay, { exposeQueue });
+    const service = await fixture.open();
+    service.indexer.readTimeoutMs = 400;
+
+    // Cancel while PDF 20 is mid-extraction (e.g. model switch / maintenance), then release 25ms later.
+    const scan1 = service.startIndexing();
+    await waitFor(() => fixture.requested.get(20) === 1, 'PDF 20 did not start');
+    const cancelStart = Date.now();
+    await service.indexer.cancel();
+    await scan1;
+    assert.ok(Date.now() - cancelStart < 200, 'cancel() should not block for readTimeoutMs');
+    assert.equal(service.indexer.stalledRead, null);
+
+    // Immediately start a fresh scan before the cancelled worker job finishes; release it 25ms later.
+    delay = null;
+    setTimeout(() => release(), 25);
+    await service.startIndexing();
+    assert.equal(service.getIndexProgress().phase, 'completed', `exposeQueue=${exposeQueue}: new scan should complete cleanly`);
+    assert.equal(await service.store.getReadTimeout(20), null);
+    assert.equal(await fixture.vectorizedPassages(10), 1);
+    assert.equal(await fixture.vectorizedPassages(11), 1);
+    assert.equal(fixture.errors.length, 0);
+  }
+});
+
+test('Cancelling while getAttachmentSignature is slow returns promptly without logging an error', async (t) => {
+  let releaseStat;
+  const fixture = await createFixture(t, () => null);
+  const att20 = fixture.items.get(20);
+  const origGetFilePath = att20.getFilePathAsync;
+  att20.getFilePathAsync = () => new Promise((resolve) => { releaseStat = () => resolve(origGetFilePath()); });
+  t.after(() => releaseStat?.());
+
+  const service = await fixture.open();
+  service.indexer.readTimeoutMs = 600;
+  const scan = service.startIndexing();
+  await waitFor(() => Boolean(releaseStat), 'getAttachmentSignature did not start');
+  const t0 = Date.now();
+  await service.indexer.cancel();
+  const elapsed = Date.now() - t0;
+  await scan;
+  assert.ok(elapsed < 250, `cancel() during getAttachmentSignature blocked for ${elapsed}ms`);
+  assert.equal(service.getIndexProgress().phase, 'idle');
+  assert.equal(fixture.errors.length, 0);
+
+  // Restore and verify subsequent scan succeeds cleanly.
+  att20.getFilePathAsync = origGetFilePath;
+  releaseStat();
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(await fixture.vectorizedPassages(10), 1);
+  assert.equal(await fixture.vectorizedPassages(11), 1);
+});

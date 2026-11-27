@@ -28,18 +28,8 @@ class AttachmentReadTimeout extends Error {}
 class PdfWorkerBusy extends AttachmentReadTimeout {}
 /** Waiting for Zotero's own PDF jobs to finish timed out before our PDF was submitted. */
 class PdfWorkerQueuedTimeout extends AttachmentReadTimeout {}
-
-async function waitForAttachmentRead<T>(read: Promise<T>, errorMessage: string, timeoutMs: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new AttachmentReadTimeout(errorMessage)), timeoutMs);
-  });
-  try {
-    return await Promise.race([read, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+/** Internal sentinel used to wake up an in-flight read immediately when the indexer cancels. */
+class ReadCancelled extends Error {}
 
 function yieldToEventLoop(ms = 12): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -119,6 +109,10 @@ export class BackgroundIndexer {
   readTimeoutMs = ATTACHMENT_READ_TIMEOUT_MS;
   /** A PDF read that timed out and has not finished in Zotero's serial PDF worker yet. */
   private stalledRead: Promise<void> | null = null;
+  /** PDF worker jobs whose foreground wait was cancelled while Zotero's serial worker was still running them. */
+  private pendingCancelledReads = new Set<Promise<void>>();
+  /** Callbacks woken immediately when cancel() is called so in-flight waits do not block shutdown or maintenance. */
+  private cancelWaiters = new Set<() => void>();
   /** Text Zotero extracted after the scan gave up on it, kept for the next scan of the same file version. */
   private lateReads = new Map<number, { fileHash: string; mtime: number; maxPdfPages: number; result: PdfExtractionResult }>();
   /** Changes when the index is cleared, so text from a read started before that is not kept. */
@@ -182,9 +176,85 @@ export class BackgroundIndexer {
     }
   }
 
+  private onCancel(callback: () => void): () => void {
+    if (this.cancelled || this.disposed) {
+      callback();
+      return () => {};
+    }
+    this.cancelWaiters.add(callback);
+    return () => {
+      this.cancelWaiters.delete(callback);
+    };
+  }
+
+  private notifyCancelWaiters(): void {
+    if (!this.cancelWaiters.size) return;
+    const waiters = [...this.cancelWaiters];
+    this.cancelWaiters.clear();
+    for (const wake of waiters) {
+      try {
+        wake();
+      } catch {
+        // Ignore individual waiter errors during cancellation
+      }
+    }
+  }
+
+  private sleepOrCancel(ms: number): Promise<void> {
+    if (this.cancelled || this.disposed) return Promise.resolve();
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let unsubscribe: (() => void) | undefined;
+      const done = () => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        unsubscribe?.();
+        unsubscribe = undefined;
+        resolve();
+      };
+      timer = setTimeout(done, ms);
+      unsubscribe = this.onCancel(done);
+    });
+  }
+
+  private async waitForAttachmentRead<T>(read: Promise<T>, errorMessage: string, timeoutMs: number): Promise<T> {
+    if (this.cancelled || this.disposed) {
+      void read.catch(() => {});
+      throw new ReadCancelled();
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let unsubscribeCancel: (() => void) | undefined;
+    const race = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new AttachmentReadTimeout(errorMessage)), timeoutMs);
+      unsubscribeCancel = this.onCancel(() => reject(new ReadCancelled()));
+    });
+    try {
+      return await Promise.race([read, race]);
+    } catch (error) {
+      void read.catch(() => {});
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      unsubscribeCancel?.();
+    }
+  }
+
+  private trackCancelledWorkerRead(read: Promise<PdfExtractionResult>): void {
+    const pending: Promise<void> = read.then(() => undefined, () => undefined).finally(() => {
+      this.pendingCancelledReads.delete(pending);
+    });
+    this.pendingCancelledReads.add(pending);
+  }
+
+  private isPdfWorkerCurrentlyBusy(): boolean {
+    return isPdfWorkerBusy() === true || this.pendingCancelledReads.size > 0;
+  }
+
   private async waitIfPaused(): Promise<boolean> {
     while (this.paused && !this.cancelled && !this.disposed) {
-      await yieldToEventLoop(250);
+      await this.sleepOrCancel(250);
     }
     return !this.cancelled && !this.disposed;
   }
@@ -375,6 +445,7 @@ export class BackgroundIndexer {
     const queued = this.queuedLibraryScan;
     this.queuedLibraryScan = null;
     queued?.resolve();
+    this.notifyCancelWaiters();
     if (this.activeRun) {
       await this.activeRun.catch(() => {});
     }
@@ -554,7 +625,7 @@ export class BackgroundIndexer {
   private async waitForPdfWorkerIdle(
     budget: { remaining: number }, pollMs: number, isStillValid: () => boolean
   ): Promise<'ready' | 'cancelled' | 'busy_timeout'> {
-    while (isPdfWorkerBusy() === true) {
+    while (this.isPdfWorkerCurrentlyBusy()) {
       if (this.cancelled || this.disposed || !isStillValid()) return 'cancelled';
       if (this.paused) {
         if (!(await this.waitIfPaused()) || !isStillValid()) return 'cancelled';
@@ -563,7 +634,7 @@ export class BackgroundIndexer {
       if (budget.remaining <= 0) return 'busy_timeout';
       const step = Math.min(pollMs, budget.remaining);
       const startedAt = Date.now();
-      await yieldToEventLoop(step);
+      await this.sleepOrCancel(step);
       budget.remaining -= Math.max(step, Date.now() - startedAt);
     }
     return this.cancelled || this.disposed || !isStillValid() ? 'cancelled' : 'ready';
@@ -604,17 +675,24 @@ export class BackgroundIndexer {
     rebuildIds: ReadonlySet<number> | null,
     externalWorkerBusy: { current: boolean }
   ): Promise<PreparedAttachment | null> {
+    if (this.cancelled || this.disposed) return null;
     const { store, searchIndex } = this.deps;
     const strings = getStrings(cfg);
     const title = att.getDisplayTitle?.() || att.key;
     // Recorded before the PDF is read again, so a rebuild that fails or stops before it saves new
     // passages for this attachment is resumed by a later scan instead of being treated as done.
     if (force && store.activeProfile) await store.markRebuildStarted(att.id);
-    const sig = await waitForAttachmentRead(
-      getAttachmentSignature(att),
-      strings.indexReadTimeout(strings.indexCheckingFile, title, this.readTimeoutMs / 1000),
-      this.readTimeoutMs
-    );
+    let sig: Awaited<ReturnType<typeof getAttachmentSignature>>;
+    try {
+      sig = await this.waitForAttachmentRead(
+        getAttachmentSignature(att),
+        strings.indexReadTimeout(strings.indexCheckingFile, title, this.readTimeoutMs / 1000),
+        this.readTimeoutMs
+      );
+    } catch (error) {
+      if (error instanceof ReadCancelled) return null;
+      throw error;
+    }
     const previous = await store.getAttachmentState(att.id);
     const chunkingKey = `1:${cfg.chunkSize}:${cfg.chunkOverlap}:${cfg.maxPdfPages}`;
     const sameSource = previous !== null && previous.parentItemID === item.id && previous.attachmentKey === att.key &&
@@ -663,10 +741,11 @@ export class BackgroundIndexer {
         if (sig.filePath) {
           if (this.stalledRead) throw new PdfWorkerBusy(strings.indexPdfWorkerBusy(title));
           if (externalWorkerBusy.current) {
-            if (isPdfWorkerBusy() === true) throw new PdfWorkerBusy(strings.indexPdfWorkerBusy(title));
+            if (this.isPdfWorkerCurrentlyBusy()) throw new PdfWorkerBusy(strings.indexPdfWorkerBusy(title));
             externalWorkerBusy.current = false;
           }
         }
+        if (this.cancelled || this.disposed || !this.isCurrent(work)) return null;
         const timeoutMessage = strings.indexReadTimeout(strings.indexReadingPdf, title, this.readTimeoutMs / 1000);
         // Zotero's bootstrap sandbox omits DOM globals like AbortController when MCP is off,
         // so keep read-cancellation state in plain JS instead of depending on global AbortController.
@@ -686,8 +765,9 @@ export class BackgroundIndexer {
         let busyTimeoutError: PdfWorkerQueuedTimeout | null = null;
         let timedOutWhileQueued = false;
         let abandonedToStalledRead = false;
+        let workerCallInFlight = false;
         let activeTimer: ReturnType<typeof setTimeout> | undefined;
-        let rejectForeground!: (error: AttachmentReadTimeout) => void;
+        let rejectForeground!: (error: Error) => void;
         const foregroundTimeout = new Promise<never>((_, reject) => { rejectForeground = reject; });
         const clearActiveTimer = () => {
           if (activeTimer !== undefined) {
@@ -695,6 +775,13 @@ export class BackgroundIndexer {
             activeTimer = undefined;
           }
         };
+        const unsubscribeCancel = this.onCancel(() => {
+          if (abandonedToStalledRead) return;
+          clearActiveTimer();
+          const cancelled = new ReadCancelled();
+          abortRead(cancelled);
+          rejectForeground(cancelled);
+        });
         // Wait for Zotero's serial PDF worker to finish its own jobs before submitting ours, then give
         // our extraction its own full timeout. That way a file that starts after queuing and hangs is
         // still blamed and deferred, while a healthy file never loses its timeout budget to Zotero's queue.
@@ -712,8 +799,12 @@ export class BackgroundIndexer {
             // microtask after waitForPdfWorkerIdle resolves cannot push our submission into pure queuing.
             const waitBudget = { remaining: this.readTimeoutMs };
             const pollMs = Math.min(50, Math.max(5, Math.floor(this.readTimeoutMs / 10)));
-            while (isPdfWorkerBusy() === true) {
-              const waitResult = await this.waitForPdfWorkerIdle(waitBudget, pollMs, () => this.isCurrent(work));
+            while (this.isPdfWorkerCurrentlyBusy()) {
+              const waitResult = await this.waitForPdfWorkerIdle(
+                waitBudget,
+                pollMs,
+                () => !readSignal.aborted && this.isCurrent(work)
+              );
               if (waitResult === 'cancelled') {
                 abortRead();
                 readSignal.throwIfAborted();
@@ -725,41 +816,43 @@ export class BackgroundIndexer {
                 throw busyTimeoutError;
               }
             }
-            if (this.cancelled || this.disposed || !this.isCurrent(work)) {
+            if (readSignal.aborted || this.cancelled || this.disposed || !this.isCurrent(work)) {
               abortRead();
               readSignal.throwIfAborted();
             }
             clearActiveTimer();
             const worker = Zotero.PDFWorker;
             const queueBefore = Array.isArray(worker._queue) ? new Set(worker._queue) : null;
-            const request = worker.getFullText(att.id, maxPages, false);
-            let queuedEntry: unknown;
-            let hasQueuedEntry = false;
-            if (queueBefore && Array.isArray(worker._queue)) {
-              for (let i = worker._queue.length - 1; i >= 0; i--) {
-                if (!queueBefore.has(worker._queue[i])) {
-                  queuedEntry = worker._queue[i];
-                  hasQueuedEntry = true;
-                  break;
+            workerCallInFlight = true;
+            try {
+              const request = worker.getFullText(att.id, maxPages, false);
+              let queuedEntry: unknown;
+              let hasQueuedEntry = false;
+              if (queueBefore && Array.isArray(worker._queue)) {
+                for (let i = worker._queue.length - 1; i >= 0; i--) {
+                  if (!queueBefore.has(worker._queue[i])) {
+                    queuedEntry = worker._queue[i];
+                    hasQueuedEntry = true;
+                    break;
+                  }
                 }
               }
-            }
-            activeTimer = setTimeout(() => {
-              activeTimer = undefined;
-              abandonedToStalledRead = true;
-              // If the worker was preempted at submission time and our entry is still sitting in _queue,
-              // this PDF never started running and must not be charged a timeout strike.
-              const stillQueued = hasQueuedEntry && Array.isArray(worker._queue) && worker._queue.includes(queuedEntry);
-              if (stillQueued) {
-                timedOutWhileQueued = true;
-                rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`));
-              } else {
-                rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfTimeoutNote}`));
-              }
-            }, this.readTimeoutMs);
-            try {
+              activeTimer = setTimeout(() => {
+                activeTimer = undefined;
+                abandonedToStalledRead = true;
+                // If the worker was preempted at submission time and our entry is still sitting in _queue,
+                // this PDF never started running and must not be charged a timeout strike.
+                const stillQueued = hasQueuedEntry && Array.isArray(worker._queue) && worker._queue.includes(queuedEntry);
+                if (stillQueued) {
+                  timedOutWhileQueued = true;
+                  rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`));
+                } else {
+                  rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfTimeoutNote}`));
+                }
+              }, this.readTimeoutMs);
               return await request;
             } finally {
+              workerCallInFlight = false;
               clearActiveTimer();
             }
           },
@@ -768,15 +861,25 @@ export class BackgroundIndexer {
           extracted = await Promise.race([read, foregroundTimeout]);
         } catch (error) {
           clearActiveTimer();
+          unsubscribeCancel();
           if (busyTimeoutError) throw busyTimeoutError;
-          if (readSignal.aborted) return null;
+          if (error instanceof ReadCancelled || readSignal.aborted) {
+            if (workerCallInFlight) {
+              this.trackCancelledWorkerRead(read);
+            } else {
+              void read.catch(() => {});
+            }
+            return null;
+          }
           if (!(error instanceof AttachmentReadTimeout)) throw error;
           // Watch before the write is queued, so a late result always clears the record after it is made.
           this.watchStalledRead(att.id, sig, cfg.maxPdfPages, read);
-          if (!timedOutWhileQueued) await store.recordReadTimeout(att.id, sig);
+          if (!timedOutWhileQueued && !this.cancelled && !this.disposed) await store.recordReadTimeout(att.id, sig);
+          if (this.cancelled || this.disposed) return null;
           throw error;
         } finally {
           clearActiveTimer();
+          unsubscribeCancel();
         }
       }
       if (timedOut) await store.clearReadTimeout(att.id);
