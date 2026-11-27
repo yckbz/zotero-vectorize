@@ -183,14 +183,14 @@ export class BackgroundIndexer {
       {
         notify: (event, type, ids) => {
           if (this.disposed) return;
-          const cfg = this.deps.getConfig();
-          if (!cfg.autoIndexOnChange) return;
+          // Removals keep search from returning deleted or trashed items, so they do not depend on auto-indexing.
+          if (type === 'item' && (event === 'delete' || event === 'trash')) {
+            this.queueDeletes(ids);
+            return;
+          }
+          if (!this.deps.getConfig().autoIndexOnChange) return;
 
           if (type === 'item') {
-            if (event === 'delete' || event === 'trash') {
-              this.queueDeletes(ids);
-              return;
-            }
             if (event === 'add' || event === 'modify') {
               for (const rawId of ids) {
                 const id = Number(rawId);
