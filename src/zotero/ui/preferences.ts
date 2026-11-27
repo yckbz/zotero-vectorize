@@ -350,7 +350,8 @@ class VectorizePreferencesController {
     });
 
     const btnRebuild = el(doc, 'button', { type: 'button', id: 'zv-btn-rebuild', className: 'zv-btn' }, [s.rebuildIndex]);
-    btnRebuild.addEventListener('click', () => {
+    btnRebuild.addEventListener('click', async () => {
+      if (!this.container || !await choose(this.container, s.rebuildIndex, [['rebuild', s.rebuildIndex]], s.prefCancel, s.prefRebuildHint)) return;
       void svc.startIndexing(true);
     });
 

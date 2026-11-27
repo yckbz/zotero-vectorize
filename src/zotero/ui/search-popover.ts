@@ -500,8 +500,8 @@ export class TopSearchPopover {
         [s.rebuildIndex]
       );
       rebuildBtn.addEventListener('click', () => {
-        void this.service.startIndexing(true);
         this.hide();
+        if (Services.prompt.confirm(this.win, s.rebuildIndex, s.prefRebuildHint)) void this.service.startIndexing(true);
       });
       this.rootEl.appendChild(
         el(doc, 'div', { className: 'zv-banner' }, [

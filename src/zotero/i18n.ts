@@ -62,6 +62,7 @@ export type LocaleStrings = {
   prefNativeRestored: string;
   prefNativeExported: string;
   prefClearAllHint: string;
+  prefRebuildHint: string;
   prefSwitchModelHint: (model: string) => string;
   prefDeleteModelHint: (model: string) => string;
   prefModelCoverage: (items: number, allItems: number, chunks: number, allChunks: number) => string;
@@ -213,6 +214,7 @@ const ZH_CN: LocaleStrings = {
   prefNativeRestored: '已恢复 SQLite 向量库，正在检查文献变更。',
   prefNativeExported: '已导出 SQLite 向量库。',
   prefClearAllHint: '这会删除本机索引中的全部模型向量和全文缓存。',
+  prefRebuildHint: '将重新抽取全部 PDF 正文，并为整个文献库重新生成向量。大文献库可能需要较长时间，使用在线 API 时会产生相应费用。新向量生成之前，已有向量保留可用。',
   prefSwitchModelHint: (model) => `是否保留 ${model} 的向量？`,
   prefDeleteModelHint: (model) => `删除 ${model} 的题录和全文向量。共享的题录与 PDF 切片会保留。`,
   prefModelCoverage: (i, ni, c, nc) => `题录 ${i}/${ni} · 全文 ${c}/${nc}`,
@@ -378,6 +380,7 @@ const EN_US: LocaleStrings = {
   prefNativeRestored: 'SQLite index restored. Checking for library changes.',
   prefNativeExported: 'SQLite index exported.',
   prefClearAllHint: 'This deletes all model vectors and cached passages from this device’s local index.',
+  prefRebuildHint: 'This extracts every PDF again and regenerates vectors for the whole library. Large libraries can take a long time, and online APIs bill for the requests. Existing vectors stay searchable until they are replaced.',
   prefSwitchModelHint: (model) => `Keep the saved vectors for ${model}?`,
   prefDeleteModelHint: (model) => `Delete the metadata and full-text vectors for ${model}. Shared metadata and PDF passages will be kept.`,
   prefModelCoverage: (i, ni, c, nc) => `Metadata ${i}/${ni} · Passages ${c}/${nc}`,

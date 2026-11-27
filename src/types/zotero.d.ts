@@ -63,6 +63,9 @@ export interface ServicesNamespace {
   scriptloader: {
     loadSubScript(url: string, targetObj?: any): void;
   };
+  prompt: {
+    confirm(parent: any, title: string, text: string): boolean;
+  };
 }
 
 export interface IOUtilsNamespace {
