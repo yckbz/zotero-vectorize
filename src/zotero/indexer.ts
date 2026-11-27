@@ -93,7 +93,8 @@ export class BackgroundIndexer {
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingDebounceIds = new Set<number>();
-  private pendingExplicitIds = new Set<number>();
+  /** Explicitly requested items queued during a busy run, mapped to whether the request was forced. */
+  private pendingExplicitIds = new Map<number, boolean>();
   private activeRun: Promise<void> | null = null;
   private activeLibraryVectorProvider: EmbeddingProvider | null = null;
   private pendingModelBackfill: EmbeddingProvider | null = null;
@@ -235,10 +236,14 @@ export class BackgroundIndexer {
       this.debounceTimer = null;
       if (this.disposed || this.suspended) return;
       if (this.pendingExplicitIds.size) {
-        const explicit = [...this.pendingExplicitIds];
-        this.pendingExplicitIds.clear();
-        void this.indexItemOrAttachmentIds(explicit, false).finally(() => {
-          if (!this.disposed && !this.activeRun && this.pendingDebounceIds.size) this.scheduleDebouncedFlush(80);
+        // Forced requests run on their own so a queued "Vectorize Selected Items" keeps its force flag.
+        const forced = [...this.pendingExplicitIds].filter(([, force]) => force).map(([id]) => id);
+        const explicit = forced.length ? forced : [...this.pendingExplicitIds.keys()];
+        for (const id of explicit) this.pendingExplicitIds.delete(id);
+        void this.indexItemOrAttachmentIds(explicit, forced.length > 0).finally(() => {
+          if (!this.disposed && !this.activeRun && (this.pendingExplicitIds.size || this.pendingDebounceIds.size)) {
+            this.scheduleDebouncedFlush(80);
+          }
         });
         return;
       }
@@ -460,9 +465,9 @@ export class BackgroundIndexer {
 
     if (this.disposed) return;
     if (this.activeRun || this.suspended || this.cancelled) {
-      const queue = automatic ? this.pendingDebounceIds : this.pendingExplicitIds;
       for (const id of resolvedRegularIds) {
-        queue.add(id);
+        if (automatic) this.pendingDebounceIds.add(id);
+        else this.pendingExplicitIds.set(id, forceRebuild || this.pendingExplicitIds.get(id) === true);
       }
       return;
     }

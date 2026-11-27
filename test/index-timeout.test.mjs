@@ -300,3 +300,28 @@ test('A late PDF result never starts indexing by itself, even after the index wa
   assert.equal(fixture.requested.get(20), 2);
   assert.equal(await fixture.vectorizedPassages(10), 1);
 });
+
+test('A forced retry requested while another run is busy keeps its force flag', async (t) => {
+  let busy = null;
+  const fixture = await createFixture(t, (id) => id === 21 && busy);
+  const service = await fixture.open();
+  // The PDF has timed out twice, so only a forced retry reads it again.
+  await service.store.recordReadTimeout(20, { fileHash: 'STUCK-hash', mtime: 1000 });
+  await service.store.recordReadTimeout(20, { fileHash: 'STUCK-hash', mtime: 1000 });
+  assert.equal((await service.store.getReadTimeout(20)).strikes, 2);
+
+  let finishBusyRun;
+  busy = new Promise((resolve) => { finishBusyRun = resolve; });
+  const busyRun = service.indexItems([11], true);
+  await waitFor(() => fixture.requested.get(21) === 1, 'the busy run did not start');
+
+  // "Vectorize Selected Items" on the timed-out paper is queued behind the busy run.
+  await service.indexItems([10], true);
+  assert.equal(fixture.requested.get(20), undefined);
+  finishBusyRun();
+  await busyRun;
+  await waitFor(async () => fixture.completed.get(20) === 1 && await service.store.getReadTimeout(20) === null,
+    'the queued forced retry ran as a normal scan and skipped the timed-out PDF');
+  await waitFor(() => service.getIndexProgress().phase === 'completed', 'the forced retry did not finish');
+  assert.equal(await fixture.vectorizedPassages(10), 1);
+});
