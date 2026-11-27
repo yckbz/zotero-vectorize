@@ -192,7 +192,7 @@ export async function extractPdfPages(
   signature: Awaited<ReturnType<typeof getAttachmentSignature>>,
   options?: {
     minTextLength?: number;
-    signal?: AbortSignal;
+    signal?: Pick<AbortSignal, 'aborted' | 'throwIfAborted'>;
     /** Runs each Zotero PDF worker request; callers may wait for an idle worker or enforce per-call timeouts. */
     requestFullText?: (maxPages: number | null) => Promise<{
       text: string;

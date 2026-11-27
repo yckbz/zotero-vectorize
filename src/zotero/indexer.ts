@@ -668,7 +668,21 @@ export class BackgroundIndexer {
           }
         }
         const timeoutMessage = strings.indexReadTimeout(strings.indexReadingPdf, title, this.readTimeoutMs / 1000);
-        const controller = new AbortController();
+        // Zotero's bootstrap sandbox omits DOM globals like AbortController when MCP is off,
+        // so keep read-cancellation state in plain JS instead of depending on global AbortController.
+        let readAborted = false;
+        let readAbortReason: unknown;
+        const abortRead = (reason?: unknown): void => {
+          if (readAborted) return;
+          readAborted = true;
+          readAbortReason = reason ?? new Error('Aborted');
+        };
+        const readSignal = {
+          get aborted() { return readAborted; },
+          throwIfAborted() {
+            if (readAborted) throw readAbortReason;
+          },
+        };
         let busyTimeoutError: PdfWorkerQueuedTimeout | null = null;
         let timedOutWhileQueued = false;
         let abandonedToStalledRead = false;
@@ -685,12 +699,12 @@ export class BackgroundIndexer {
         // our extraction its own full timeout. That way a file that starts after queuing and hangs is
         // still blamed and deferred, while a healthy file never loses its timeout budget to Zotero's queue.
         const read = extractPdfPages(att, cfg.maxPdfPages, sig, {
-          signal: controller.signal,
+          signal: readSignal,
           requestFullText: async (maxPages) => {
             if (abandonedToStalledRead) {
               if (this.disposed) {
-                controller.abort();
-                controller.signal.throwIfAborted();
+                abortRead();
+                readSignal.throwIfAborted();
               }
               return Zotero.PDFWorker.getFullText(att.id, maxPages, false);
             }
@@ -701,19 +715,19 @@ export class BackgroundIndexer {
             while (isPdfWorkerBusy() === true) {
               const waitResult = await this.waitForPdfWorkerIdle(waitBudget, pollMs, () => this.isCurrent(work));
               if (waitResult === 'cancelled') {
-                controller.abort();
-                controller.signal.throwIfAborted();
+                abortRead();
+                readSignal.throwIfAborted();
               }
               if (waitResult === 'busy_timeout') {
                 externalWorkerBusy.current = true;
                 busyTimeoutError = new PdfWorkerQueuedTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`);
-                controller.abort(busyTimeoutError);
+                abortRead(busyTimeoutError);
                 throw busyTimeoutError;
               }
             }
             if (this.cancelled || this.disposed || !this.isCurrent(work)) {
-              controller.abort();
-              controller.signal.throwIfAborted();
+              abortRead();
+              readSignal.throwIfAborted();
             }
             clearActiveTimer();
             const worker = Zotero.PDFWorker;
@@ -755,7 +769,7 @@ export class BackgroundIndexer {
         } catch (error) {
           clearActiveTimer();
           if (busyTimeoutError) throw busyTimeoutError;
-          if (controller.signal.aborted) return null;
+          if (readSignal.aborted) return null;
           if (!(error instanceof AttachmentReadTimeout)) throw error;
           // Watch before the write is queued, so a late result always clears the record after it is made.
           this.watchStalledRead(att.id, sig, cfg.maxPdfPages, read);

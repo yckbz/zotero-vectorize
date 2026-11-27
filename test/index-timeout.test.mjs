@@ -632,3 +632,41 @@ test('Worker preemption between idle check and submission never charges a timeou
   assert.equal(await fixture.vectorizedPassages(10), 1);
   assert.equal(await fixture.vectorizedPassages(11), 1);
 });
+
+test('PDF indexing, busy-worker waits, and cancellation work without a global AbortController', async (t) => {
+  const originalAbortController = globalThis.AbortController;
+  delete globalThis.AbortController;
+  t.after(() => { globalThis.AbortController = originalAbortController; });
+  assert.equal(typeof globalThis.AbortController, 'undefined');
+
+  const fixture = await createFixture(t, () => null);
+  let service = await fixture.open();
+
+  // 1. Busy-worker timeout path works without global AbortController and does not record a strike.
+  fixture.occupy(new Promise(() => {}));
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'incomplete');
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.match(service.getIndexProgress().lastError, /busy with other PDF tasks/);
+  assert.equal(fixture.errors.length, 0);
+
+  // 2. Cancelling while waiting on a busy worker aborts cleanly without global AbortController.
+  service = await fixture.restart();
+  service.indexer.readTimeoutMs = 500;
+  fixture.occupy(new Promise(() => {}));
+  const scan = service.startIndexing();
+  await wait(20);
+  await service.indexer.cancel();
+  await scan;
+  assert.equal(service.getIndexProgress().phase, 'idle');
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.equal(fixture.errors.length, 0);
+
+  // 3. Normal PDF extraction and passage vectorization succeed in a sandbox without global AbortController.
+  service = await fixture.restart();
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(await fixture.vectorizedPassages(10), 1);
+  assert.equal(await fixture.vectorizedPassages(11), 1);
+  assert.equal(fixture.errors.length, 0);
+});
