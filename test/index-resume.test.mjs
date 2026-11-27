@@ -292,4 +292,26 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
   await open();
   await service.startIndexing();
   assert.equal(requests.length, 0);
+
+  // Rebuilding a missing attachment while embeddings are unavailable clears rebuild_progress instead of looping.
+  const origGetFilePath = attachment.getFilePathAsync;
+  const origGetProvider = service.getProvider.bind(service);
+  const realProvider = await origGetProvider();
+  attachment.getFilePathAsync = async () => null;
+  attachment.attachmentHash = null;
+  attachment.attachmentModificationTime = null;
+  service.getProvider = async () => ({
+    ...realProvider,
+    getModelFingerprint: () => realProvider.getModelFingerprint(),
+    getStatus: async () => ({ ...(await realProvider.getStatus()), ready: false, neuralAvailable: false }),
+  });
+  await service.startIndexing(true);
+  assert.equal(await service.store.getRebuildFrom(20), null);
+  assert.equal((await service.store.getAttachmentState(20)).status, 'missing');
+  const callsAfterMissingRebuild = extractionCalls;
+  await service.startIndexing();
+  assert.equal(extractionCalls, callsAfterMissingRebuild);
+  assert.equal(service.getIndexProgress().skippedUnchanged >= 1, true);
+  attachment.getFilePathAsync = origGetFilePath;
+  service.getProvider = origGetProvider;
 });

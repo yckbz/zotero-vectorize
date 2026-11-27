@@ -58,14 +58,16 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
   });
   const items = new Map([paper(10, 'Stuck paper', 20, 1), attachment(20, 'STUCK', 10, 1),
     paper(11, 'Readable paper', 21, 2), attachment(21, 'READABLE', 11, 2)].map((item) => [item.id, item]));
+  const makeWorker = () => ({ processing: false, pending: [] });
   const fixture = {
+    items,
     requested: new Map(),
     completed: new Map(),
     embedded: [],
     errors: [],
     /** How many library scans listed the personal library. */
     scans: 0,
-    worker: { jobs: 0, queue: Promise.resolve() },
+    worker: makeWorker(),
     // A job of Zotero's own, such as indexing new PDFs for its full-text search, that holds the worker.
     occupy: (hold) => schedule(() => hold),
     open: async () => {
@@ -77,7 +79,7 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
     // Restarting Zotero starts a new PDF worker.
     restart: async () => {
       await service.shutdown();
-      fixture.worker = { jobs: 0, queue: Promise.resolve() };
+      fixture.worker = makeWorker();
       return fixture.open();
     },
     vectorizedPassages: async (itemID) =>
@@ -85,11 +87,29 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
     workerFree: () => waitFor(() => service.indexer.stalledRead === null, 'the PDF worker was not released'),
   };
   const count = (map, id) => map.set(id, (map.get(id) ?? 0) + 1);
+  const processQueue = async (worker) => {
+    if (worker.processing) return;
+    worker.processing = true;
+    try {
+      while (worker.pending.length) {
+        const entry = worker.pending.shift();
+        try {
+          entry.resolve(await entry.run());
+        } catch (error) {
+          entry.reject(error);
+        }
+      }
+    } finally {
+      worker.processing = false;
+    }
+  };
   const schedule = (run) => {
     const worker = fixture.worker;
-    worker.jobs++;
-    const job = worker.queue.then(run).finally(() => { worker.jobs--; });
-    worker.queue = job.catch(() => {});
+    let resolve;
+    let reject;
+    const job = new Promise((res, rej) => { resolve = res; reject = rej; });
+    worker.pending.push({ run, resolve, reject });
+    void processQueue(worker);
     return job;
   };
   globalThis.PathUtils = { join: path.join };
@@ -115,14 +135,16 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
     },
     Notifier: { registerObserver: () => 'test-index', unregisterObserver: () => {} },
     PDFWorker: {
-      get _processingQueue() { return exposeQueue ? fixture.worker.jobs > 0 : undefined; },
-      get _queue() { return exposeQueue ? [] : undefined; },
-      getFullText: (id) => {
+      get _processingQueue() { return exposeQueue ? fixture.worker.processing : undefined; },
+      get _queue() { return exposeQueue ? fixture.worker.pending : undefined; },
+      getFullText: (id, maxPages) => {
         count(fixture.requested, id);
         return schedule(async () => {
-          await delayJob(id);
+          const custom = await delayJob(id, maxPages);
           count(fixture.completed, id);
-          return { text: 'Readable passage about phonon transport in layered crystals.', extractedPages: 1, totalPages: 1 };
+          return custom && typeof custom === 'object' && 'text' in custom
+            ? custom
+            : { text: 'Readable passage about phonon transport in layered crystals.', extractedPages: 1, totalPages: 1 };
         });
       },
     },
@@ -209,19 +231,35 @@ test('Text Zotero extracts after a timeout is reused by the next scan instead of
   assert.equal(await fixture.vectorizedPassages(11), 1);
 });
 
-test('A read that fails after timing out is not kept, so the next attempt reads the PDF again', async (t) => {
-  // The first extraction of PDF 20 outlasts the timeout and then fails. Later ones succeed at once.
+test('A read that fails after timing out is not kept and keeps its timeout strike', async (t) => {
+  // The first two extractions of PDF 20 outlast the timeout and then fail.
   let calls = 0;
-  const fixture = await createFixture(t, (id) => id === 20 && ++calls === 1 &&
-    wait(150).then(() => { throw new Error('temporary read failure'); }));
+  const fixture = await createFixture(t, (id) => id === 20 && ++calls <= 2 &&
+    wait(100).then(() => { throw new Error('temporary read failure'); }));
   const service = await fixture.open();
   await service.startIndexing();
   assert.equal((await service.store.getReadTimeout(20)).strikes, 1);
   await fixture.workerFree();
+  // A late failure does not prove the PDF is healthy, so the strike survives.
+  assert.equal((await service.store.getReadTimeout(20)).strikes, 1);
 
-  await service.indexItems([10], true);
+  // On the second scan, PDF 20 is deferred behind healthy PDF 21, times out and fails late again -> strike 2.
+  await service.startIndexing();
+  assert.equal(await fixture.vectorizedPassages(11), 1);
+  assert.equal((await service.store.getReadTimeout(20)).strikes, 2);
+  await fixture.workerFree();
+  assert.equal((await service.store.getReadTimeout(20)).strikes, 2);
+
+  // A third incremental scan skips PDF 20 without calling the worker again.
+  await service.startIndexing();
   assert.equal(fixture.requested.get(20), 2);
+  assert.match(service.getIndexProgress().lastError, /Skipped STUCK because its text extraction timed out twice/);
+
+  // Explicit forced retry reads PDF 20 again, succeeds, and clears the strike.
+  await service.indexItems([10], true);
+  assert.equal(fixture.requested.get(20), 3);
   assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(await service.store.getReadTimeout(20), null);
   assert.equal(await fixture.vectorizedPassages(10), 1);
 });
 
@@ -396,4 +434,201 @@ test('A manual scan during an automatic scan of every library joins it', async (
   await Promise.all([automaticScan, manual]);
   assert.equal(fixture.scans, 1);
   assert.deepEqual([fixture.requested.get(20), fixture.requested.get(21)], [1, 1]);
+});
+
+test('A PDF that waits behind a Zotero job and then hangs after starting still gets recorded and deferred', async (t) => {
+  let started = 0;
+  const releases = [];
+  t.after(() => { for (const release of releases) release(); });
+  const fixture = await createFixture(t, (id) => {
+    if (id !== 20) return null;
+    started++;
+    return new Promise((resolve) => { releases.push(resolve); });
+  });
+
+  // Round 1: Zotero's own job finishes shortly after the scan starts, then PDF 20 begins extracting and hangs.
+  let service = await fixture.open();
+  fixture.occupy(wait(15));
+  await service.startIndexing();
+  assert.equal(started, 1);
+  assert.equal(service.getIndexProgress().phase, 'incomplete');
+  assert.deepEqual(await service.store.getReadTimeout(20), { fileHash: 'STUCK-hash', mtime: 1000, strikes: 1 });
+  assert.equal(await service.store.getReadTimeout(21), null);
+
+  // Round 2: after restart (even with another brief Zotero job), PDF 20 is deferred so healthy PDF 21 is indexed first.
+  service = await fixture.restart();
+  fixture.occupy(wait(15));
+  await service.startIndexing();
+  assert.equal(await fixture.vectorizedPassages(11), 1);
+  assert.equal(started, 2);
+  assert.equal((await service.store.getReadTimeout(20)).strikes, 2);
+
+  // Round 3: after two strikes, PDF 20 is skipped without touching the worker.
+  service = await fixture.restart();
+  await service.startIndexing();
+  assert.equal(started, 2);
+  assert.match(service.getIndexProgress().lastError, /Skipped STUCK because its text extraction timed out twice/);
+});
+
+test('A healthy PDF waiting behind a long Zotero job still gets its own full extraction timeout', async (t) => {
+  const fixture = await createFixture(t, (id) => id === 20 && wait(30).then(() => undefined));
+  const service = await fixture.open();
+  // 35ms waiting for Zotero + 30ms extracting exceeds the 50ms timeout if combined, but each phase stays within 50ms.
+  fixture.occupy(wait(35));
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.equal(await fixture.vectorizedPassages(10), 1);
+  assert.equal(await fixture.vectorizedPassages(11), 1);
+});
+
+test('Blank-page binary search gives each worker call its own idle wait and timeout attribution', async (t) => {
+  let calls = 0;
+  let releaseHang;
+  t.after(() => releaseHang?.());
+  let mode = 'hang-second';
+  const fixture = await createFixture(t, (id, maxPages) => {
+    if (id !== 20) return null;
+    calls++;
+    if (calls === 1) {
+      // Three leading blank pages so extractPdfPages triggers binary search for first non-blank page.
+      if (mode === 'occupy-before-second') fixture.occupy(new Promise(() => {}));
+      return { text: 'Passage after leading blank pages about electron transport.', extractedPages: 4, totalPages: 4 };
+    }
+    if (mode === 'hang-second') {
+      return new Promise((resolve) => { releaseHang = () => resolve({ text: '', extractedPages: maxPages ?? 1, totalPages: 4 }); });
+    }
+    return { text: maxPages >= 4 ? 'Passage after leading blank pages about electron transport.' : '', extractedPages: maxPages ?? 1, totalPages: 4 };
+  });
+  let service = await fixture.open();
+
+  // First call waited behind a brief Zotero job, second binary-search call ran on an idle worker and hung -> strike 1.
+  fixture.occupy(wait(15));
+  await service.startIndexing();
+  assert.equal(calls, 2);
+  assert.equal((await service.store.getReadTimeout(20)).strikes, 1);
+
+  // Reverse: first call succeeds on idle worker, then Zotero occupies worker indefinitely before the second call -> no strike.
+  service = await fixture.restart();
+  await service.store.clearReadTimeout(20);
+  calls = 0;
+  mode = 'occupy-before-second';
+  await service.startIndexing();
+  assert.equal(calls, 1);
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.match(service.getIndexProgress().lastError, /busy with other PDF tasks/);
+});
+
+test('A synchronous error listing libraries does not wedge later library scans', async (t) => {
+  const fixture = await createFixture(t, () => null);
+  const service = await fixture.open();
+  const originalGetAll = Zotero.Libraries.getAll;
+  Zotero.Libraries.getAll = () => { throw new Error('libraries unavailable'); };
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'error');
+  assert.equal(service.indexer.activeRun, null);
+
+  Zotero.Libraries.getAll = originalGetAll;
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(await fixture.vectorizedPassages(10), 1);
+  assert.equal(await fixture.vectorizedPassages(11), 1);
+});
+
+test('Bookkeeping metadata cleans up on item delete, profile delete, and reconcile without firing write observers', async (t) => {
+  const fixture = await createFixture(t, () => null);
+  const service = await fixture.open();
+  await service.startIndexing();
+
+  // Local timeout and rebuild-start bookkeeping do not spuriously notify write observers.
+  let writeNotifications = 0;
+  const unsub = service.store.subscribeWrites(() => { writeNotifications++; });
+  await service.store.markRebuildStarted(20);
+  await service.store.recordReadTimeout(20, { fileHash: 'STUCK-hash', mtime: 1000 });
+  await service.store.clearReadTimeout(20, { fileHash: 'OTHER-hash', mtime: 1000 });
+  assert.equal((await service.store.getReadTimeout(20)).strikes, 1, 'mismatched signature must not clear timeout');
+  assert.equal(writeNotifications, 0);
+  unsub();
+
+  // Removing a parent item clears child rebuild_progress and read_timeout keys from store_meta.
+  await service.store.removeItem(10);
+  assert.equal(await service.store.getRebuildFrom(20), null);
+  assert.equal(await service.store.getReadTimeout(20), null);
+
+  // Deleting a profile removes its rebuild_progress entries while preserving other profiles.
+  const activeProfile = service.store.activeProfile;
+  const otherProfile = { id: 'other-profile', engine: 'openai', model: 'other', dimensions: 2, provenance: 'verified' };
+  await service.store.markRebuildStarted(21);
+  await service.store.activateProfile(otherProfile);
+  await service.store.markRebuildStarted(21);
+  await service.store.activateProfile(activeProfile, otherProfile.id);
+  assert.equal(await service.store.getRebuildFrom(21), -1);
+  await service.store.deleteProfile(activeProfile.id);
+  assert.equal(await service.store.getRebuildFrom(21), null);
+  await service.store.activateProfile(otherProfile);
+  assert.equal(await service.store.getRebuildFrom(21), null);
+
+  // An orphaned read_timeout for a deleted attachment without attachment_state is cleaned up by reconcileLibrary.
+  await service.store.recordReadTimeout(999, { fileHash: 'GONE', mtime: 1 });
+  assert.equal((await service.store.getReadTimeout(999)).strikes, 1);
+  await service.startIndexing();
+  assert.equal(await service.store.getReadTimeout(999), null);
+});
+
+test('Worker preemption between idle check and submission never charges a timeout strike to a healthy PDF', async (t) => {
+  const fixture = await createFixture(t, () => null);
+  let service = await fixture.open();
+
+  // Case 1: Zotero preempts the worker in the microtask right after waitForPdfWorkerIdle sees idle, two restarts in a row.
+  for (let session = 0; session < 2; session++) {
+    let preempted = false;
+    let releaseFront;
+    const origWait = service.indexer.waitForPdfWorkerIdle.bind(service.indexer);
+    service.indexer.waitForPdfWorkerIdle = async (...args) => {
+      // Deterministically release the initial Zotero job once waitForPdfWorkerIdle is actively waiting.
+      if (releaseFront) {
+        const release = releaseFront;
+        releaseFront = undefined;
+        setTimeout(release, 5);
+      }
+      const result = await origWait(...args);
+      if (result === 'ready' && !preempted) {
+        preempted = true;
+        // Grab the worker before requestFullText resumes from await waitForPdfWorkerIdle.
+        fixture.occupy(new Promise(() => {}));
+      }
+      return result;
+    };
+    fixture.occupy(new Promise((resolve) => { releaseFront = resolve; }));
+    await service.startIndexing();
+    assert.equal(preempted, true);
+    assert.equal(fixture.requested.get(20), undefined);
+    assert.equal(await service.store.getReadTimeout(20), null);
+    assert.match(service.getIndexProgress().lastError, /busy with other PDF tasks/);
+    service = await fixture.restart();
+  }
+
+  // Case 2: Worker is preempted synchronously at getFullText submission so target PDF stays in _queue without running.
+  const origGetFullText = Zotero.PDFWorker.getFullText;
+  let preemptedAtSubmit = false;
+  Zotero.PDFWorker.getFullText = (id, maxPages, isPriority) => {
+    if (id === 20 && !preemptedAtSubmit) {
+      preemptedAtSubmit = true;
+      fixture.occupy(new Promise(() => {}));
+    }
+    return origGetFullText(id, maxPages, isPriority);
+  };
+  await service.startIndexing();
+  Zotero.PDFWorker.getFullText = origGetFullText;
+  assert.equal(preemptedAtSubmit, true);
+  assert.equal(fixture.completed.get(20), undefined);
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.match(service.getIndexProgress().lastError, /busy with other PDF tasks/);
+
+  // Third restart with an idle worker: the healthy PDF was never charged a strike and indexes cleanly.
+  service = await fixture.restart();
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(await fixture.vectorizedPassages(10), 1);
+  assert.equal(await fixture.vectorizedPassages(11), 1);
 });

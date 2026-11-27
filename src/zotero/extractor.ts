@@ -193,8 +193,12 @@ export async function extractPdfPages(
   options?: {
     minTextLength?: number;
     signal?: AbortSignal;
-    /** Called before each request to Zotero's PDF worker with whether the worker was already busy. */
-    onWorkerRequest?: (busy: boolean | null) => void;
+    /** Runs each Zotero PDF worker request; callers may wait for an idle worker or enforce per-call timeouts. */
+    requestFullText?: (maxPages: number | null) => Promise<{
+      text: string;
+      extractedPages: number;
+      totalPages?: number;
+    }>;
   }
 ): Promise<PdfExtractionResult> {
   if (!attachment || attachment.deleted || !attachment.isPDFAttachment()) {
@@ -211,10 +215,9 @@ export async function extractPdfPages(
   let totalPages: number | undefined;
   try {
     options?.signal?.throwIfAborted();
-    const getFullText = (maxPages: number | null) => {
-      options?.onWorkerRequest?.(isPdfWorkerBusy());
-      return Zotero.PDFWorker.getFullText(attachment.id, maxPages, false);
-    };
+    const getFullText = (maxPages: number | null) => options?.requestFullText
+      ? options.requestFullText(maxPages)
+      : Zotero.PDFWorker.getFullText(attachment.id, maxPages, false);
     const res = await getFullText(maxPdfPages > 0 ? maxPdfPages : null);
     rawText = res?.text || '';
     totalPages = res?.totalPages;

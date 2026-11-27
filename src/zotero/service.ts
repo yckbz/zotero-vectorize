@@ -867,6 +867,7 @@ export class VectorizeService {
           throw new Error('Snapshot contains no items from this Zotero library');
         }
       });
+      this.indexer.forgetLateReads();
       await this.reloadIndex();
     });
     if (!await this.hasLegacyIndexForActiveModel()) void this.startIndexing(false);

@@ -13,7 +13,8 @@ import { buildModelFingerprint } from '../core/hash.ts';
 import { isFiniteVector } from '../core/math.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
 import {
-  extractItemMetadata, extractPdfPages, getAttachmentSignature, isIndexableRegularItem, type PdfExtractionResult,
+  extractItemMetadata, extractPdfPages, getAttachmentSignature, isIndexableRegularItem, isPdfWorkerBusy,
+  type PdfExtractionResult,
 } from './extractor.ts';
 import { getStrings } from './i18n.ts';
 import { REBUILD_FROM_EXTRACTION, type VectorStore } from './vector-store.ts';
@@ -25,6 +26,8 @@ const READ_TIMEOUT_SKIP_STRIKES = 2;
 class AttachmentReadTimeout extends Error {}
 /** Zotero's PDF worker runs one job at a time, and an earlier timed-out job still holds it. */
 class PdfWorkerBusy extends AttachmentReadTimeout {}
+/** Waiting for Zotero's own PDF jobs to finish timed out before our PDF was submitted. */
+class PdfWorkerQueuedTimeout extends AttachmentReadTimeout {}
 
 async function waitForAttachmentRead<T>(read: Promise<T>, errorMessage: string, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -414,6 +417,8 @@ export class BackgroundIndexer {
 
     const run = (async () => {
       try {
+        await Promise.resolve();
+        if (this.cancelled || this.disposed) return;
         this.emit({
           phase: 'scanning',
           totalItems: 0,
@@ -527,6 +532,8 @@ export class BackgroundIndexer {
     this.paused = false;
     const run = (async () => {
       try {
+        await Promise.resolve();
+        if (this.cancelled || this.disposed) return;
         await this.processItemIds(Array.from(resolvedRegularIds), forceRebuild, false, automatic);
       } catch (err: any) {
         Zotero.logError(err);
@@ -544,22 +551,40 @@ export class BackgroundIndexer {
     return run;
   }
 
+  private async waitForPdfWorkerIdle(
+    budget: { remaining: number }, pollMs: number, isStillValid: () => boolean
+  ): Promise<'ready' | 'cancelled' | 'busy_timeout'> {
+    while (isPdfWorkerBusy() === true) {
+      if (this.cancelled || this.disposed || !isStillValid()) return 'cancelled';
+      if (this.paused) {
+        if (!(await this.waitIfPaused()) || !isStillValid()) return 'cancelled';
+        continue;
+      }
+      if (budget.remaining <= 0) return 'busy_timeout';
+      const step = Math.min(pollMs, budget.remaining);
+      const startedAt = Date.now();
+      await yieldToEventLoop(step);
+      budget.remaining -= Math.max(step, Date.now() - startedAt);
+    }
+    return this.cancelled || this.disposed || !isStillValid() ? 'cancelled' : 'ready';
+  }
+
   private watchStalledRead(
     attachmentID: number, signature: { fileHash: string; mtime: number }, maxPdfPages: number, read: Promise<PdfExtractionResult>
   ): void {
     const generation = this.lateReadGeneration;
     const stalled: Promise<void> = read.then((result) => result, () => null).then(async (result) => {
       if (this.stalledRead === stalled) this.stalledRead = null;
-      if (this.disposed) return;
+      // Only a successful late read proves the file is merely slow rather than stuck. A read that times out
+      // and then errors keeps its timeout strike so repeated failures still reach the skip threshold.
+      if (this.disposed || !result || result.status === 'error' || generation !== this.lateReadGeneration) return;
       // Zotero finished the job after the scan moved on, so the file is slow rather than stuck. Keep the
       // text for the next scan of this file version instead of extracting it again or skipping it.
-      // Nothing is indexed here: the user's next scan decides when and what to index. A failed read is
-      // not kept, so the next scan reads the file again, and neither is text from before the index was cleared.
-      if (result && result.status !== 'error' && generation === this.lateReadGeneration) {
-        this.lateReads.set(attachmentID, { ...signature, maxPdfPages, result });
-      }
+      // Nothing is indexed here: the user's next scan decides when and what to index.
+      this.lateReads.set(attachmentID, { ...signature, maxPdfPages, result });
+      if (this.suspended) return;
       try {
-        await this.deps.store.clearReadTimeout(attachmentID);
+        await this.deps.store.clearReadTimeout(attachmentID, signature);
       } catch (error) {
         if (!this.disposed) Zotero.logError(error);
       }
@@ -575,7 +600,9 @@ export class BackgroundIndexer {
     item: ZoteroItem, att: ZoteroItem, provider: EmbeddingProvider, canEmbed: boolean,
     force: boolean, cfg: PluginConfig,
     recordFailure: (message: string) => void,
-    recordText: (count: number) => void
+    recordText: (count: number) => void,
+    rebuildIds: ReadonlySet<number> | null,
+    externalWorkerBusy: { current: boolean }
   ): Promise<PreparedAttachment | null> {
     const { store, searchIndex } = this.deps;
     const strings = getStrings(cfg);
@@ -596,7 +623,7 @@ export class BackgroundIndexer {
     const model = provider.getModelFingerprint();
     const hasDimension = model !== buildModelFingerprint(provider.engine, provider.model);
     // A failed or cancelled rebuild resumes from its saved position instead of treating old vectors as rebuilt.
-    const savedRebuild = force ? null : await store.getRebuildFrom(att.id);
+    const savedRebuild = force || (rebuildIds !== null && !rebuildIds.has(att.id)) ? null : await store.getRebuildFrom(att.id);
     if (sameLayout && savedRebuild === null && (previous.status === 'no_text' || previous.status === 'missing' ||
         (previous.status === 'indexed' && (!canEmbed || fingerprintMatches(previous.modelFingerprint, model, hasDimension))))) {
       this.emit({ skippedUnchanged: this.progress.skippedUnchanged + 1 });
@@ -617,37 +644,125 @@ export class BackgroundIndexer {
     const work: PreparedAttachment = { item, attachment: att, state, remaining: 0, rebuildFrom };
     let chunks = existing;
     if (!reuseLayout) {
-      // A file version that timed out in several runs would stall every scan, so later scans skip it until
-      // it changes or the user indexes the item explicitly. One timeout alone can be a busy PDF worker.
       const timedOut = await store.getReadTimeout(att.id);
-      if (timedOut && !force && timedOut.fileHash === sig.fileHash && timedOut.mtime === sig.mtime &&
-          timedOut.strikes >= READ_TIMEOUT_SKIP_STRIKES) {
-        recordFailure(strings.indexReadTimeoutSkipped(title));
-        return null;
-      }
       const late = this.lateReads.get(att.id);
       this.lateReads.delete(att.id);
       let extracted: PdfExtractionResult;
       if (late && late.fileHash === sig.fileHash && late.mtime === sig.mtime && late.maxPdfPages === cfg.maxPdfPages) {
         extracted = late.result;
       } else {
+        // A file version that timed out in several runs would stall every scan, so later scans skip it until
+        // it changes or the user indexes the item explicitly. One timeout alone can be a busy PDF worker.
+        if (timedOut && !force && timedOut.fileHash === sig.fileHash && timedOut.mtime === sig.mtime &&
+            timedOut.strikes >= READ_TIMEOUT_SKIP_STRIKES) {
+          recordFailure(strings.indexReadTimeoutSkipped(title));
+          return null;
+        }
         // Abandoning a timed-out read does not free Zotero's serial PDF worker. Starting another read
         // would only queue behind it and wrongly record a healthy file as timed out.
-        if (this.stalledRead) throw new PdfWorkerBusy(strings.indexPdfWorkerBusy(title));
-        // A request made while Zotero's worker had another job waits behind it, so its timeout does not show
-        // that this file is stuck. When Zotero does not expose its queue, the timeout counts.
-        let queued = false;
-        const read = extractPdfPages(att, cfg.maxPdfPages, sig, { onWorkerRequest: (busy) => { queued ||= busy === true; } });
+        if (sig.filePath) {
+          if (this.stalledRead) throw new PdfWorkerBusy(strings.indexPdfWorkerBusy(title));
+          if (externalWorkerBusy.current) {
+            if (isPdfWorkerBusy() === true) throw new PdfWorkerBusy(strings.indexPdfWorkerBusy(title));
+            externalWorkerBusy.current = false;
+          }
+        }
         const timeoutMessage = strings.indexReadTimeout(strings.indexReadingPdf, title, this.readTimeoutMs / 1000);
+        const controller = new AbortController();
+        let busyTimeoutError: PdfWorkerQueuedTimeout | null = null;
+        let timedOutWhileQueued = false;
+        let abandonedToStalledRead = false;
+        let activeTimer: ReturnType<typeof setTimeout> | undefined;
+        let rejectForeground!: (error: AttachmentReadTimeout) => void;
+        const foregroundTimeout = new Promise<never>((_, reject) => { rejectForeground = reject; });
+        const clearActiveTimer = () => {
+          if (activeTimer !== undefined) {
+            clearTimeout(activeTimer);
+            activeTimer = undefined;
+          }
+        };
+        // Wait for Zotero's serial PDF worker to finish its own jobs before submitting ours, then give
+        // our extraction its own full timeout. That way a file that starts after queuing and hangs is
+        // still blamed and deferred, while a healthy file never loses its timeout budget to Zotero's queue.
+        const read = extractPdfPages(att, cfg.maxPdfPages, sig, {
+          signal: controller.signal,
+          requestFullText: async (maxPages) => {
+            if (abandonedToStalledRead) {
+              if (this.disposed) {
+                controller.abort();
+                controller.signal.throwIfAborted();
+              }
+              return Zotero.PDFWorker.getFullText(att.id, maxPages, false);
+            }
+            // Re-check in a loop with a shared wait budget so a Zotero task grabbing the worker in the
+            // microtask after waitForPdfWorkerIdle resolves cannot push our submission into pure queuing.
+            const waitBudget = { remaining: this.readTimeoutMs };
+            const pollMs = Math.min(50, Math.max(5, Math.floor(this.readTimeoutMs / 10)));
+            while (isPdfWorkerBusy() === true) {
+              const waitResult = await this.waitForPdfWorkerIdle(waitBudget, pollMs, () => this.isCurrent(work));
+              if (waitResult === 'cancelled') {
+                controller.abort();
+                controller.signal.throwIfAborted();
+              }
+              if (waitResult === 'busy_timeout') {
+                externalWorkerBusy.current = true;
+                busyTimeoutError = new PdfWorkerQueuedTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`);
+                controller.abort(busyTimeoutError);
+                throw busyTimeoutError;
+              }
+            }
+            if (this.cancelled || this.disposed || !this.isCurrent(work)) {
+              controller.abort();
+              controller.signal.throwIfAborted();
+            }
+            clearActiveTimer();
+            const worker = Zotero.PDFWorker;
+            const queueBefore = Array.isArray(worker._queue) ? new Set(worker._queue) : null;
+            const request = worker.getFullText(att.id, maxPages, false);
+            let queuedEntry: unknown;
+            let hasQueuedEntry = false;
+            if (queueBefore && Array.isArray(worker._queue)) {
+              for (let i = worker._queue.length - 1; i >= 0; i--) {
+                if (!queueBefore.has(worker._queue[i])) {
+                  queuedEntry = worker._queue[i];
+                  hasQueuedEntry = true;
+                  break;
+                }
+              }
+            }
+            activeTimer = setTimeout(() => {
+              activeTimer = undefined;
+              abandonedToStalledRead = true;
+              // If the worker was preempted at submission time and our entry is still sitting in _queue,
+              // this PDF never started running and must not be charged a timeout strike.
+              const stillQueued = hasQueuedEntry && Array.isArray(worker._queue) && worker._queue.includes(queuedEntry);
+              if (stillQueued) {
+                timedOutWhileQueued = true;
+                rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`));
+              } else {
+                rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfTimeoutNote}`));
+              }
+            }, this.readTimeoutMs);
+            try {
+              return await request;
+            } finally {
+              clearActiveTimer();
+            }
+          },
+        });
         try {
-          extracted = await waitForAttachmentRead(read, `${timeoutMessage} ${strings.indexPdfTimeoutNote}`, this.readTimeoutMs);
+          extracted = await Promise.race([read, foregroundTimeout]);
         } catch (error) {
+          clearActiveTimer();
+          if (busyTimeoutError) throw busyTimeoutError;
+          if (controller.signal.aborted) return null;
           if (!(error instanceof AttachmentReadTimeout)) throw error;
           // Watch before the write is queued, so a late result always clears the record after it is made.
           this.watchStalledRead(att.id, sig, cfg.maxPdfPages, read);
-          if (queued) throw new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`);
-          await store.recordReadTimeout(att.id, sig);
+          if (!timedOutWhileQueued) await store.recordReadTimeout(att.id, sig);
           throw error;
+        } finally {
+          clearActiveTimer();
         }
       }
       if (timedOut) await store.clearReadTimeout(att.id);
@@ -679,7 +794,8 @@ export class BackgroundIndexer {
     work.remaining = canEmbed ? chunks.filter((chunk) => needsEmbedding(work, chunk)).length : 0;
     if (work.remaining) state.status = 'pending';
     // Without an embedding engine the rebuild position is kept, so vectors are rebuilt once it is available.
-    const rebuildUpdate = rebuildFrom === null ? undefined : canEmbed && !work.remaining ? null : rebuildFrom;
+    // Attachments with no extractable passages have nothing left to re-embed and clear rebuild state immediately.
+    const rebuildUpdate = rebuildFrom === null ? undefined : (!chunks.length || (canEmbed && !work.remaining)) ? null : rebuildFrom;
     if (!reuseLayout) {
       const parents = await store.saveAttachmentChunksAndState(chunks, state, 'replace', rebuildUpdate);
       await store.readCommitted(async () => {
@@ -730,12 +846,14 @@ export class BackgroundIndexer {
     };
     const ready: PreparedAttachment[] = [];
     let reader: Promise<void> | undefined;
+    const rebuildIds = force ? null : await store.getRebuildProgressAttachmentIDs();
+    const externalWorkerBusy = { current: false };
 
     const prepare = async (item: ZoteroItem, att: ZoteroItem): Promise<PreparedAttachment | null> => {
       this.emit({ totalAttachments: this.progress.totalAttachments + 1 });
       try {
         return await this.prepareAttachment(item, att, provider, canEmbed, force, cfg, recordFailure,
-          (count) => { savedChunks += count; });
+          (count) => { savedChunks += count; }, rebuildIds, externalWorkerBusy);
       } catch (error) {
         // A timed-out or blocked read skips only this attachment. Other attachments still get their
         // vectors, and their PDFs are read once Zotero's PDF worker is free again.
@@ -748,6 +866,7 @@ export class BackgroundIndexer {
     };
     const preparePdfs = async function* (this: BackgroundIndexer) {
       // Attachments whose extraction timed out before go last, so they cannot hold up the rest of the library.
+      const timedOutIds = await store.getReadTimeoutAttachmentIDs();
       const deferred: Array<[ZoteroItem, ZoteroItem]> = [];
       for (const itemID of itemIds) {
         if (!(await this.waitIfPaused())) return;
@@ -757,7 +876,7 @@ export class BackgroundIndexer {
           if (!(await this.waitIfPaused())) return;
           const att = await Zotero.Items.getAsync(attachmentID).catch(() => null);
           if (!att || att.deleted || !att.isPDFAttachment()) continue;
-          if (await store.getReadTimeout(att.id)) {
+          if (timedOutIds.has(att.id)) {
             deferred.push([item, att]);
             continue;
           }

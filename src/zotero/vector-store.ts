@@ -42,12 +42,21 @@ const SNAPSHOT_COLUMNS = {
 /** Rebuild position meaning the attachment's PDF must be extracted again before its passages are re-embedded. */
 export const REBUILD_FROM_EXTRACTION = -1;
 
+const REBUILD_PROGRESS_PREFIX = 'rebuild_progress:';
+const READ_TIMEOUT_PREFIX = 'read_timeout:';
+
 function rebuildProgressKey(attachmentID: number): string {
-  return `rebuild_progress:${attachmentID}`;
+  return `${REBUILD_PROGRESS_PREFIX}${attachmentID}`;
 }
 
 function readTimeoutKey(attachmentID: number): string {
-  return `read_timeout:${attachmentID}`;
+  return `${READ_TIMEOUT_PREFIX}${attachmentID}`;
+}
+
+function parseMetaAttachmentID(key: string, prefix: string): number | null {
+  if (!key.startsWith(prefix)) return null;
+  const id = Number(key.slice(prefix.length));
+  return Number.isInteger(id) && id > 0 ? id : null;
 }
 
 function parseReadTimeout(raw: string | null): { fileHash: string; mtime: number; strikes: number } | null {
@@ -98,13 +107,15 @@ export class VectorStore {
     return this.dbPath;
   }
 
-  private enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+  private enqueueWrite<T>(fn: () => Promise<T>, notify = true): Promise<T> {
     const run = this.writeChain.then(fn, fn).then((result) => {
-      for (const listener of this.writeListeners) {
-        try {
-          listener();
-        } catch {
-          // A UI observer cannot fail a committed write.
+      if (notify) {
+        for (const listener of this.writeListeners) {
+          try {
+            listener();
+          } catch {
+            // A UI observer cannot fail a committed write.
+          }
         }
       }
       return result;
@@ -372,6 +383,7 @@ export class VectorStore {
         if (profile) await this.ensureProfile(conn, profile);
         if (discardId && discardId !== profile?.id) {
           await conn.queryAsync('DELETE FROM embedding_profiles WHERE id = ?', [discardId]);
+          await this.clearRebuildProgressForProfile(conn, discardId);
         }
       });
       this.profile = profile;
@@ -399,6 +411,7 @@ export class VectorStore {
       const conn = await this.ensureConn();
       await conn.executeTransaction(async () => {
         await conn.queryAsync('DELETE FROM embedding_profiles WHERE id = ?', [id]);
+        await this.clearRebuildProgressForProfile(conn, id);
         if (id === this.profile?.id) {
           await this.ensureProfile(conn, { ...this.profile, dimensions: 0 });
         }
@@ -734,17 +747,39 @@ export class VectorStore {
     return this.enqueueWrite(async () => {
       const conn = await this.ensureConn();
       await conn.executeTransaction(async () => {
+        const attachments = await conn.queryAsync<{ attachment_id: number }>(
+          `SELECT attachment_id FROM attachment_state WHERE parent_item_id = ?
+           UNION SELECT DISTINCT attachment_id FROM fulltext_chunks WHERE item_id = ? AND attachment_id > 0`,
+          [itemID, itemID]
+        );
         await conn.queryAsync('DELETE FROM item_vectors WHERE item_id = ?', [itemID]);
         await conn.queryAsync('DELETE FROM fulltext_chunks WHERE item_id = ?', [itemID]);
         await conn.queryAsync('DELETE FROM attachment_state WHERE parent_item_id = ?', [itemID]);
+        for (const row of attachments) {
+          const attachmentID = Number(row.attachment_id);
+          await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [rebuildProgressKey(attachmentID)]);
+          await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [readTimeoutKey(attachmentID)]);
+        }
       });
     });
   }
 
   async getStoredAttachmentIDs(): Promise<number[]> {
     const conn = await this.ensureConn();
+    const ids = new Set<number>();
     const rows = await conn.queryAsync<{ attachment_id: number }>('SELECT attachment_id FROM attachment_state');
-    return rows.map((row) => Number(row.attachment_id));
+    for (const row of rows) ids.add(Number(row.attachment_id));
+    for (const prefix of [REBUILD_PROGRESS_PREFIX, READ_TIMEOUT_PREFIX]) {
+      const metaRows = await conn.queryAsync<{ key: string }>(
+        'SELECT key FROM store_meta WHERE key >= ? AND key < ?',
+        [prefix, prefix.slice(0, -1) + ';']
+      );
+      for (const row of metaRows) {
+        const id = parseMetaAttachmentID(row.key, prefix);
+        if (id !== null) ids.add(id);
+      }
+    }
+    return [...ids];
   }
 
   async getShareableAttachments(libraryID: number, chunkingKey: string): Promise<Array<{
@@ -840,6 +875,24 @@ export class VectorStore {
     return Number.isInteger(value) && value >= REBUILD_FROM_EXTRACTION ? value : null;
   }
 
+  async getRebuildProgressAttachmentIDs(): Promise<Set<number>> {
+    const profile = this.profile;
+    const ids = new Set<number>();
+    if (!profile) return ids;
+    const conn = await this.ensureConn();
+    const rows = await conn.queryAsync<{ key: string; value: string }>(
+      'SELECT key, value FROM store_meta WHERE key >= ? AND key < ?',
+      [REBUILD_PROGRESS_PREFIX, REBUILD_PROGRESS_PREFIX.slice(0, -1) + ';']
+    );
+    for (const row of rows) {
+      const id = parseMetaAttachmentID(row.key, REBUILD_PROGRESS_PREFIX);
+      if (id === null) continue;
+      const value = this.parseRebuildProgress(row.value)[profile.id];
+      if (Number.isInteger(value) && value >= REBUILD_FROM_EXTRACTION) ids.add(id);
+    }
+    return ids;
+  }
+
   /**
    * Records that a rebuild of an already indexed attachment has started for the active model. Saving the
    * newly extracted passages replaces the record, so it remains only when the rebuild stops before that.
@@ -854,7 +907,7 @@ export class VectorStore {
           [attachmentID])) return;
         await this.writeRebuildFrom(conn, attachmentID, profile.id, REBUILD_FROM_EXTRACTION);
       });
-    });
+    }, false);
   }
 
   private parseRebuildProgress(raw: string | null): Record<string, number> {
@@ -882,12 +935,43 @@ export class VectorStore {
     }
   }
 
+  private async clearRebuildProgressForProfile(conn: ZoteroDBConnectionInstance, profileID: string): Promise<void> {
+    const rows = await conn.queryAsync<{ key: string; value: string }>(
+      'SELECT key, value FROM store_meta WHERE key >= ? AND key < ?',
+      [REBUILD_PROGRESS_PREFIX, REBUILD_PROGRESS_PREFIX.slice(0, -1) + ';']
+    );
+    for (const row of rows) {
+      const progress = this.parseRebuildProgress(row.value);
+      if (!Object.hasOwn(progress, profileID)) continue;
+      delete progress[profileID];
+      if (Object.keys(progress).length) {
+        await conn.queryAsync('INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)', [row.key, JSON.stringify(progress)]);
+      } else {
+        await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [row.key]);
+      }
+    }
+  }
+
   /**
    * The file version whose PDF text extraction last timed out, and how many runs in a row it timed out in.
    * Scans skip a file version only after repeated timeouts, so one slow moment cannot hide a healthy PDF.
    */
   async getReadTimeout(attachmentID: number): Promise<{ fileHash: string; mtime: number; strikes: number } | null> {
     return parseReadTimeout(await this.getMeta(readTimeoutKey(attachmentID)));
+  }
+
+  async getReadTimeoutAttachmentIDs(): Promise<Set<number>> {
+    const conn = await this.ensureConn();
+    const rows = await conn.queryAsync<{ key: string; value: string }>(
+      'SELECT key, value FROM store_meta WHERE key >= ? AND key < ?',
+      [READ_TIMEOUT_PREFIX, READ_TIMEOUT_PREFIX.slice(0, -1) + ';']
+    );
+    const ids = new Set<number>();
+    for (const row of rows) {
+      const id = parseMetaAttachmentID(row.key, READ_TIMEOUT_PREFIX);
+      if (id !== null && parseReadTimeout(row.value)) ids.add(id);
+    }
+    return ids;
   }
 
   async recordReadTimeout(attachmentID: number, signature: { fileHash: string; mtime: number }): Promise<void> {
@@ -900,14 +984,20 @@ export class VectorStore {
       const strikes = sameVersion ? previous.strikes + 1 : 1;
       await conn.queryAsync('INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)',
         [key, JSON.stringify({ fileHash: signature.fileHash, mtime: signature.mtime, strikes })]);
-    });
+    }, false);
   }
 
-  async clearReadTimeout(attachmentID: number): Promise<void> {
+  async clearReadTimeout(attachmentID: number, signature?: { fileHash: string; mtime: number }): Promise<void> {
     return this.enqueueWrite(async () => {
       const conn = await this.ensureConn();
-      await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [readTimeoutKey(attachmentID)]);
-    });
+      const key = readTimeoutKey(attachmentID);
+      if (signature) {
+        const raw = await conn.valueQueryAsync<string | false>('SELECT value FROM store_meta WHERE key = ?', [key]);
+        const previous = parseReadTimeout(typeof raw === 'string' ? raw : null);
+        if (!previous || previous.fileHash !== signature.fileHash || previous.mtime !== signature.mtime) return;
+      }
+      await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [key]);
+    }, false);
   }
 
   async clearAll(): Promise<void> {
