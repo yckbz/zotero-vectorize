@@ -96,6 +96,14 @@ export class BackgroundIndexer {
   /** Explicitly requested items queued during a busy run, mapped to whether the request was forced. */
   private pendingExplicitIds = new Map<number, boolean>();
   private activeRun: Promise<void> | null = null;
+  /**
+   * Set while activeRun is a library scan, to tell which later scan requests it already covers. An automatic
+   * scan leaves out libraries that should not be indexed automatically, such as a personal library that
+   * receives a shared index, and records when it did.
+   */
+  private activeLibraryScan: { force: boolean; automatic: boolean; excludedLibrary: boolean } | null = null;
+  /** A library scan requested while another run was active. It runs next instead of being dropped. */
+  private queuedLibraryScan: { force: boolean; automatic: boolean; done: Promise<void>; resolve: () => void } | null = null;
   private activeLibraryVectorProvider: EmbeddingProvider | null = null;
   private pendingModelBackfill: EmbeddingProvider | null = null;
   private paused = false;
@@ -259,6 +267,13 @@ export class BackgroundIndexer {
     const pendingModelBackfill = this.pendingModelBackfill;
     this.pendingModelBackfill = null;
     if (this.disposed || this.cancelled) return;
+    const queued = this.queuedLibraryScan;
+    if (queued) {
+      // The queued scan also embeds whatever a pending model backfill would, and drains queued items after it.
+      this.queuedLibraryScan = null;
+      void this.startLibraryScan(queued.force, queued.automatic).finally(queued.resolve);
+      return;
+    }
     if (pendingModelBackfill && (this.progress.phase === 'completed' || this.progress.phase === 'incomplete')) {
       void this.startLibraryScan(false, true);
       return;
@@ -354,6 +369,9 @@ export class BackgroundIndexer {
     this.cancelled = true;
     this.paused = false;
     this.pendingModelBackfill = null;
+    const queued = this.queuedLibraryScan;
+    this.queuedLibraryScan = null;
+    queued?.resolve();
     if (this.activeRun) {
       await this.activeRun.catch(() => {});
     }
@@ -381,10 +399,18 @@ export class BackgroundIndexer {
   async startLibraryScan(forceRebuild = false, automatic = false): Promise<void> {
     if (this.disposed || this.cancelled || this.suspended) return;
     if (this.activeRun) {
-      return this.activeRun;
+      // A running library scan already covers an incremental request. A rebuild asked for during an
+      // incremental scan, or any library scan asked for during a single-item run, runs next instead.
+      const active = this.activeLibraryScan;
+      if (active && (active.force || !forceRebuild) && (!active.automatic || automatic ||
+          (!active.excludedLibrary && !this.excludesAnyLibrary()))) {
+        return this.activeRun;
+      }
+      return this.queueLibraryScan(forceRebuild, automatic);
     }
     this.cancelled = false;
     this.paused = false;
+    this.activeLibraryScan = { force: forceRebuild, automatic, excludedLibrary: false };
 
     const run = (async () => {
       try {
@@ -434,12 +460,37 @@ export class BackgroundIndexer {
         this.emit({ phase: 'error', message: error + note, lastError: error });
       } finally {
         this.activeRun = null;
+        this.activeLibraryScan = null;
         this.schedulePendingDrainAfterRun();
       }
     })();
 
     this.activeRun = run;
     return run;
+  }
+
+  /** Whether automatic indexing currently leaves out a library that a manual scan would index. */
+  private excludesAnyLibrary(): boolean {
+    const shouldAutoIndex = this.deps.shouldAutoIndex;
+    if (!shouldAutoIndex) return false;
+    try {
+      return Zotero.Libraries.getAll().some((lib) => lib.libraryType !== 'feed' && !shouldAutoIndex(lib.libraryID));
+    } catch {
+      return true;
+    }
+  }
+
+  private queueLibraryScan(force: boolean, automatic: boolean): Promise<void> {
+    const queued = this.queuedLibraryScan;
+    if (queued) {
+      queued.force ||= force;
+      queued.automatic &&= automatic;
+      return queued.done;
+    }
+    let resolve!: () => void;
+    const done = new Promise<void>((settle) => { resolve = settle; });
+    this.queuedLibraryScan = { force, automatic, done, resolve };
+    return done;
   }
 
   async indexItemOrAttachmentIds(rawIds: number[], forceRebuild = false, automatic = false): Promise<void> {
@@ -662,7 +713,11 @@ export class BackgroundIndexer {
     });
 
     const { store, searchIndex } = this.deps;
-    const allowed = (item: ZoteroItem) => !automatic || this.deps.shouldAutoIndex?.(item.libraryID) !== false;
+    const allowed = (item: ZoteroItem): boolean => {
+      if (!automatic || this.deps.shouldAutoIndex?.(item.libraryID) !== false) return true;
+      if (libraryScan && this.activeLibraryScan) this.activeLibraryScan.excludedLibrary = true;
+      return false;
+    };
     let savedChunks = 0;
     const recordFailure = (message: string): void => {
       this.emit({ failedCount: this.progress.failedCount + 1, lastError: this.progress.lastError ?? message });

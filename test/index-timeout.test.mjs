@@ -17,10 +17,10 @@ async function waitFor(condition, message) {
   assert.fail(message);
 }
 
-// Paper 10 has PDF 20 and paper 11 has PDF 21. Like Zotero's PDF worker, the fixture runs one job at a
-// time, so a job that never finishes blocks every job queued after it, and it exposes whether a job is
-// running or queued the way Zotero does. `delayJob(id)` may return a promise that holds the job for that
-// attachment.
+// Paper 10 with PDF 20 is in the personal library, and paper 11 with PDF 21 is in a group library. Like
+// Zotero's PDF worker, the fixture runs one job at a time, so a job that never finishes blocks every job
+// queued after it, and it exposes whether a job is running or queued the way Zotero does. `delayJob(id)`
+// may return a promise that holds the job for that attachment.
 async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'zv-timeout-'));
   const pdf = path.join(dataDir, 'test.pdf');
@@ -42,27 +42,29 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
     ['autoIndexOnStartup', false],
     ['uiLanguage', 'en-US'],
   ]);
-  const paper = (id, title, attachmentID) => ({
-    id, key: `PAPER${id}`, libraryID: 1, itemType: 'journalArticle',
+  const paper = (id, title, attachmentID, libraryID) => ({
+    id, key: `PAPER${id}`, libraryID, itemType: 'journalArticle',
     isRegularItem: () => true,
     getField: (field) => field === 'title' ? title : '',
     getAttachments: () => [attachmentID],
   });
-  const attachment = (id, key, parentItemID) => ({
-    id, key, libraryID: 1, parentItemID,
+  const attachment = (id, key, parentItemID, libraryID) => ({
+    id, key, libraryID, parentItemID,
     isRegularItem: () => false,
     isPDFAttachment: () => true,
     getFilePathAsync: async () => pdf,
     attachmentHash: `${key}-hash`,
     attachmentModificationTime: 1000,
   });
-  const items = new Map([paper(10, 'Stuck paper', 20), attachment(20, 'STUCK', 10),
-    paper(11, 'Readable paper', 21), attachment(21, 'READABLE', 11)].map((item) => [item.id, item]));
+  const items = new Map([paper(10, 'Stuck paper', 20, 1), attachment(20, 'STUCK', 10, 1),
+    paper(11, 'Readable paper', 21, 2), attachment(21, 'READABLE', 11, 2)].map((item) => [item.id, item]));
   const fixture = {
     requested: new Map(),
     completed: new Map(),
     embedded: [],
     errors: [],
+    /** How many library scans listed the personal library. */
+    scans: 0,
     worker: { jobs: 0, queue: Promise.resolve() },
     // A job of Zotero's own, such as indexing new PDFs for its full-text search, that holds the worker.
     occupy: (hold) => schedule(() => hold),
@@ -103,8 +105,14 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
       registerObserver: () => 1,
       unregisterObserver: () => {},
     },
-    Libraries: { getAll: () => [{ libraryID: 1, libraryType: 'user' }] },
-    Items: { getAll: async () => [...items.values()], getAsync: async (id) => items.get(id) },
+    Libraries: { getAll: () => [{ libraryID: 1, libraryType: 'user' }, { libraryID: 2, libraryType: 'group' }] },
+    Items: {
+      getAll: async (libraryID) => {
+        if (libraryID === 1) fixture.scans++;
+        return [...items.values()].filter((item) => item.libraryID === libraryID);
+      },
+      getAsync: async (id) => items.get(id),
+    },
     Notifier: { registerObserver: () => 'test-index', unregisterObserver: () => {} },
     PDFWorker: {
       get _processingQueue() { return exposeQueue ? fixture.worker.jobs > 0 : undefined; },
@@ -324,4 +332,68 @@ test('A forced retry requested while another run is busy keeps its force flag', 
     'the queued forced retry ran as a normal scan and skipped the timed-out PDF');
   await waitFor(() => service.getIndexProgress().phase === 'completed', 'the forced retry did not finish');
   assert.equal(await fixture.vectorizedPassages(10), 1);
+});
+
+test('A rebuild requested during a single-item run runs after it instead of being dropped', async (t) => {
+  let busy = null;
+  const fixture = await createFixture(t, (id) => id === 21 && busy);
+  const service = await fixture.open();
+  await service.startIndexing();
+  assert.deepEqual([fixture.requested.get(20), fixture.requested.get(21)], [1, 1]);
+
+  let finishItemRun;
+  busy = new Promise((resolve) => { finishItemRun = resolve; });
+  const itemRun = service.indexItems([11], true);
+  await waitFor(() => fixture.requested.get(21) === 2, 'the item run did not start');
+
+  // The rebuild waits for the item run, and the caller's promise settles once the rebuild itself is done.
+  let rebuilt = false;
+  const rebuild = service.startIndexing(true).then(() => { rebuilt = true; });
+  // A second request while the rebuild is queued joins it rather than adding another scan.
+  const incremental = service.startIndexing(false);
+  await wait(30);
+  assert.equal(rebuilt, false);
+  busy = null;
+  finishItemRun();
+  await Promise.all([itemRun, rebuild, incremental]);
+  assert.deepEqual([fixture.requested.get(20), fixture.requested.get(21)], [2, 3]);
+  assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(service.indexer.activeRun, null);
+});
+
+test('A manual scan during an automatic scan that leaves out a library runs after it', async (t) => {
+  let busy = null;
+  const fixture = await createFixture(t, (id) => id === 21 && busy);
+  const service = await fixture.open();
+  // A device that receives a shared index does not index its personal library automatically.
+  service.indexSync.shouldAutoIndex = (libraryID) => libraryID !== 1;
+
+  let finish;
+  busy = new Promise((resolve) => { finish = resolve; });
+  const automaticScan = service.indexer.startLibraryScan(false, true);
+  await waitFor(() => fixture.requested.get(21) === 1, 'the automatic scan did not start');
+  const manual = service.startIndexing();
+  busy = null;
+  finish();
+  await Promise.all([automaticScan, manual]);
+  assert.equal(fixture.scans, 2);
+  assert.equal(fixture.requested.get(20), 1);
+  assert.equal(await fixture.vectorizedPassages(10), 1);
+  assert.equal(fixture.requested.get(21), 1);
+});
+
+test('A manual scan during an automatic scan of every library joins it', async (t) => {
+  let busy = null;
+  const fixture = await createFixture(t, (id) => id === 21 && busy);
+  const service = await fixture.open();
+  let finish;
+  busy = new Promise((resolve) => { finish = resolve; });
+  const automaticScan = service.indexer.startLibraryScan(false, true);
+  await waitFor(() => fixture.requested.get(21) === 1, 'the automatic scan did not start');
+  const manual = service.startIndexing();
+  busy = null;
+  finish();
+  await Promise.all([automaticScan, manual]);
+  assert.equal(fixture.scans, 1);
+  assert.deepEqual([fixture.requested.get(20), fixture.requested.get(21)], [1, 1]);
 });
