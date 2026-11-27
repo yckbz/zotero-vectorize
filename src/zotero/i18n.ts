@@ -25,6 +25,7 @@ export type LocaleStrings = {
   emptyIndexDesc: string;
   setupBannerCta: string;
   setupBannerHint: string;
+  engineErrorHint: (error: string) => string;
   openSettings: string;
   openPalette: string;
   buildIndexNow: string;
@@ -177,6 +178,7 @@ const ZH_CN: LocaleStrings = {
   emptyIndexDesc: '点击下方按钮在后台静默索引您的文献库与 PDF 全文，不修改 Zotero 原库。',
   setupBannerCta: '下载本地语义模型',
   setupBannerHint: '当前使用关键词检索。安装本地 ONNX 模型可启用跨语言语义检索。',
+  engineErrorHint: (error) => `嵌入服务暂不可用，本次仅使用关键词检索，已有索引不受影响。（${error}）`,
   openSettings: '插件设置',
   openPalette: '命令面板',
   buildIndexNow: '立即增量索引',
@@ -340,6 +342,7 @@ const EN_US: LocaleStrings = {
   emptyIndexDesc: 'Start silent background indexing to vectorize metadata and PDF passages without touching zotero.sqlite.',
   setupBannerCta: 'Download Local ONNX Model',
   setupBannerHint: 'Keyword search is available. Install a local ONNX model for cross-language semantic search.',
+  engineErrorHint: (error) => `The embedding service is unavailable, so this search used keywords only. The saved index is unchanged. (${error})`,
   openSettings: 'Settings',
   openPalette: 'Command Palette',
   buildIndexNow: 'Index Missing / Changed',

@@ -489,6 +489,10 @@ export class CommandPalette {
       this.bodyEl.appendChild(el(doc, 'div', { className: 'zv-banner', role: 'status' }, [
         resp.diagnostics.mismatchWarning,
       ]));
+    } else if (resp.diagnostics.engineError) {
+      this.bodyEl.appendChild(el(doc, 'div', { className: 'zv-banner', role: 'status' }, [
+        s.engineErrorHint(resp.diagnostics.engineError),
+      ]));
     }
 
     if (resp.hits.length === 0) {

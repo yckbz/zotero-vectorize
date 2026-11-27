@@ -192,6 +192,8 @@ export interface SearchDiagnostics {
   vectorSearchUsed: boolean;
   lexicalFallbackUsed: boolean;
   mismatchWarning?: string;
+  /** The embedding service failed for this query; the stored index itself is intact. */
+  engineError?: string;
   engineLabel: string;
   totalIndexedItems: number;
   totalIndexedChunks: number;

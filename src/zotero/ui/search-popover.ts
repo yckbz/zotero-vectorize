@@ -509,6 +509,19 @@ export class TopSearchPopover {
           rebuildBtn,
         ])
       );
+    } else if (resp?.diagnostics.engineError) {
+      // A failed embedding request says nothing about the stored index, so offer settings instead of a rebuild.
+      const settingsBannerBtn = el(doc, 'button', { type: 'button', className: 'zv-banner-btn' }, [s.openSettings]);
+      settingsBannerBtn.addEventListener('click', () => {
+        this.hide();
+        openPluginPreferences(this.win);
+      });
+      this.rootEl.appendChild(
+        el(doc, 'div', { className: 'zv-banner' }, [
+          el(doc, 'span', {}, [s.engineErrorHint(resp.diagnostics.engineError)]),
+          settingsBannerBtn,
+        ])
+      );
     }
 
     // 3. Body list

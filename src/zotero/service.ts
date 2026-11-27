@@ -623,7 +623,7 @@ export class VectorizeService {
         } catch {
           options?.signal?.throwIfAborted();
         }
-        if (remote && !remote.diagnostics.mismatchWarning) {
+        if (remote && !remote.diagnostics.mismatchWarning && !remote.diagnostics.engineError) {
           if (localIDs.size) {
             const local = await this.searchIndexWithConfig(clean, { ...sharedOptions, filterItemIDs: localIDs }, this.searchIndex, this.config);
             remote.hits = [...remote.hits, ...local.hits].sort((a, b) =>
@@ -663,7 +663,7 @@ export class VectorizeService {
       normalizeNotation: config.normalizeNotation,
       filterItemIDs: options?.filterItemIDs,
     }, options?.signal);
-    if (errorNote && !response.diagnostics.mismatchWarning) response.diagnostics.mismatchWarning = errorNote;
+    if (errorNote && !response.diagnostics.mismatchWarning) response.diagnostics.engineError = errorNote;
     return response;
   }
 

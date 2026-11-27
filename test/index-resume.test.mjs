@@ -55,6 +55,7 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
   const pages = Array.from({ length: 43 }, (_, i) => `Passage ${i + 1} discusses a test of the indexing pipeline.`);
   let extractionCalls = 0;
   let rejectSecondBatch = true;
+  let rejectQueries = false;
   const requests = [];
   const probes = [];
   globalThis.PathUtils = { join: path.join };
@@ -92,6 +93,9 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
             status: 400,
             responseText: JSON.stringify({ error: { message: 'batch size is invalid, it should not be larger than 20.' } }),
           };
+        }
+        if (rejectQueries && batch[0] === 'pipeline outage query') {
+          return { status: 400, responseText: JSON.stringify({ error: { message: 'query refused by fixture' } }) };
         }
         const rejected = rejectSecondBatch && batch[0] === pages[20];
         const payload = rejected
@@ -150,6 +154,15 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
   const metadata = service.searchIndex.getItemById(10);
   let coverage = await service.getStats(await service.getEngineStatus());
   assert.deepEqual([coverage.vectorizedChunks, coverage.failedAttachments, coverage.missingAttachments], [20, 1, 1]);
+
+  // A failed query embedding is an engine error, not an index mismatch that calls for a rebuild.
+  rejectQueries = true;
+  const outage = await service.search('pipeline outage query', { mode: 'fulltext' });
+  rejectQueries = false;
+  assert.equal(outage.diagnostics.mismatchWarning, undefined);
+  assert.match(outage.diagnostics.engineError, /query refused by fixture/);
+  assert.equal(outage.diagnostics.vectorSearchUsed, false);
+  assert.ok(outage.hits.length > 0);
 
   await service.shutdown();
   rejectSecondBatch = false;
