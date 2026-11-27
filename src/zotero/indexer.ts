@@ -14,7 +14,7 @@ import { isFiniteVector } from '../core/math.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
 import { extractItemMetadata, extractPdfPages, getAttachmentSignature, isIndexableRegularItem } from './extractor.ts';
 import { getStrings } from './i18n.ts';
-import type { VectorStore } from './vector-store.ts';
+import { REBUILD_FROM_EXTRACTION, type VectorStore } from './vector-store.ts';
 
 const ATTACHMENT_READ_TIMEOUT_MS = 120_000;
 
@@ -48,6 +48,15 @@ interface PreparedAttachment {
   attachment: ZoteroItem;
   state: AttachmentStateRecord;
   remaining: number;
+  /**
+   * During a full rebuild, the first passage index not yet re-embedded. Stored vectors stay searchable
+   * until a new vector replaces them. Null outside a rebuild.
+   */
+  rebuildFrom: number | null;
+}
+
+function needsEmbedding(work: PreparedAttachment, chunk: IndexedChunkRecord): boolean {
+  return !chunk.vector || (work.rebuildFrom !== null && chunk.chunkIndex >= work.rebuildFrom);
 }
 
 export interface IndexerDeps {
@@ -392,11 +401,10 @@ export class BackgroundIndexer {
         await this.processItemIds(Array.from(regularIds), forceRebuild, true, automatic);
       } catch (err: any) {
         Zotero.logError(err);
-        this.emit({
-          phase: 'error',
-          message: err?.message || String(err),
-          lastError: err?.message || String(err),
-        });
+        const error = err?.message || String(err);
+        // Attachments the rebuild had started resume on the next scan. The rest still have their old vectors.
+        const note = forceRebuild ? ` ${getStrings(this.deps.getConfig()).indexRebuildStoppedNote}` : '';
+        this.emit({ phase: 'error', message: error + note, lastError: error });
       } finally {
         this.activeRun = null;
         this.schedulePendingDrainAfterRun();
@@ -471,6 +479,9 @@ export class BackgroundIndexer {
     const { store, searchIndex } = this.deps;
     const strings = getStrings(cfg);
     const title = att.getDisplayTitle?.() || att.key;
+    // Recorded before the PDF is read again, so a rebuild that fails or stops before it saves new
+    // passages for this attachment is resumed by a later scan instead of being treated as done.
+    if (force && store.activeProfile) await store.markRebuildStarted(att.id);
     const sig = await waitForAttachmentRead(
       getAttachmentSignature(att),
       strings.indexReadTimeout(strings.indexCheckingFile, title, ATTACHMENT_READ_TIMEOUT_MS / 1000)
@@ -482,7 +493,9 @@ export class BackgroundIndexer {
     const sameLayout = !force && sameSource && previous.chunkingKey === chunkingKey;
     const model = provider.getModelFingerprint();
     const hasDimension = model !== buildModelFingerprint(provider.engine, provider.model);
-    if (sameLayout && (previous.status === 'no_text' || previous.status === 'missing' ||
+    // A failed or cancelled rebuild resumes from its saved position instead of treating old vectors as rebuilt.
+    const savedRebuild = force ? null : await store.getRebuildFrom(att.id);
+    if (sameLayout && savedRebuild === null && (previous.status === 'no_text' || previous.status === 'missing' ||
         (previous.status === 'indexed' && (!canEmbed || fingerprintMatches(previous.modelFingerprint, model, hasDimension))))) {
       this.emit({ skippedUnchanged: this.progress.skippedUnchanged + 1 });
       return null;
@@ -491,12 +504,15 @@ export class BackgroundIndexer {
     const existing = searchIndex.getItemChunks(item.id).some((chunk) => chunk.attachmentID === att.id)
       ? (await store.getChunksForItem(item.id)).filter((chunk) => chunk.attachmentID === att.id && chunk.attachmentKey === att.key)
       : [];
-    const reuseLayout = sameLayout && existing.length > 0 && existing.length === previous.chunkCount;
+    const reuseLayout = sameLayout && savedRebuild !== REBUILD_FROM_EXTRACTION && existing.length > 0 &&
+      existing.length === previous.chunkCount;
+    // Re-extracted passages may be numbered differently, so a resumed rebuild then starts over.
+    const rebuildFrom = force && store.activeProfile ? 0 : savedRebuild === null ? null : reuseLayout ? savedRebuild : 0;
     const state: AttachmentStateRecord = {
       attachmentID: att.id, attachmentKey: att.key, parentItemID: item.id, fileHash: sig.fileHash,
       mtime: sig.mtime, chunkingKey, status: 'indexed', chunkCount: 0, modelFingerprint: '', updatedAt: Date.now(),
     };
-    const work: PreparedAttachment = { item, attachment: att, state, remaining: 0 };
+    const work: PreparedAttachment = { item, attachment: att, state, remaining: 0, rebuildFrom };
     let chunks = existing;
     if (!reuseLayout) {
       const extracted = await waitForAttachmentRead(
@@ -528,10 +544,12 @@ export class BackgroundIndexer {
 
     if (!(await this.waitIfPaused()) || !this.isCurrent(work)) return null;
     state.chunkCount = chunks.length;
-    work.remaining = canEmbed ? chunks.filter((chunk) => !chunk.vector).length : 0;
+    work.remaining = canEmbed ? chunks.filter((chunk) => needsEmbedding(work, chunk)).length : 0;
     if (work.remaining) state.status = 'pending';
+    // Without an embedding engine the rebuild position is kept, so vectors are rebuilt once it is available.
+    const rebuildUpdate = rebuildFrom === null ? undefined : canEmbed && !work.remaining ? null : rebuildFrom;
     if (!reuseLayout) {
-      const parents = await store.saveAttachmentChunksAndState(chunks, state, 'replace', force);
+      const parents = await store.saveAttachmentChunksAndState(chunks, state, 'replace', rebuildUpdate);
       await store.readCommitted(async () => {
         for (const id of new Set([...(parents ?? []), item.id])) {
           searchIndex.replaceItemChunks(id, await store.getChunksForItem(id));
@@ -540,7 +558,7 @@ export class BackgroundIndexer {
       recordText(chunks.length);
       this.deps.onItemIndexed?.();
     } else if (canEmbed) {
-      if (await store.saveAttachmentChunksAndState([], state, 'checkpoint') === null) return null;
+      if (await store.saveAttachmentChunksAndState([], state, 'checkpoint', rebuildUpdate) === null) return null;
     }
     return work.remaining ? work : null;
   }
@@ -720,10 +738,14 @@ export class BackgroundIndexer {
           if (this.cancelled || this.disposed || !this.isCurrent(work)) continue;
           work.remaining -= rows.length;
           const complete = work.remaining === 0;
+          // Each attachment's passages are embedded in index order, so committed rows extend the rebuilt prefix.
+          const rebuildFrom = work.rebuildFrom === null ? null
+            : Math.max(work.rebuildFrom, ...rows.map((row) => row.chunkIndex + 1));
           const committed = await store.saveAttachmentChunksAndState(rows, {
             ...work.state, status: complete ? 'indexed' : 'pending', updatedAt: Date.now(),
-          }, 'checkpoint');
+          }, 'checkpoint', complete || rebuildFrom === null ? null : rebuildFrom);
           if (committed === null) continue;
+          work.rebuildFrom = rebuildFrom;
           await store.readCommitted(async () => {
             const byID = new Map(rows.map((row) => [row.chunkId, row]));
             searchIndex.replaceItemChunks(work.item.id, searchIndex.getItemChunks(work.item.id)
@@ -747,7 +769,8 @@ export class BackgroundIndexer {
         prefetch();
         if (!this.isCurrent(work)) continue;
         const chunks = searchIndex.getItemChunks(work.item.id)
-          .filter((chunk) => chunk.attachmentID === work.attachment.id && !chunk.vector);
+          .filter((chunk) => chunk.attachmentID === work.attachment.id && needsEmbedding(work, chunk))
+          .sort((a, b) => a.chunkIndex - b.chunkIndex);
         if (!chunks.length) continue;
         limit ??= await provider.getPassageBatchSize();
         for (const chunk of chunks) {

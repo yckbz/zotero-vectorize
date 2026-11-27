@@ -71,6 +71,7 @@ export type LocaleStrings = {
   indexTextDone: (items: number, chunks: number) => string;
   indexVectorDone: (items: number, chunks: number) => string;
   indexIncomplete: (items: number, failures: number, error: string) => string;
+  indexRebuildStoppedNote: string;
   indexAttachmentIssues: (unfinished: number, missing: number, noText: number) => string;
   palettePlaceholder: string;
   paletteTitle: string;
@@ -221,6 +222,7 @@ const ZH_CN: LocaleStrings = {
   indexTextDone: (items, chunks) => `文本索引完成。本轮处理 ${items} 篇文献、保存 ${chunks} 个分块，未生成向量。`,
   indexVectorDone: (items, chunks) => `向量索引扫描完成。本轮处理 ${items} 篇文献、生成 ${chunks} 个正文向量。`,
   indexIncomplete: (items, failures, error) => `索引未完成。本轮检查 ${items} 篇文献，${failures} 项失败。首个错误：${error}`,
+  indexRebuildStoppedNote: '重建未完成：已开始重建的文件会在下次索引时继续，尚未处理的文件仍使用旧向量，需要时请再次全量重建。',
   indexAttachmentIssues: (unfinished, missing, noText) => `待完成附件 ${unfinished} · 缺失 PDF ${missing} · 无可提取文本 ${noText}`,
   indexReadTimeout: (stage, title, seconds) => `${stage}，${title} 在 ${seconds} 秒内未响应，本轮索引已停止。`,
   rebuildIndex: '全量重建索引',
@@ -385,6 +387,7 @@ const EN_US: LocaleStrings = {
   indexTextDone: (items, chunks) => `Text indexing completed. Processed ${items} items, saved ${chunks} passages, and generated no vectors in this scan.`,
   indexVectorDone: (items, chunks) => `Vector indexing scan completed. Processed ${items} items and generated ${chunks} passage vectors.`,
   indexIncomplete: (items, failures, error) => `Indexing incomplete. Checked ${items} items with ${failures} failures. First error: ${error}`,
+  indexRebuildStoppedNote: 'The rebuild did not finish. Files it had started continue on the next index run, and files it had not reached keep their old vectors. Rebuild again if needed.',
   indexAttachmentIssues: (unfinished, missing, noText) => `${unfinished} unfinished attachments · ${missing} missing PDFs · ${noText} without extractable text`,
   indexReadTimeout: (stage, title, seconds) => `${stage}. ${title} did not respond within ${seconds} seconds. Indexing stopped.`,
   rebuildIndex: 'Rebuild All',

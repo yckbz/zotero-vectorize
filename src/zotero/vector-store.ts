@@ -39,6 +39,13 @@ const SNAPSHOT_COLUMNS = {
   attachment_embeddings: ['profile_id', 'attachment_id', 'status', 'error_message'],
 };
 
+/** Rebuild position meaning the attachment's PDF must be extracted again before its passages are re-embedded. */
+export const REBUILD_FROM_EXTRACTION = -1;
+
+function rebuildProgressKey(attachmentID: number): string {
+  return `rebuild_progress:${attachmentID}`;
+}
+
 async function upsert(conn: ZoteroDBConnectionInstance, table: string, columns: string[], key: string[], values: unknown[]) {
   const assignments = columns.filter((column) => !key.includes(column)).map((column) => `${column} = excluded.${column}`);
   await conn.queryAsync(
@@ -634,7 +641,7 @@ export class VectorStore {
     chunks: IndexedChunkRecord[],
     state: AttachmentStateRecord,
     mode: 'replace' | 'checkpoint',
-    force = false
+    rebuildFrom?: number | null
   ): Promise<number[] | null> {
     const profile = this.profile;
     return this.enqueueWrite(async () => {
@@ -665,12 +672,9 @@ export class VectorStore {
             if (replacement?.text !== row.text || row.item_id !== parentItemID) {
               sharedChunksChanged = true;
               await conn.queryAsync('DELETE FROM fulltext_chunks WHERE chunk_id = ?', [row.chunk_id]);
-            } else {
-              if (row.item_key !== replacement.itemKey || row.attachment_id !== replacement.attachmentID ||
-                  row.attachment_key !== replacement.attachmentKey) sharedChunksChanged = true;
-              if (force && profile) {
-                await conn.queryAsync('DELETE FROM passage_embeddings WHERE profile_id = ? AND chunk_id = ?', [profile.id, row.chunk_id]);
-              }
+            } else if (row.item_key !== replacement.itemKey || row.attachment_id !== replacement.attachmentID ||
+                row.attachment_key !== replacement.attachmentKey) {
+              sharedChunksChanged = true;
             }
           }
           if (sharedChunksChanged) {
@@ -698,6 +702,7 @@ export class VectorStore {
           await upsert(conn, 'attachment_embeddings', SNAPSHOT_COLUMNS.attachment_embeddings,
             ['profile_id', 'attachment_id'], [profile.id, attachmentID, state.status, state.errorMessage || '']);
         }
+        if (profile && rebuildFrom !== undefined) await this.writeRebuildFrom(conn, attachmentID, profile.id, rebuildFrom);
         await this.touch(conn);
         written = true;
       });
@@ -800,9 +805,64 @@ export class VectorStore {
       await conn.executeTransaction(async () => {
         await conn.queryAsync('DELETE FROM fulltext_chunks WHERE attachment_id = ?', [attachmentID]);
         await conn.queryAsync('DELETE FROM attachment_state WHERE attachment_id = ?', [attachmentID]);
+        await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [rebuildProgressKey(attachmentID)]);
       });
       return parentId === false || parentId === null ? null : Number(parentId);
     });
+  }
+
+  /**
+   * The first passage index a full rebuild of this attachment has not re-embedded yet for the active
+   * model, or null when no rebuild is in progress. Passages are re-embedded in index order.
+   * REBUILD_FROM_EXTRACTION means the rebuild stopped before it saved newly extracted passages.
+   */
+  async getRebuildFrom(attachmentID: number): Promise<number | null> {
+    const profile = this.profile;
+    if (!profile) return null;
+    const value = this.parseRebuildProgress(await this.getMeta(rebuildProgressKey(attachmentID)))[profile.id];
+    return Number.isInteger(value) && value >= REBUILD_FROM_EXTRACTION ? value : null;
+  }
+
+  /**
+   * Records that a rebuild of an already indexed attachment has started for the active model. Saving the
+   * newly extracted passages replaces the record, so it remains only when the rebuild stops before that.
+   */
+  async markRebuildStarted(attachmentID: number): Promise<void> {
+    return this.enqueueWrite(async () => {
+      const profile = this.profile;
+      if (!profile) return;
+      const conn = await this.ensureConn();
+      await conn.executeTransaction(async () => {
+        if (!await conn.valueQueryAsync('SELECT EXISTS(SELECT 1 FROM attachment_state WHERE attachment_id = ?)',
+          [attachmentID])) return;
+        await this.writeRebuildFrom(conn, attachmentID, profile.id, REBUILD_FROM_EXTRACTION);
+      });
+    });
+  }
+
+  private parseRebuildProgress(raw: string | null): Record<string, number> {
+    if (!raw) return {};
+    try {
+      const value = JSON.parse(raw);
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private async writeRebuildFrom(
+    conn: ZoteroDBConnectionInstance, attachmentID: number, profileID: string, rebuildFrom: number | null
+  ): Promise<void> {
+    const key = rebuildProgressKey(attachmentID);
+    const raw = await conn.valueQueryAsync<string | false>('SELECT value FROM store_meta WHERE key = ?', [key]);
+    const progress = this.parseRebuildProgress(typeof raw === 'string' ? raw : null);
+    if (rebuildFrom === null) delete progress[profileID];
+    else progress[profileID] = rebuildFrom;
+    if (Object.keys(progress).length) {
+      await conn.queryAsync('INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)', [key, JSON.stringify(progress)]);
+    } else {
+      await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [key]);
+    }
   }
 
   async clearAll(): Promise<void> {

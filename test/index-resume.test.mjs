@@ -56,6 +56,8 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
   let extractionCalls = 0;
   let rejectSecondBatch = true;
   let rejectQueries = false;
+  let rejectPassages = false;
+  let failExtraction = false;
   const requests = [];
   const probes = [];
   globalThis.PathUtils = { join: path.join };
@@ -77,6 +79,7 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
     PDFWorker: {
       getFullText: async () => {
         extractionCalls++;
+        if (failExtraction) throw new Error('PDF read refused by fixture');
         return { text: pages.join('\f'), extractedPages: pages.length, totalPages: pages.length };
       },
     },
@@ -97,7 +100,7 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
         if (rejectQueries && batch[0] === 'pipeline outage query') {
           return { status: 400, responseText: JSON.stringify({ error: { message: 'query refused by fixture' } }) };
         }
-        const rejected = rejectSecondBatch && batch[0] === pages[20];
+        const rejected = (rejectSecondBatch && batch[0] === pages[20]) || (rejectPassages && !isProbe && pages.includes(batch[0]));
         const payload = rejected
           ? { error: { message: 'second batch refused by fixture' } }
           : { data: batch.map((_, index) => ({ index, embedding: [1, 0] })) };
@@ -207,20 +210,86 @@ test('Indexing discovers the gateway batch limit and resumes PDF batches across 
   assert.deepEqual((await service.store.getChunksForItem(10)).slice(0, 20), before.slice(0, 20));
   assert.equal((await service.getStats({ modelFingerprint: 'openai:other-model:2', dimensions: 2 })).vectorizedChunks, 0);
 
+  const vectorCount = async () => (await service.store.getChunksForItem(10)).filter((chunk) => chunk.vector).length;
+  const passageRequests = () => requests.flat().filter((text) => pages.includes(text));
+
+  // A rebuild during an embedding outage keeps every stored vector, and resumes once the service is back.
+  rejectPassages = true;
+  await service.startIndexing(true);
+  rejectPassages = false;
+  assert.equal(extractionCalls, 3);
+  assert.equal(service.getIndexProgress().phase, 'incomplete');
+  assert.equal(await vectorCount(), 43);
+  assert.equal(service.searchIndex.getItemChunks(10).filter((chunk) => chunk.vector).length, 43);
+  await service.shutdown();
+  requests.length = 0;
+  await open();
+  await service.startIndexing();
+  assert.deepEqual(passageRequests(), pages);
+  assert.equal(extractionCalls, 3);
+  assert.equal((await service.store.getAttachmentState(20)).status, 'indexed');
+
+  // A rebuild that fails after its first batch resumes with the passages it had not re-embedded.
+  rejectSecondBatch = true;
+  requests.length = 0;
+  await service.startIndexing(true);
+  rejectSecondBatch = false;
+  // The fixture refuses the second batch (passages 21-40), so only the first 20 are re-embedded.
+  assert.deepEqual(passageRequests(), pages.slice(0, 40));
+  assert.equal((await service.store.getAttachmentState(20)).status, 'error');
+  assert.equal(await vectorCount(), 43);
+  await service.shutdown();
+  requests.length = 0;
+  await open();
+  await service.startIndexing();
+  assert.deepEqual(passageRequests(), pages.slice(20));
+  assert.equal(extractionCalls, 4);
+  assert.equal((await service.store.getAttachmentState(20)).status, 'indexed');
+
+  // A cancelled rebuild over incomplete old coverage re-embeds exactly the passages it had not reached.
+  await service.shutdown();
+  const partial = new DatabaseSync(dbPath);
+  partial.exec('DELETE FROM passage_embeddings WHERE chunk_id IN (SELECT chunk_id FROM fulltext_chunks WHERE chunk_index >= 30)');
+  partial.close();
+  await open();
   let cancellation;
   const unsubscribe = service.subscribeProgress((progress) => {
     if (progress.embeddedChunks === 20 && !cancellation) cancellation = service.indexer.cancel();
   });
+  requests.length = 0;
   await service.startIndexing(true);
   await cancellation;
   unsubscribe();
+  assert.deepEqual(passageRequests(), pages.slice(0, 20));
   assert.equal((await service.store.getAttachmentState(20)).status, 'pending');
-  assert.equal((await service.store.getChunksForItem(10)).filter((chunk) => chunk.vector).length, 20);
+  assert.equal(await vectorCount(), 30);
+  await service.shutdown();
+  requests.length = 0;
+  await open();
+  await service.startIndexing();
+  assert.deepEqual(passageRequests(), pages.slice(20));
+  assert.equal(extractionCalls, 5);
+  assert.equal(await vectorCount(), 43);
+  assert.equal((await service.store.getAttachmentState(20)).status, 'indexed');
+
+  // A rebuild that cannot read the PDF again keeps the old passages, and the next scan finishes it.
+  failExtraction = true;
+  requests.length = 0;
+  await service.startIndexing(true);
+  failExtraction = false;
+  assert.equal(extractionCalls, 6);
+  assert.equal(service.getIndexProgress().phase, 'incomplete');
+  assert.deepEqual(passageRequests(), []);
+  assert.equal(await vectorCount(), 43);
+  requests.length = 0;
+  await service.startIndexing();
+  assert.equal(extractionCalls, 7);
+  assert.deepEqual(passageRequests(), pages);
+  assert.equal(service.getIndexProgress().phase, 'completed');
 
   await service.shutdown();
   requests.length = 0;
   await open();
   await service.startIndexing();
-  assert.deepEqual(requests.flat(), pages.slice(20));
-  assert.equal(extractionCalls, 3);
+  assert.equal(requests.length, 0);
 });
