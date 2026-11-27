@@ -372,20 +372,21 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
       Zotero.PDFWorker.getFullText = originalGetFullText;
     }
 
-    // A pending Zotero PDF worker read must release the active scan without replacing the old chunks.
+    // A pending Zotero PDF worker read skips that PDF without replacing its old chunks.
     const originalLogError = Zotero.logError;
     const originalSetTimeout = globalThis.setTimeout;
     let extractionStarted = false;
+    let finishHungRead;
     try {
       Zotero.PDFWorker.getFullText = () => {
         extractionStarted = true;
-        return new Promise(() => {});
+        return new Promise((resolve) => { finishHungRead = resolve; });
       };
       Zotero.logError = () => {};
       globalThis.setTimeout = (fn, ms, ...args) => originalSetTimeout(fn, ms === 120_000 ? 10 : ms, ...args);
       await svc.startIndexing(true);
       assert.equal(extractionStarted, true);
-      assert.equal(svc.getIndexProgress().phase, 'error');
+      assert.equal(svc.getIndexProgress().phase, 'incomplete');
       assert.match(svc.getIndexProgress().lastError, /抽取 PDF 正文.*120 秒/);
       assert.equal(svc.searchIndex.getChunkCount(), 1);
     } finally {
@@ -393,6 +394,12 @@ test('VectorStore, BackgroundIndexer, and VectorizeService incremental lifecycle
       Zotero.logError = originalLogError;
       globalThis.setTimeout = originalSetTimeout;
     }
+    // Zotero's serial PDF worker eventually finishes the abandoned job. That frees the worker without
+    // starting another scan by itself.
+    finishHungRead(await originalGetFullText(20, null, false));
+    for (let i = 0; i < 200 && svc.indexer.stalledRead; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(svc.indexer.stalledRead, null);
+    assert.equal(svc.indexer.activeRun, null);
 
     // Fresh Ollama providers do not know the dimension of a tagged model until inference.
     let embeddingCalls = 0;

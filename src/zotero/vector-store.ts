@@ -46,6 +46,22 @@ function rebuildProgressKey(attachmentID: number): string {
   return `rebuild_progress:${attachmentID}`;
 }
 
+function readTimeoutKey(attachmentID: number): string {
+  return `read_timeout:${attachmentID}`;
+}
+
+function parseReadTimeout(raw: string | null): { fileHash: string; mtime: number; strikes: number } | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw);
+    if (typeof value?.fileHash !== 'string' || typeof value?.mtime !== 'number') return null;
+    const strikes = Number.isInteger(value.strikes) && value.strikes > 0 ? value.strikes : 1;
+    return { fileHash: value.fileHash, mtime: value.mtime, strikes };
+  } catch {
+    return null;
+  }
+}
+
 async function upsert(conn: ZoteroDBConnectionInstance, table: string, columns: string[], key: string[], values: unknown[]) {
   const assignments = columns.filter((column) => !key.includes(column)).map((column) => `${column} = excluded.${column}`);
   await conn.queryAsync(
@@ -806,6 +822,7 @@ export class VectorStore {
         await conn.queryAsync('DELETE FROM fulltext_chunks WHERE attachment_id = ?', [attachmentID]);
         await conn.queryAsync('DELETE FROM attachment_state WHERE attachment_id = ?', [attachmentID]);
         await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [rebuildProgressKey(attachmentID)]);
+        await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [readTimeoutKey(attachmentID)]);
       });
       return parentId === false || parentId === null ? null : Number(parentId);
     });
@@ -863,6 +880,34 @@ export class VectorStore {
     } else {
       await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [key]);
     }
+  }
+
+  /**
+   * The file version whose PDF text extraction last timed out, and how many runs in a row it timed out in.
+   * Scans skip a file version only after repeated timeouts, so one slow moment cannot hide a healthy PDF.
+   */
+  async getReadTimeout(attachmentID: number): Promise<{ fileHash: string; mtime: number; strikes: number } | null> {
+    return parseReadTimeout(await this.getMeta(readTimeoutKey(attachmentID)));
+  }
+
+  async recordReadTimeout(attachmentID: number, signature: { fileHash: string; mtime: number }): Promise<void> {
+    return this.enqueueWrite(async () => {
+      const conn = await this.ensureConn();
+      const key = readTimeoutKey(attachmentID);
+      const raw = await conn.valueQueryAsync<string | false>('SELECT value FROM store_meta WHERE key = ?', [key]);
+      const previous = parseReadTimeout(typeof raw === 'string' ? raw : null);
+      const sameVersion = previous?.fileHash === signature.fileHash && previous.mtime === signature.mtime;
+      const strikes = sameVersion ? previous.strikes + 1 : 1;
+      await conn.queryAsync('INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)',
+        [key, JSON.stringify({ fileHash: signature.fileHash, mtime: signature.mtime, strikes })]);
+    });
+  }
+
+  async clearReadTimeout(attachmentID: number): Promise<void> {
+    return this.enqueueWrite(async () => {
+      const conn = await this.ensureConn();
+      await conn.queryAsync('DELETE FROM store_meta WHERE key = ?', [readTimeoutKey(attachmentID)]);
+    });
   }
 
   async clearAll(): Promise<void> {

@@ -176,11 +176,26 @@ export async function getAttachmentSignature(
   return { filePath, fileHash, mtime };
 }
 
+/**
+ * Whether Zotero's PDF worker already has a job running or queued. Zotero runs PDF jobs one at a time, so a
+ * new job then waits behind it. Null when this Zotero version does not expose its queue.
+ */
+export function isPdfWorkerBusy(): boolean | null {
+  const worker = Zotero.PDFWorker;
+  if (typeof worker._processingQueue !== 'boolean' || !Array.isArray(worker._queue)) return null;
+  return worker._processingQueue || worker._queue.length > 0;
+}
+
 export async function extractPdfPages(
   attachment: ZoteroItem,
   maxPdfPages: number,
   signature: Awaited<ReturnType<typeof getAttachmentSignature>>,
-  options?: { minTextLength: number; signal: AbortSignal }
+  options?: {
+    minTextLength?: number;
+    signal?: AbortSignal;
+    /** Called before each request to Zotero's PDF worker with whether the worker was already busy. */
+    onWorkerRequest?: (busy: boolean | null) => void;
+  }
 ): Promise<PdfExtractionResult> {
   if (!attachment || attachment.deleted || !attachment.isPDFAttachment()) {
     return { pages: [], fileHash: '', mtime: 0, status: 'missing' };
@@ -195,12 +210,12 @@ export async function extractPdfPages(
   let firstPageIndex = 0;
   let totalPages: number | undefined;
   try {
-    options?.signal.throwIfAborted();
-    const res = await Zotero.PDFWorker.getFullText(
-      attachment.id,
-      maxPdfPages > 0 ? maxPdfPages : null,
-      false
-    );
+    options?.signal?.throwIfAborted();
+    const getFullText = (maxPages: number | null) => {
+      options?.onWorkerRequest?.(isPdfWorkerBusy());
+      return Zotero.PDFWorker.getFullText(attachment.id, maxPages, false);
+    };
+    const res = await getFullText(maxPdfPages > 0 ? maxPdfPages : null);
     rawText = res?.text || '';
     totalPages = res?.totalPages;
     // Zotero trims the joined result, which removes the separators at blank page edges.
@@ -208,15 +223,15 @@ export async function extractPdfPages(
     if (rawText.trim() && res.extractedPages > delimitedPages) {
       let upper = res.extractedPages - delimitedPages;
       while (firstPageIndex < upper) {
-        options?.signal.throwIfAborted();
+        options?.signal?.throwIfAborted();
         const middle = Math.floor((firstPageIndex + upper) / 2);
-        const prefix = await Zotero.PDFWorker.getFullText(attachment.id, middle + 1, false);
+        const prefix = await getFullText(middle + 1);
         if (prefix.text.trim()) upper = middle;
         else firstPageIndex = middle + 1;
       }
     }
   } catch (err: any) {
-    options?.signal.throwIfAborted();
+    options?.signal?.throwIfAborted();
     return {
       pages: [],
       fileHash,
@@ -225,7 +240,7 @@ export async function extractPdfPages(
       errorMessage: err?.message || String(err),
     };
   }
-  options?.signal.throwIfAborted();
+  options?.signal?.throwIfAborted();
 
   let pages = splitPdfPagesFromFulltext(rawText, firstPageIndex);
   if (maxPdfPages > 0) {

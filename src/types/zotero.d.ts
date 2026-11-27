@@ -235,6 +235,10 @@ export interface ZoteroNamespace {
     getPages(itemID: number): Promise<{ indexedPages: number; total: number } | false>;
   };
   PDFWorker: {
+    /** Internal job queue of Zotero's serial PDF worker; read only to tell whether a new job must wait. */
+    _queue?: unknown[];
+    /** Internal flag: true while the worker is running a job. */
+    _processingQueue?: boolean;
     getFullText(itemID: number, maxPages?: number | null, isPriority?: boolean, password?: string): Promise<{
       text: string;
       extractedPages: number;

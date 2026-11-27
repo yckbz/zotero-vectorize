@@ -702,6 +702,7 @@ export class VectorizeService {
     await this.init();
     await this.withIndexMaintenance(async () => {
       await this.store.clearAll();
+      this.indexer.forgetLateReads();
       await this.reloadIndex();
     });
   }

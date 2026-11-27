@@ -37,6 +37,10 @@ export type LocaleStrings = {
   indexReadingPdf: string;
   indexEmbeddingPdf: (completed: number, total: number) => string;
   indexReadTimeout: (stage: string, title: string, seconds: number) => string;
+  indexReadTimeoutSkipped: (title: string) => string;
+  indexPdfWorkerBusy: (title: string) => string;
+  indexPdfTimeoutNote: string;
+  indexPdfQueuedNote: string;
   prefCancel: string;
   prefApplyModel: string;
   prefKeepModel: string;
@@ -226,7 +230,11 @@ const ZH_CN: LocaleStrings = {
   indexIncomplete: (items, failures, error) => `索引未完成。本轮检查 ${items} 篇文献，${failures} 项失败。首个错误：${error}`,
   indexRebuildStoppedNote: '重建未完成：已开始重建的文件会在下次索引时继续，尚未处理的文件仍使用旧向量，需要时请再次全量重建。',
   indexAttachmentIssues: (unfinished, missing, noText) => `待完成附件 ${unfinished} · 缺失 PDF ${missing} · 无可提取文本 ${noText}`,
-  indexReadTimeout: (stage, title, seconds) => `${stage}，${title} 在 ${seconds} 秒内未响应，本轮索引已停止。`,
+  indexReadTimeout: (stage, title, seconds) => `${stage}，${title} 在 ${seconds} 秒内未响应，已跳过此文件。`,
+  indexPdfTimeoutNote: 'Zotero 处理完它之前，暂不抽取其他 PDF；连续两次超时后，之后的扫描会跳过它。',
+  indexPdfQueuedNote: '当时 Zotero 正在处理其他 PDF 任务，这次超时不计入跳过次数；Zotero 处理完之前，暂不抽取其他 PDF。',
+  indexReadTimeoutSkipped: (title) => `${title} 连续两次抽取正文超时，已跳过。文件更新后会自动重试，也可在条目右键菜单选择「立即向量化所选文献」重试。`,
+  indexPdfWorkerBusy: (title) => `Zotero 的 PDF 处理仍被一个超时文件占用，暂未抽取 ${title}。该文件处理完成或重启 Zotero 后，再次索引即可。`,
   rebuildIndex: '全量重建索引',
   clearIndex: '清空向量库',
   palettePlaceholder: '输入中文概念、模糊印象或英文关键词，搜索标题、摘要与 PDF 原文段落…',
@@ -392,7 +400,11 @@ const EN_US: LocaleStrings = {
   indexIncomplete: (items, failures, error) => `Indexing incomplete. Checked ${items} items with ${failures} failures. First error: ${error}`,
   indexRebuildStoppedNote: 'The rebuild did not finish. Files it had started continue on the next index run, and files it had not reached keep their old vectors. Rebuild again if needed.',
   indexAttachmentIssues: (unfinished, missing, noText) => `${unfinished} unfinished attachments · ${missing} missing PDFs · ${noText} without extractable text`,
-  indexReadTimeout: (stage, title, seconds) => `${stage}. ${title} did not respond within ${seconds} seconds. Indexing stopped.`,
+  indexReadTimeout: (stage, title, seconds) => `${stage}. ${title} did not respond within ${seconds} seconds and was skipped.`,
+  indexPdfTimeoutNote: 'Other PDFs are not extracted until Zotero finishes it. After a second timeout, later scans skip it.',
+  indexPdfQueuedNote: 'Zotero was busy with other PDF tasks, so this timeout does not count toward skipping the file. Other PDFs are not extracted until Zotero finishes.',
+  indexReadTimeoutSkipped: (title) => `Skipped ${title} because its text extraction timed out twice. It is retried when the file changes, or choose Vectorize Selected Items from the item menu.`,
+  indexPdfWorkerBusy: (title) => `Zotero is still busy with a PDF that timed out, so ${title} was not extracted. Index again after that PDF finishes or Zotero restarts.`,
   rebuildIndex: 'Rebuild All',
   clearIndex: 'Clear Index',
   palettePlaceholder: 'Describe a concept in Chinese or English, fuzzy title, or PDF passage…',
