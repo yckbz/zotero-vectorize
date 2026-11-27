@@ -503,7 +503,10 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
   const coverage = { textContent: '' };
   const feedback = { textContent: '', style: {} };
   const indexNotice = { textContent: '' };
+  const progressBar = { style: {}, classList: { toggle() {} } };
+  const progressText = { textContent: '' };
   const elements = { 'zv-stat-chunks': coverage, 'zv-pref-feedback': feedback, 'zv-index-read-error': indexNotice,
+    'zv-pref-progress-fill': progressBar, 'zv-pref-progress-text': progressText,
     'zv-shared-index': { hidden: true }, 'zv-shared-items': {}, 'zv-shared-chunks': {}, 'zv-shared-model': {},
     'zv-shared-published': {}, 'zv-shared-index-cache': {} };
   globalThis.document = {
@@ -595,6 +598,24 @@ test('Preferences refreshes persisted coverage during a scan and flushes the fin
   controller.updateSharedIndex(service);
   assert.equal(elements['zv-shared-index'].hidden, true);
   assert.equal(coverage.textContent, '43 / 43');
+
+  // Error progress displays the full rebuild-stopped message rather than truncating to lastError.
+  controller.updateProgressDom({
+    phase: 'error',
+    totalItems: 10, processedItems: 2, totalAttachments: 4, processedAttachments: 1,
+    embeddedChunks: 0, skippedUnchanged: 0, failedCount: 1, currentTitle: '',
+    lastError: 'Database busy',
+    message: 'Database busy The rebuild did not finish. Files it had started continue on the next index run.',
+  });
+  assert.match(progressText.textContent, /Database busy.*rebuild did not finish/);
+  controller.updateProgressDom({
+    phase: 'error',
+    totalItems: 0, processedItems: 0, totalAttachments: 0, processedAttachments: 0,
+    embeddedChunks: 0, skippedUnchanged: 0, failedCount: 1, currentTitle: '',
+    lastError: 'Fallback error only',
+    message: '',
+  });
+  assert.equal(progressText.textContent, 'Fallback error only');
 });
 
 test('registerSimilarPapersSection renders .zv-item-pane-box and .zv-similar-card and uses valid FTL attributes', async () => {

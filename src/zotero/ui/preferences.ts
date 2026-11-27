@@ -162,7 +162,7 @@ class VectorizePreferencesController {
     } else if (p.phase === 'paused') {
       text.textContent = `${p.message} (${p.processedItems}/${p.totalItems})`;
     } else if (p.phase === 'error') {
-      text.textContent = p.lastError || p.message;
+      text.textContent = p.message || p.lastError || '';
     } else {
       text.textContent = p.message || '';
     }
