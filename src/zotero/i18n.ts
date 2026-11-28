@@ -108,6 +108,9 @@ export type LocaleStrings = {
   prefMcpCopied: string;
   prefMcpStartError: string;
   prefMcpCopyError: string;
+  prefFooterRepo: string;
+  prefFooterIssue: string;
+  prefFooterHint: string;
   prefIndexSyncTitle: string;
   prefIndexSyncHint: string;
   prefIndexSyncRole: { off: string; publish: string; receive: string };
@@ -266,6 +269,9 @@ const ZH_CN: LocaleStrings = {
   prefMcpCopied: '已复制 Codex 配置。',
   prefMcpStartError: '无法启动 MCP。请检查 Zotero 版本和本机端口占用。',
   prefMcpCopyError: '无法复制 Codex 配置。',
+  prefFooterRepo: 'GitHub',
+  prefFooterIssue: '反馈问题',
+  prefFooterHint: '遇到问题或有建议，欢迎在 GitHub 提交 Issue，请附上插件版本、Zotero 版本和上方显示的错误信息。',
   prefIndexSyncTitle: '通过 Zotero 同步向量索引',
   prefIndexSyncHint: '使用「我的文库」已有的 WebDAV。只在一台设备选发布，其它设备选接收。索引附件含提取的 PDF 正文与模型参数，凭据保存在本机。',
   prefIndexSyncRole: { off: '关闭', publish: '发布本机索引', receive: '接收共享索引' },
@@ -436,6 +442,9 @@ const EN_US: LocaleStrings = {
   prefMcpCopied: 'Codex configuration copied.',
   prefMcpStartError: 'MCP could not start. Check the Zotero version and whether the local port is in use.',
   prefMcpCopyError: 'Could not copy the Codex configuration.',
+  prefFooterRepo: 'GitHub',
+  prefFooterIssue: 'Report an issue',
+  prefFooterHint: 'Found a bug or have an idea? Open a GitHub issue and include the plugin version, Zotero version, and any error shown above.',
   prefIndexSyncTitle: 'Sync vector indexes through Zotero',
   prefIndexSyncHint: 'Uses the existing WebDAV setup for My Library. Choose one publisher and set other devices to receive. The index attachment contains extracted PDF text and model settings. Credentials stay on this device.',
   prefIndexSyncRole: { off: 'Off', publish: 'Publish this device’s index', receive: 'Receive the shared index' },

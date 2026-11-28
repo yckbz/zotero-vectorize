@@ -77,6 +77,8 @@ export class VectorizeService {
   readonly providerManager: ProviderManager;
   readonly indexer: BackgroundIndexer;
   readonly indexSync: IndexSync;
+  /** The running plugin version Zotero passed to startup(), or an empty string when unknown. */
+  readonly version: string;
   private config: PluginConfig;
   private stopConfigObserver: (() => void) | null = null;
   private queryVectorCache = new Map<string, { fp: string; vec: Float32Array }>();
@@ -93,7 +95,8 @@ export class VectorizeService {
     controller: AbortController; done: Promise<void>; settings: string; startedActive: boolean;
   } | null = null;
 
-  constructor(options: { rootURI: string; dataDir: string }) {
+  constructor(options: { rootURI: string; dataDir: string; version?: string }) {
+    this.version = options.version ?? '';
     this.config = readPluginConfig();
     this.store = new VectorStore(options.dataDir);
     this.providerManager = new ProviderManager({

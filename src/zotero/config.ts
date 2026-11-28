@@ -2,6 +2,7 @@ import type { EngineType, HfMirrorMode, PluginConfig, SearchMode, UiLanguage } f
 import { DEFAULT_PDF_CHUNK_OVERLAP, DEFAULT_PDF_CHUNK_SIZE } from '../core/chunker.ts';
 
 export const PLUGIN_ID = 'zotero-vectorize@yckbz.org';
+export const REPOSITORY_URL = 'https://github.com/yckbz/zotero-vectorize';
 export const PREF_BRANCH = 'extensions.zotero-vectorize.';
 
 export const DEFAULT_CONFIG: PluginConfig = {

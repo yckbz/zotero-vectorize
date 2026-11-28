@@ -3,7 +3,7 @@ import type { EmbeddingProfileStats } from '../embedding-profile.ts';
 import { embeddingSettings } from '../embedding-profile.ts';
 import type { VectorizeService } from '../service.ts';
 import { MODEL_PRESETS } from '../../engines/provider.ts';
-import { resolveUiLocale } from '../config.ts';
+import { REPOSITORY_URL, resolveUiLocale } from '../config.ts';
 import { getStrings } from '../i18n.ts';
 import { el } from './render-utils.ts';
 
@@ -859,8 +859,34 @@ class VectorizePreferencesController {
       ]));
     }
 
+    this.container.appendChild(this.buildFooter(doc, svc, s));
+
     this.updateProgressDom(svc.getIndexProgress());
     void this.refreshStatsAndStatus();
+  }
+
+  /** Version and project links, so users can find updates and report problems. */
+  private buildFooter(doc: Document, svc: VectorizeService, s: ReturnType<typeof getStrings>): HTMLElement {
+    const link = (label: string, url: string) => {
+      const anchor = el(doc, 'a', { className: 'zv-pref-footer-link', href: url }, [label]);
+      // Open in the system browser instead of navigating the settings window.
+      anchor.addEventListener('click', (event) => {
+        event.preventDefault();
+        try {
+          Zotero.launchURL(url);
+        } catch (error) {
+          Zotero.logError(error);
+        }
+      });
+      return anchor;
+    };
+    const name = svc.version ? `Zotero Vectorize v${svc.version}` : 'Zotero Vectorize';
+    return el(doc, 'div', { className: 'zv-pref-footer' }, [
+      el(doc, 'div', {}, [
+        name, ' · ', link(s.prefFooterRepo, REPOSITORY_URL), ' · ', link(s.prefFooterIssue, `${REPOSITORY_URL}/issues/new`),
+      ]),
+      el(doc, 'div', {}, [s.prefFooterHint]),
+    ]);
   }
 
   private profileLabel(profile: EmbeddingProfileStats): string {

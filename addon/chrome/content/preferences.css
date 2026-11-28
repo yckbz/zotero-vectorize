@@ -298,6 +298,26 @@
   line-height: 1.45;
 }
 
+.zv-pref-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 4px 8px;
+  font-size: 11.5px;
+  color: var(--zv-muted);
+  line-height: 1.45;
+}
+
+.zv-pref-footer-link {
+  color: var(--zv-ink);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.zv-pref-footer-link:hover {
+  color: var(--zv-accent-hover);
+}
+
 .zv-pref-dialog {
   color: var(--fill-primary, inherit);
   background: var(--material-background, Canvas);

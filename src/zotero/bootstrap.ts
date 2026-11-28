@@ -231,6 +231,7 @@ async function startPlugin(data: { version: string; rootURI: string }): Promise<
   const instance = new VectorizeService({
     rootURI: pluginRootURI,
     dataDir,
+    version: data.version,
   });
   const controller = new McpController(instance, data.version, pluginRootURI);
   service = instance;

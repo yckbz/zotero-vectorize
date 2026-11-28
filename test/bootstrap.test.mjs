@@ -114,6 +114,7 @@ test('plugin lifecycle keeps one MCP owner and finishes shutdown before starting
   initialServices.add(Zotero.Vectorize);
   await startup(data, 1);
   assert.equal(Zotero.Vectorize, service);
+  assert.equal(service.version, data.version);
   assert.equal(Zotero.VectorizeMcp, mcp);
   assert.equal(registrations, 1);
   assert.equal(starts, 1);

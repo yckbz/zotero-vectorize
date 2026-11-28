@@ -165,6 +165,8 @@ export interface ZoteroNamespace {
   debug(msg: any): void;
   logError(err: any): void;
   warn(msg: any): void;
+  /** Opens a URL in the system browser. */
+  launchURL(url: string): void;
   DataDirectory: {
     dir: string;
     getDatabase(name: string): string;
