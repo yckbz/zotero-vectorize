@@ -840,3 +840,81 @@ test('Cancelling while getAttachmentSignature is slow returns promptly without l
   assert.equal(await fixture.vectorizedPassages(10), 1);
   assert.equal(await fixture.vectorizedPassages(11), 1);
 });
+
+test('requestPdfFullText ignores unrecognized Zotero.PDFWorker._queue shapes and still starts the timeout', async (t) => {
+  const { requestPdfFullText } = await importTs('src/zotero/extractor.ts');
+  t.after(() => { delete globalThis.Zotero; });
+
+  // 1. Non-array _queue (e.g. Set) must not throw and must invoke onStart immediately.
+  globalThis.Zotero = {
+    PDFWorker: {
+      _queue: new Set(),
+      getFullText: async () => ({ text: 'Readable text', extractedPages: 1, totalPages: 1 }),
+    },
+  };
+  let started = 0;
+  const setRes = await requestPdfFullText(20, null, () => { started++; });
+  assert.equal(setRes.text, 'Readable text');
+  assert.equal(started, 1);
+
+  // 2. Object-shaped queue entries must not be mutated and must invoke onStart immediately.
+  const objQueue = [];
+  const objEntry = { task: () => ({ text: 'From object queue', extractedPages: 1, totalPages: 1 }) };
+  globalThis.Zotero = {
+    PDFWorker: {
+      _queue: objQueue,
+      getFullText: () => {
+        objQueue.push(objEntry);
+        return Promise.resolve().then(() => objQueue.shift().task());
+      },
+    },
+  };
+  started = 0;
+  const objRes = await requestPdfFullText(20, null, () => { started++; });
+  assert.equal(objRes.text, 'From object queue');
+  assert.equal(started, 1);
+  assert.equal(Object.hasOwn(objEntry, '0'), false);
+
+  // 3. Tuple entries whose first element is not a function must not be overwritten.
+  const cmdQueue = [];
+  globalThis.Zotero = {
+    PDFWorker: {
+      _queue: cmdQueue,
+      getFullText: () => {
+        cmdQueue.push(['getFullText', [20, null]]);
+        return Promise.resolve().then(() => {
+          const [method] = cmdQueue.shift();
+          assert.equal(method, 'getFullText');
+          return { text: 'From command queue', extractedPages: 1, totalPages: 1 };
+        });
+      },
+    },
+  };
+  started = 0;
+  const cmdRes = await requestPdfFullText(20, null, () => { started++; });
+  assert.equal(cmdRes.text, 'From command queue');
+  assert.equal(started, 1);
+
+  // 4. End-to-end: an unrecognized queue shape still transitions to an extraction timeout and records a strike.
+  delete globalThis.Zotero;
+  let releaseHang;
+  const hang = new Promise((resolve) => { releaseHang = resolve; });
+  t.after(() => releaseHang?.());
+  const fixture = await createFixture(t, () => null, { exposeQueue: false });
+  const altQueue = [];
+  Zotero.PDFWorker = {
+    _queue: altQueue,
+    getFullText: () => {
+      altQueue.push({ job: 'opaque' });
+      return hang.then(() => {
+        altQueue.shift();
+        return { text: 'Late text', extractedPages: 1, totalPages: 1 };
+      });
+    },
+  };
+  const service = await fixture.open();
+  await service.startIndexing();
+  assert.equal(service.getIndexProgress().phase, 'incomplete');
+  assert.deepEqual(await service.store.getReadTimeout(20), { fileHash: 'STUCK-hash', mtime: 1000, strikes: 1 });
+  assert.equal(fixture.errors.length, 0);
+});

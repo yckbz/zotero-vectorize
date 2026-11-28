@@ -188,12 +188,12 @@ export function isPdfWorkerBusy(): boolean | null {
 
 export function requestPdfFullText(attachmentID: number, maxPages: number | null, onStart: () => void) {
   const worker = Zotero.PDFWorker;
-  const previousTail = worker._queue?.at(-1);
+  const previousTail = Array.isArray(worker._queue) ? worker._queue.at(-1) : undefined;
   const request = worker.getFullText(attachmentID, maxPages, false);
-  const queued = worker._queue?.at(-1);
-  // Zotero appends non-priority work synchronously. If our entry remains in the queue,
-  // the worker will call it only when it starts this particular request.
-  if (queued && queued !== previousTail) {
+  const queued = Array.isArray(worker._queue) ? worker._queue.at(-1) : undefined;
+  // Zotero appends non-priority work synchronously as [run, resolve, reject]. If our entry remains in
+  // the queue with that shape, the worker will call it only when it starts this particular request.
+  if (Array.isArray(queued) && queued !== previousTail && typeof queued[0] === 'function') {
     const run = queued[0];
     queued[0] = () => {
       onStart();
