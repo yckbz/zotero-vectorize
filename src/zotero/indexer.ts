@@ -14,7 +14,7 @@ import { isFiniteVector } from '../core/math.ts';
 import { VectorSearchIndex } from '../core/search-engine.ts';
 import {
   extractItemMetadata, extractPdfPages, getAttachmentSignature, isIndexableRegularItem, isPdfWorkerBusy,
-  type PdfExtractionResult,
+  requestPdfFullText, type PdfExtractionResult,
 } from './extractor.ts';
 import { getStrings } from './i18n.ts';
 import { REBUILD_FROM_EXTRACTION, type VectorStore } from './vector-store.ts';
@@ -26,7 +26,7 @@ const READ_TIMEOUT_SKIP_STRIKES = 2;
 class AttachmentReadTimeout extends Error {}
 /** Zotero's PDF worker runs one job at a time, and an earlier timed-out job still holds it. */
 class PdfWorkerBusy extends AttachmentReadTimeout {}
-/** Waiting for Zotero's own PDF jobs to finish timed out before our PDF was submitted. */
+/** Waiting for Zotero's worker timed out before our PDF started. */
 class PdfWorkerQueuedTimeout extends AttachmentReadTimeout {}
 /** Internal sentinel used to wake up an in-flight read immediately when the indexer cancels. */
 class ReadCancelled extends Error {}
@@ -763,7 +763,6 @@ export class BackgroundIndexer {
           },
         };
         let busyTimeoutError: PdfWorkerQueuedTimeout | null = null;
-        let timedOutWhileQueued = false;
         let abandonedToStalledRead = false;
         let workerCallInFlight = false;
         let activeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -774,6 +773,14 @@ export class BackgroundIndexer {
             clearTimeout(activeTimer);
             activeTimer = undefined;
           }
+        };
+        const startWorkerTimeout = (error: AttachmentReadTimeout) => {
+          clearActiveTimer();
+          activeTimer = setTimeout(() => {
+            activeTimer = undefined;
+            abandonedToStalledRead = true;
+            rejectForeground(error);
+          }, this.readTimeoutMs);
         };
         const unsubscribeCancel = this.onCancel(() => {
           if (abandonedToStalledRead) return;
@@ -820,37 +827,14 @@ export class BackgroundIndexer {
               abortRead();
               readSignal.throwIfAborted();
             }
-            clearActiveTimer();
-            const worker = Zotero.PDFWorker;
-            const queueBefore = Array.isArray(worker._queue) ? new Set(worker._queue) : null;
             workerCallInFlight = true;
             try {
-              const request = worker.getFullText(att.id, maxPages, false);
-              let queuedEntry: unknown;
-              let hasQueuedEntry = false;
-              if (queueBefore && Array.isArray(worker._queue)) {
-                for (let i = worker._queue.length - 1; i >= 0; i--) {
-                  if (!queueBefore.has(worker._queue[i])) {
-                    queuedEntry = worker._queue[i];
-                    hasQueuedEntry = true;
-                    break;
-                  }
+              startWorkerTimeout(new PdfWorkerQueuedTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`));
+              return await requestPdfFullText(att.id, maxPages, () => {
+                if (!readSignal.aborted && !abandonedToStalledRead) {
+                  startWorkerTimeout(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfTimeoutNote}`));
                 }
-              }
-              activeTimer = setTimeout(() => {
-                activeTimer = undefined;
-                abandonedToStalledRead = true;
-                // If the worker was preempted at submission time and our entry is still sitting in _queue,
-                // this PDF never started running and must not be charged a timeout strike.
-                const stillQueued = hasQueuedEntry && Array.isArray(worker._queue) && worker._queue.includes(queuedEntry);
-                if (stillQueued) {
-                  timedOutWhileQueued = true;
-                  rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfQueuedNote}`));
-                } else {
-                  rejectForeground(new AttachmentReadTimeout(`${timeoutMessage} ${strings.indexPdfTimeoutNote}`));
-                }
-              }, this.readTimeoutMs);
-              return await request;
+              });
             } finally {
               workerCallInFlight = false;
               clearActiveTimer();
@@ -874,7 +858,9 @@ export class BackgroundIndexer {
           if (!(error instanceof AttachmentReadTimeout)) throw error;
           // Watch before the write is queued, so a late result always clears the record after it is made.
           this.watchStalledRead(att.id, sig, cfg.maxPdfPages, read);
-          if (!timedOutWhileQueued && !this.cancelled && !this.disposed) await store.recordReadTimeout(att.id, sig);
+          if (!(error instanceof PdfWorkerQueuedTimeout) && !this.cancelled && !this.disposed) {
+            await store.recordReadTimeout(att.id, sig);
+          }
           if (this.cancelled || this.disposed) return null;
           throw error;
         } finally {

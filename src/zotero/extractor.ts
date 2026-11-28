@@ -186,6 +186,25 @@ export function isPdfWorkerBusy(): boolean | null {
   return worker._processingQueue || worker._queue.length > 0;
 }
 
+export function requestPdfFullText(attachmentID: number, maxPages: number | null, onStart: () => void) {
+  const worker = Zotero.PDFWorker;
+  const previousTail = worker._queue?.at(-1);
+  const request = worker.getFullText(attachmentID, maxPages, false);
+  const queued = worker._queue?.at(-1);
+  // Zotero appends non-priority work synchronously. If our entry remains in the queue,
+  // the worker will call it only when it starts this particular request.
+  if (queued && queued !== previousTail) {
+    const run = queued[0];
+    queued[0] = () => {
+      onStart();
+      return run();
+    };
+  } else {
+    onStart();
+  }
+  return request;
+}
+
 export async function extractPdfPages(
   attachment: ZoteroItem,
   maxPdfPages: number,

@@ -92,11 +92,11 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
     worker.processing = true;
     try {
       while (worker.pending.length) {
-        const entry = worker.pending.shift();
+        const [run, resolve, reject] = worker.pending.shift();
         try {
-          entry.resolve(await entry.run());
+          resolve(await run());
         } catch (error) {
-          entry.reject(error);
+          reject(error);
         }
       }
     } finally {
@@ -108,7 +108,7 @@ async function createFixture(t, delayJob, { exposeQueue = true } = {}) {
     let resolve;
     let reject;
     const job = new Promise((res, rej) => { resolve = res; reject = rej; });
-    worker.pending.push({ run, resolve, reject });
+    worker.pending.push([run, resolve, reject]);
     void processQueue(worker);
     return job;
   };
@@ -631,6 +631,23 @@ test('Worker preemption between idle check and submission never charges a timeou
   assert.equal(service.getIndexProgress().phase, 'completed');
   assert.equal(await fixture.vectorizedPassages(10), 1);
   assert.equal(await fixture.vectorizedPassages(11), 1);
+});
+
+test('A PDF queued at submission gets the full extraction timeout after it starts', async (t) => {
+  const fixture = await createFixture(t, (id) => id === 20 && wait(130));
+  const service = await fixture.open();
+  service.indexer.readTimeoutMs = 200;
+  const worker = Zotero.PDFWorker;
+  const getFullText = worker.getFullText;
+  worker.getFullText = (id, ...args) => {
+    if (id === 20) fixture.occupy(wait(130));
+    return getFullText(id, ...args);
+  };
+
+  await service.indexItems([10], true);
+  assert.equal(service.getIndexProgress().phase, 'completed');
+  assert.equal(await service.store.getReadTimeout(20), null);
+  assert.equal(await fixture.vectorizedPassages(10), 1);
 });
 
 test('PDF indexing, busy-worker waits, and cancellation work without a global AbortController', async (t) => {
